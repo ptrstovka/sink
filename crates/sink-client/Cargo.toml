@@ -1,0 +1,42 @@
+[package]
+name = "sink-client"
+description = "Client CLI and tunnel runtime for sink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sink"
+path = "src/main.rs"
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+directories.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sink-protocol = { path = "../sink-protocol" }
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tokio-rustls = "0.26"
+tokio-tungstenite.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+webpki-roots = "1"
+yamux.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "sink-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+sha2.workspace = true
+sink-client = { path = "../sink-client" }
+sink-protocol = { path = "../sink-protocol" }
+sink-server = { path = "../sink-server" }
+tempfile.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

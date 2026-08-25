@@ -1,0 +1,24 @@
+# Merge these fields into the existing Traefik v3 install configuration.
+# Zero request/connection deadlines are intentional for unbounded uploads,
+# downloads, SSE, and WebSockets; enforce resource controls elsewhere.
+entryPoints:
+  web:
+    address: ":80"
+    transport:
+      respondingTimeouts:
+        readTimeout: 0s
+        writeTimeout: 0s
+        idleTimeout: 0s
+
+  websecure:
+    address: ":443"
+    transport:
+      respondingTimeouts:
+        readTimeout: 0s
+        writeTimeout: 0s
+        idleTimeout: 0s
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true

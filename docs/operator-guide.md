@@ -1,0 +1,99 @@
+# Operator guide
+
+This guide assumes one Linux host running `sink-server` behind an existing
+Traefik v3 instance. Read [deployment boundaries](deployment-boundaries.md)
+before adapting it to containers, multiple hosts, or multiple server replicas.
+
+## 1. Prepare DNS and TLS
+
+Point `connect.example.com` and `*.example.com` at Traefik. Add a separate
+`example.com` record if the minimal apex response is wanted; wildcard DNS does
+not cover the apex. Provision a certificate covering `*.example.com`. Include
+`example.com` as a SAN if the HTTPS apex router is retained.
+
+The `connect` label is reserved for authenticated control traffic and must
+never be assigned as a public tunnel.
+
+## 2. Install the release
+
+Verify the selected archive with the release's `SHA256SUMS`. Install both
+binaries as root-owned, non-writable executables:
+
+```console
+install -o root -g root -m 0755 sink /usr/local/bin/sink
+install -o root -g root -m 0755 sink-server /usr/local/bin/sink-server
+```
+
+Create a non-login service identity and configuration directory using the
+distribution's normal account-management tools. The service example expects a
+`sink` user/group, `/etc/sink/sink-server.env` owned by `root:sink` with mode
+`0640`, and systemd-managed `/var/lib/sink` state.
+
+Copy `deploy/systemd/sink-server.service` to `/etc/systemd/system/` and the
+environment example to `/etc/sink/`. Replace `example.com`, review the listen
+address, SQLite path, and log filter, then run:
+
+```console
+systemd-analyze verify /etc/systemd/system/sink-server.service
+systemctl daemon-reload
+systemctl enable --now sink-server
+systemctl status sink-server
+```
+
+The server should bind `127.0.0.1:8080`; do not expose its plaintext listener
+to an untrusted network.
+
+## 3. Configure Traefik
+
+Copy `deploy/traefik/sink-dynamic.yml` into the existing file-provider
+directory, replace every `example.com`, and merge the static fragment's
+timeouts/provider settings into the existing Traefik install configuration.
+Do not attach a buffering middleware or request-size limit to Sink routers.
+
+The connect and wildcard routers keep public HTTP available, terminate
+public/control HTTPS, redirect plaintext control requests to HTTPS, preserve
+the original Host, and send everything to the same plaintext backend. Two
+optional apex routers expose the minimal base-domain response. The higher
+explicit priority prevents the wildcard router from taking `connect`.
+
+Validate against the installed Traefik version by starting a disposable
+Traefik process with the merged install configuration, or use the deployment's
+existing config validation/reload mechanism. Confirm the Traefik log reports
+all Sink routers and no file-provider parse errors before changing DNS.
+
+## 4. Manage users
+
+Use the same database selector as the service when running administrative
+commands as the `sink` OS user. For example, prefix each command with `sudo -u
+sink env SINK_SERVER_SQLITE_PATH=/var/lib/sink/sink.sqlite3`:
+
+```console
+sink-server user create alice
+sink-server user list
+sink-server user rotate-token alice
+sink-server user disable alice
+sink-server user enable alice
+```
+
+Create and rotate print the token once. Transfer it through a secret channel.
+Listings never contain reusable tokens. Rotation and disable immediately
+invalidate existing tunnels; a lost token must be rotated, not retrieved.
+
+## 5. Operate safely
+
+- Read logs with `journalctl -u sink-server`; authentication failures, tunnel
+  lifecycle, conflicts, and forwarding errors should be visible without tokens
+  or HTTP bodies.
+- Monitor disk space, file descriptors, memory, connection count, certificate
+  expiry, and Traefik errors. The MVP has no rich metrics endpoint.
+- Back up SQLite with its online backup mechanism, or stop the service before
+  copying the database. Copying only the main file while WAL writes are active
+  can produce an inconsistent backup. Test restoration.
+- Before upgrade, back up SQLite, verify the new release checksum, stage the
+  old binary for rollback, replace the executable atomically, and restart the
+  service. Review release notes for database migration or protocol changes.
+- Use Traefik/host controls for rate limits and resource protection, but exempt
+  intended streaming traffic from body buffering and fixed lifetime limits.
+
+Run the [manual acceptance tests](acceptance-tests.md) before first production
+use and after changes to Traefik, TLS, networking, or server/client versions.

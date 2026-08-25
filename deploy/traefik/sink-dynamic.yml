@@ -1,0 +1,66 @@
+# Traefik v3 dynamic configuration. Replace every example.com occurrence.
+# The websecure entry point must already have a certificate covering
+# *.example.com; add example.com too if the apex HTTPS router is retained.
+http:
+  routers:
+    sink-connect-http:
+      entryPoints: [web]
+      rule: 'Host(`connect.example.com`)'
+      priority: 200
+      middlewares: [sink-control-https]
+      service: sink-server
+
+    sink-connect-https:
+      entryPoints: [websecure]
+      rule: 'Host(`connect.example.com`)'
+      priority: 200
+      service: sink-server
+      tls: {}
+
+    sink-apex-http:
+      entryPoints: [web]
+      rule: 'Host(`example.com`)'
+      priority: 150
+      service: sink-server
+
+    sink-apex-https:
+      entryPoints: [websecure]
+      rule: 'Host(`example.com`)'
+      priority: 150
+      service: sink-server
+      tls: {}
+
+    sink-public-http:
+      entryPoints: [web]
+      rule: 'HostRegexp(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.example\.com$`)'
+      priority: 100
+      service: sink-server
+
+    sink-public-https:
+      entryPoints: [websecure]
+      rule: 'HostRegexp(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.example\.com$`)'
+      priority: 100
+      service: sink-server
+      tls: {}
+
+  middlewares:
+    sink-control-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+  services:
+    sink-server:
+      loadBalancer:
+        passHostHeader: true
+        serversTransport: sink-streaming
+        servers:
+          - url: http://127.0.0.1:8080
+
+  serversTransports:
+    sink-streaming:
+      maxIdleConnsPerHost: 256
+      forwardingTimeouts:
+        dialTimeout: 5s
+        responseHeaderTimeout: 0s
+        idleConnTimeout: 90s

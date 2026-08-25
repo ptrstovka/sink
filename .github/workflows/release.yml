@@ -1,0 +1,113 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag to receive rebuilt assets
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    name: ${{ matrix.archive_suffix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive_suffix: macos-arm64
+            install_musl: false
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_suffix: macos-x86_64
+            install_musl: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive_suffix: linux-arm64
+            install_musl: true
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive_suffix: linux-x86_64
+            install_musl: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Install musl build tools
+        if: matrix.install_musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+
+      - name: Cache Cargo build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: >-
+          cargo build --release --locked --target "${{ matrix.target }}"
+          --bin sink --bin sink-server
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="sink-${RELEASE_TAG}-${{ matrix.archive_suffix }}.tar.gz"
+          mkdir -p dist/package
+          install -m 0755 "target/${{ matrix.target }}/release/sink" dist/package/sink
+          install -m 0755 "target/${{ matrix.target }}/release/sink-server" dist/package/sink-server
+          install -m 0644 LICENSE-MIT dist/package/LICENSE-MIT
+          install -m 0644 LICENSE-APACHE dist/package/LICENSE-APACHE
+          tar -C dist/package -czf "dist/${archive}" \
+            sink sink-server LICENSE-MIT LICENSE-APACHE
+
+      - name: Store release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.archive_suffix }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attach assets
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksum manifest
+        working-directory: dist
+        run: sha256sum sink-*.tar.gz | sort -k2 > SHA256SUMS
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${RELEASE_TAG}" dist/*.tar.gz dist/SHA256SUMS --clobber
