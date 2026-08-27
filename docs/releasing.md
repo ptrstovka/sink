@@ -72,9 +72,8 @@ The workflow performs this sequence for each macOS architecture:
 3. Verify both signatures with `codesign`.
 4. Submit a temporary ZIP to `notarytool` and wait for completion.
 5. Print Apple's notarization log and require an `Accepted` result.
-6. Assess both executables with Gatekeeper's `spctl` policy.
-7. Create the release `.tar.gz` from the exact signed, accepted bytes.
-8. Delete the temporary certificate, API key, and keychain.
+6. Create the release `.tar.gz` from the exact signed, accepted bytes.
+7. Delete the temporary certificate, API key, and keychain.
 
 If signing or notarization fails, the macOS matrix jobs fail and the publish job
 doesn't attach any rebuilt release archives.
@@ -91,13 +90,15 @@ executables:
 ```console
 codesign --verify --strict --verbose=2 sink
 codesign -dvv sink
-spctl --assess --type exec --verbose=4 sink
 
 codesign --verify --strict --verbose=2 sink-server
 codesign -dvv sink-server
-spctl --assess --type exec --verbose=4 sink-server
 ```
 
 The `codesign -dvv` output should include `Authority=Developer ID Application`,
-the expected Team ID, `Runtime Version`, and a secure `Timestamp`. `spctl`
-should report `accepted` with `source=Notarized Developer ID`.
+the expected Team ID, `Runtime Version`, and a secure `Timestamp`. Run the
+browser-downloaded executable normally while online to exercise Gatekeeper's
+online ticket lookup. `spctl --assess` isn't a valid post-check for these bare
+command-line executables: it can reject successfully notarized code with
+`the code is valid but does not seem to be an app` because there is no app
+bundle to assess.

@@ -197,10 +197,6 @@ jobs:
             exit 1
           fi
 
-          for binary in dist/package/sink dist/package/sink-server; do
-            spctl --assess --type execute --verbose=4 "$binary"
-          done
-
       - name: Create release archive
         shell: bash
         run: |
