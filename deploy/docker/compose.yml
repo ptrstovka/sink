@@ -1,0 +1,19 @@
+services:
+  sink-server:
+    image: ghcr.io/ptrstovka/sink-server:${SINK_VERSION:-0.0.1}
+    restart: unless-stopped
+    environment:
+      SINK_SERVER_PUBLIC_BASE_DOMAIN: ${SINK_PUBLIC_BASE_DOMAIN:?set SINK_PUBLIC_BASE_DOMAIN}
+      SINK_SERVER_LOG_LEVEL: ${SINK_LOG_LEVEL:-info}
+    ports:
+      - "127.0.0.1:${SINK_HOST_PORT:-42424}:8080"
+    volumes:
+      - sink-data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  sink-data:

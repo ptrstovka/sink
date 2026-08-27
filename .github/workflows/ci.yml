@@ -22,7 +22,7 @@ jobs:
       RUST_BACKTRACE: 1
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain

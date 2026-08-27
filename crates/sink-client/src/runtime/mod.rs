@@ -486,8 +486,8 @@ mod tests {
         let accepted = SessionAccepted::new(
             session,
             Subdomain::parse("generated-42")?,
-            "http://generated-42.serus.eu",
-            "https://generated-42.serus.eu",
+            "http://generated-42.example.com",
+            "https://generated-42.example.com",
             30,
         );
         runtime.accepted = Some(control::validate_acceptance(accepted, session, None, None)?);
@@ -496,7 +496,7 @@ mod tests {
             assert_eq!(hello.session_id, session);
             assert_eq!(
                 hello.requested_hostname.as_deref(),
-                Some("generated-42.serus.eu")
+                Some("generated-42.example.com")
             );
         }
         Ok(())
@@ -507,12 +507,12 @@ mod tests {
         let runtime = TunnelRuntime::new(
             resolved_config()?,
             "3000".parse()?,
-            Some("https://Demo.serus.eu".parse()?),
+            Some("https://Demo.example.com".parse()?),
             false,
         )?;
         assert_eq!(
             runtime.client_hello().requested_hostname.as_deref(),
-            Some("demo.serus.eu")
+            Some("demo.example.com")
         );
         Ok(())
     }

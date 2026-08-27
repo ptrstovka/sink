@@ -287,12 +287,12 @@ mod tests {
         let accepted = SessionAccepted::new(
             session,
             Subdomain::parse("demo")?,
-            "http://demo.serus.eu",
-            "https://demo.serus.eu",
+            "http://demo.example.com",
+            "https://demo.example.com",
             30,
         );
-        let info = validate_acceptance(accepted.clone(), session, Some("demo.serus.eu"), None)?;
-        assert_eq!(info.hostname, "demo.serus.eu");
+        let info = validate_acceptance(accepted.clone(), session, Some("demo.example.com"), None)?;
+        assert_eq!(info.hostname, "demo.example.com");
 
         let wrong_session = validate_acceptance(accepted.clone(), Uuid::from_u128(43), None, None);
         assert!(matches!(
@@ -300,14 +300,14 @@ mod tests {
             Err(RuntimeError::ProtocolViolation)
         ));
         let wrong_request =
-            validate_acceptance(accepted.clone(), session, Some("other.serus.eu"), None);
+            validate_acceptance(accepted.clone(), session, Some("other.example.com"), None);
         assert!(matches!(
             wrong_request,
             Err(RuntimeError::ProtocolViolation)
         ));
 
         let mut wrong_url = accepted;
-        wrong_url.public_http_url = "http://other.serus.eu".to_owned();
+        wrong_url.public_http_url = "http://other.example.com".to_owned();
         assert!(matches!(
             validate_acceptance(wrong_url, session, None, None),
             Err(RuntimeError::ProtocolViolation)

@@ -11,7 +11,6 @@ pub const SQLITE_PATH_ENV: &str = "SINK_SERVER_SQLITE_PATH";
 pub const LOG_LEVEL_ENV: &str = "SINK_SERVER_LOG_LEVEL";
 
 pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:8080";
-pub const DEFAULT_PUBLIC_BASE_DOMAIN: &str = "serus.eu";
 pub const DEFAULT_SQLITE_PATH: &str = "sink.sqlite3";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -25,7 +24,12 @@ pub struct ServeArgs {
     pub listen_address: Option<SocketAddr>,
 
     /// Public DNS suffix used for tunnel and control hostnames.
-    #[arg(long, value_name = "DOMAIN", env = "SINK_SERVER_PUBLIC_BASE_DOMAIN")]
+    #[arg(
+        long,
+        value_name = "DOMAIN",
+        env = "SINK_SERVER_PUBLIC_BASE_DOMAIN",
+        required = true
+    )]
     pub public_base_domain: Option<String>,
 
     #[command(flatten)]
@@ -36,7 +40,7 @@ pub struct ServeArgs {
     pub log_level: Option<String>,
 }
 
-/// SQLite location shared by `serve` and all operator commands.
+/// SQLite location shared by `serve` and all administration commands.
 #[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
 pub struct DatabaseArgs {
     /// SQLite database file. This option is global within `user`, so it may be
@@ -79,14 +83,12 @@ impl ServeConfig {
                 .map_err(|source| ConfigError::InvalidListenAddress { source })?,
         };
 
-        let public_base_domain = match args.public_base_domain.as_deref() {
-            Some(domain) => normalize_base_domain(domain)?,
-            None => normalize_base_domain(
-                environment_string(environment, PUBLIC_BASE_DOMAIN_ENV)?
-                    .as_deref()
-                    .unwrap_or(DEFAULT_PUBLIC_BASE_DOMAIN),
-            )?,
+        let configured_domain = match args.public_base_domain.as_deref() {
+            Some(domain) => domain.to_owned(),
+            None => environment_string(environment, PUBLIC_BASE_DOMAIN_ENV)?
+                .ok_or(ConfigError::MissingPublicBaseDomain)?,
         };
+        let public_base_domain = normalize_base_domain(&configured_domain)?;
 
         let sqlite_path = args.database.resolve_with(environment)?;
 
@@ -165,6 +167,11 @@ pub enum ConfigError {
 
     #[error("public base domain must be a valid DNS name without a scheme, port, or wildcard")]
     InvalidPublicBaseDomain,
+
+    #[error(
+        "public base domain is required; pass `--public-base-domain DOMAIN` or set SINK_SERVER_PUBLIC_BASE_DOMAIN"
+    )]
+    MissingPublicBaseDomain,
 
     #[error("SQLite database path cannot be empty")]
     EmptySqlitePath,
@@ -284,11 +291,21 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_the_operator_contract() {
-        let resolved = ServeConfig::resolve_with(&ServeArgs::default(), &environment(&[]))
-            .expect("valid defaults");
+    fn domain_is_required_while_other_settings_keep_defaults() {
+        assert!(matches!(
+            ServeConfig::resolve_with(&ServeArgs::default(), &environment(&[])),
+            Err(ConfigError::MissingPublicBaseDomain)
+        ));
 
-        assert_eq!(resolved.public_base_domain, DEFAULT_PUBLIC_BASE_DOMAIN);
+        let resolved = ServeConfig::resolve_with(
+            &ServeArgs {
+                public_base_domain: Some("example.test".to_owned()),
+                ..ServeArgs::default()
+            },
+            &environment(&[]),
+        )
+        .expect("valid required domain");
+
         assert_eq!(resolved.sqlite_path, PathBuf::from(DEFAULT_SQLITE_PATH));
         assert_eq!(resolved.log_level, DEFAULT_LOG_LEVEL);
     }

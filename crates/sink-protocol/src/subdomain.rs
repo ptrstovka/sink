@@ -97,7 +97,7 @@ mod tests {
     fn rejects_reserved_and_multi_label_names() {
         assert_eq!(Subdomain::parse("connect"), Err(SubdomainError::Reserved));
         assert_eq!(
-            Subdomain::parse("demo.serus.eu"),
+            Subdomain::parse("demo.example.com"),
             Err(SubdomainError::InvalidCharacter)
         );
     }

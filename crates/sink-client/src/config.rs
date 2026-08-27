@@ -12,7 +12,6 @@ use thiserror::Error;
 use url::Url;
 use zeroize::{Zeroize as _, Zeroizing};
 
-pub const DEFAULT_SERVER_ADDR: &str = "https://connect.serus.eu";
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 
 /// An authentication token whose debug representation is always redacted.
@@ -142,19 +141,15 @@ impl SavedConfig {
         self.server_addr.as_ref()
     }
 
-    /// Resolves a normal `sink http` run using the intended production server
-    /// when neither an override nor a saved address exists.
+    /// Resolves a normal `sink http` run. Both credentials and the server
+    /// address must come from an explicit override or saved configuration.
     pub fn resolve_for_http(&self, overrides: RunOverrides) -> Result<ResolvedConfig, ConfigError> {
-        self.resolve(overrides, ServerAddressFallback::IntendedDefault)
+        self.resolve(overrides)
     }
 
-    /// Resolves run settings with explicit override > saved > fallback
-    /// precedence. This method never writes to the config store.
-    pub fn resolve(
-        &self,
-        overrides: RunOverrides,
-        fallback: ServerAddressFallback,
-    ) -> Result<ResolvedConfig, ConfigError> {
+    /// Resolves run settings with explicit override > saved precedence. This
+    /// method never writes to the config store.
+    pub fn resolve(&self, overrides: RunOverrides) -> Result<ResolvedConfig, ConfigError> {
         let auth_token = overrides
             .authtoken
             .or_else(|| self.authtoken.clone())
@@ -162,13 +157,7 @@ impl SavedConfig {
         let server_addr = overrides
             .server_addr
             .or_else(|| self.server_addr.clone())
-            .map(Ok)
-            .unwrap_or_else(|| match fallback {
-                ServerAddressFallback::IntendedDefault => DEFAULT_SERVER_ADDR
-                    .parse()
-                    .map_err(|_| ConfigError::InvalidBuiltInServerAddress),
-                ServerAddressFallback::RequireConfigured => Err(ConfigError::MissingServerAddress),
-            })?;
+            .ok_or(ConfigError::MissingServerAddress)?;
 
         if server_addr.is_plaintext() && !overrides.allow_plaintext_control {
             return Err(ConfigError::PlaintextControlNotAllowed);
@@ -198,13 +187,6 @@ pub struct RunOverrides {
     pub allow_plaintext_control: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ServerAddressFallback {
-    #[default]
-    IntendedDefault,
-    RequireConfigured,
-}
-
 #[derive(Clone, Debug)]
 pub struct ResolvedConfig {
     auth_token: AuthToken,
@@ -232,8 +214,8 @@ pub struct ConfigStore {
 
 impl ConfigStore {
     pub fn platform() -> Result<Self, ConfigError> {
-        let project_dirs = ProjectDirs::from("eu", "serus", "sink")
-            .ok_or(ConfigError::PlatformConfigUnavailable)?;
+        let project_dirs =
+            ProjectDirs::from("", "", "sink").ok_or(ConfigError::PlatformConfigUnavailable)?;
         Ok(Self::new(project_dirs.config_dir().join(CONFIG_FILE_NAME)))
     }
 
@@ -435,8 +417,6 @@ pub enum ConfigError {
         "no server address configured; run `sink config add-server-addr SERVER` or pass `--server-addr SERVER`"
     )]
     MissingServerAddress,
-    #[error("the built-in Sink server address is invalid")]
-    InvalidBuiltInServerAddress,
     #[error(
         "refusing a plaintext control connection; use an https:// server or pass `--allow-plaintext-control` for local development"
     )]
@@ -502,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn resolution_uses_intended_default_and_has_actionable_missing_errors()
+    fn resolution_requires_both_values_and_has_actionable_missing_errors()
     -> Result<(), Box<dyn std::error::Error>> {
         let saved = SavedConfig::default();
         assert!(matches!(
@@ -514,13 +494,8 @@ mod tests {
             authtoken: Some(AuthToken::new("secret")?),
             ..RunOverrides::default()
         };
-        let resolved = saved.resolve_for_http(overrides.clone())?;
-        assert_eq!(
-            resolved.server_addr().to_string(),
-            DEFAULT_SERVER_ADDR.to_owned() + "/"
-        );
         assert!(matches!(
-            saved.resolve(overrides, ServerAddressFallback::RequireConfigured),
+            saved.resolve_for_http(overrides),
             Err(ConfigError::MissingServerAddress)
         ));
         Ok(())
@@ -553,7 +528,7 @@ mod tests {
         };
         let resolved = ResolvedConfig {
             auth_token: token.clone(),
-            server_addr: DEFAULT_SERVER_ADDR
+            server_addr: "https://connect.example.test"
                 .parse()
                 .map_err(|_| AuthTokenError::Empty)?,
         };

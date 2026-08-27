@@ -698,8 +698,8 @@ mod tests {
         let target = LocalTarget::from_str("http://local.example:8080/api/v1/")?;
         let mut request = Request::builder()
             .uri("/users/%2Fraw?active=true")
-            .header(HOST, "public.serus.eu")
-            .header("x-forwarded-host", "public.serus.eu")
+            .header(HOST, "public.example.com")
+            .header("x-forwarded-host", "public.example.com")
             .body(())?;
         rewrite_local_request(&mut request, &target)?;
         assert_eq!(
@@ -707,7 +707,7 @@ mod tests {
             "http://local.example:8080/api/v1/users/%2Fraw?active=true"
         );
         assert_eq!(request.headers()[HOST], "local.example:8080");
-        assert_eq!(request.headers()["x-forwarded-host"], "public.serus.eu");
+        assert_eq!(request.headers()["x-forwarded-host"], "public.example.com");
         Ok(())
     }
 

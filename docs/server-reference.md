@@ -1,8 +1,10 @@
-# Operator guide
+# Server deployment reference
 
-This guide assumes one Linux host running `sink-server` behind an existing
-Traefik v3 instance. Read [deployment boundaries](deployment-boundaries.md)
-before adapting it to containers, multiple hosts, or multiple server replicas.
+This reference assumes you run one Linux host with `sink-server` behind an
+existing Traefik v3 instance. For a friendlier walkthrough that configures both
+your server and local client, start with [Get Sink running](getting-started.md).
+Read [deployment boundaries](deployment-boundaries.md) before adapting the
+setup to multiple hosts or multiple server replicas.
 
 ## 1. Prepare DNS and TLS
 
@@ -42,6 +44,28 @@ systemctl status sink-server
 
 The server should bind `127.0.0.1:8080`; do not expose its plaintext listener
 to an untrusted network.
+
+### Container alternative
+
+Each published release builds `ghcr.io/ptrstovka/sink-server` for Linux amd64
+and arm64. The image runs as UID/GID `10001`, listens on container port `8080`,
+and stores SQLite state under `/data`. For the supplied Compose deployment:
+
+```console
+cd deploy/docker
+SINK_PUBLIC_BASE_DOMAIN=example.com SINK_VERSION=0.0.1 docker compose up -d
+docker compose exec sink-server sink-server user create alice
+```
+
+The example binds only `127.0.0.1:42424` on the host for a same-host Traefik
+service. Keep the named volume for upgrades. When replacing it with a bind
+mount, make the host directory writable by UID/GID `10001`. The GHCR package
+may require `docker login ghcr.io` until its package visibility is made public.
+
+Release tags must match the Rust package version, with an optional `v` prefix.
+For example, workspace version `0.0.1` may be released as `0.0.1` or `v0.0.1`.
+The workflow publishes the exact release tag, the normalized semantic version,
+the `major.minor` tag, and `latest` for a non-prerelease release.
 
 ## 3. Configure Traefik
 

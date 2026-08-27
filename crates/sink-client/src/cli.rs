@@ -4,7 +4,7 @@ use thiserror::Error;
 use crate::{
     config::{
         AuthToken, ConfigError, ConfigStore, ControlServerAddr, ResolvedConfig, RunOverrides,
-        SavedConfig, ServerAddressFallback,
+        SavedConfig,
     },
     target::{LocalTarget, PublicUrl},
 };
@@ -71,12 +71,8 @@ impl HttpArgs {
         }
     }
 
-    pub fn resolve_config(
-        &self,
-        saved: &SavedConfig,
-        fallback: ServerAddressFallback,
-    ) -> Result<ResolvedConfig, ConfigError> {
-        saved.resolve(self.run_overrides(), fallback)
+    pub fn resolve_config(&self, saved: &SavedConfig) -> Result<ResolvedConfig, ConfigError> {
+        saved.resolve(self.run_overrides())
     }
 }
 
@@ -138,7 +134,7 @@ mod tests {
             "http",
             "https://localhost:8443/base",
             "--url",
-            "https://demo.serus.eu",
+            "https://demo.example.com",
             "--authtoken",
             "one-run-secret",
             "--server-addr",
@@ -156,7 +152,7 @@ mod tests {
         );
         assert_eq!(
             args.url.as_ref().map(PublicUrl::requested_hostname),
-            Some("demo.serus.eu")
+            Some("demo.example.com")
         );
         assert_eq!(
             args.authtoken.as_ref().map(AuthToken::expose_secret),
@@ -209,7 +205,8 @@ mod tests {
 
     #[test]
     fn rejects_non_https_public_url_during_cli_parsing() {
-        let error = Cli::try_parse_from(["sink", "http", "3000", "--url", "http://demo.serus.eu"]);
+        let error =
+            Cli::try_parse_from(["sink", "http", "3000", "--url", "http://demo.example.com"]);
         assert!(error.is_err());
     }
 

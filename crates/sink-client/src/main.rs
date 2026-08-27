@@ -3,7 +3,7 @@ use std::{error::Error, future::pending, io, process::ExitCode};
 use clap::Parser as _;
 use sink_client::{
     cli::{Cli, ConfigField, SinkCommand},
-    config::{ConfigStore, ServerAddressFallback},
+    config::ConfigStore,
     runtime::{RequestSummary, TunnelPhase, TunnelRuntime},
 };
 use tokio::{sync::broadcast, task::JoinHandle};
@@ -39,7 +39,7 @@ async fn run() -> Result<(), BoxError> {
 async fn run_tunnel(arguments: sink_client::cli::HttpArgs) -> Result<(), BoxError> {
     let store = ConfigStore::platform()?;
     let saved = store.load()?;
-    let resolved = arguments.resolve_config(&saved, ServerAddressFallback::IntendedDefault)?;
+    let resolved = arguments.resolve_config(&saved)?;
     let runtime = TunnelRuntime::from_http(&arguments, resolved)?;
     let handle = runtime.handle();
 

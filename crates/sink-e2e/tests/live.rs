@@ -29,7 +29,7 @@ use hyper::{body::Incoming, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use sha2::{Digest as _, Sha256};
 use sink_client::{
-    config::{AuthToken, RunOverrides, SavedConfig, ServerAddressFallback},
+    config::{AuthToken, RunOverrides, SavedConfig},
     runtime::{
         ConnectionInfo, FailureDisposition, RuntimeError, RuntimeHandle, TunnelPhase, TunnelRuntime,
     },
@@ -575,14 +575,11 @@ fn client_runtime(
     target_addr: SocketAddr,
     requested_hostname: Option<&str>,
 ) -> TestResult<TunnelRuntime> {
-    let config = SavedConfig::default().resolve(
-        RunOverrides {
-            authtoken: Some(AuthToken::new(token.to_owned())?),
-            server_addr: Some(format!("http://{control_addr}").parse()?),
-            allow_plaintext_control: true,
-        },
-        ServerAddressFallback::RequireConfigured,
-    )?;
+    let config = SavedConfig::default().resolve(RunOverrides {
+        authtoken: Some(AuthToken::new(token.to_owned())?),
+        server_addr: Some(format!("http://{control_addr}").parse()?),
+        allow_plaintext_control: true,
+    })?;
     let target = LocalTarget::from_str(&format!("http://{target_addr}"))?;
     let public_url = requested_hostname
         .map(|hostname| PublicUrl::from_str(&format!("https://{hostname}")))

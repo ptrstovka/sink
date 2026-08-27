@@ -13,8 +13,8 @@ The shipped examples deliberately target a narrow, supportable MVP topology:
   separate record. A wildcard certificate covers `connect` and tunnel hosts,
   but not the apex unless it is also listed.
 - Only a single DNS label is a tunnel name. `connect` is reserved. Raw TCP,
-  UDP, Windows, Docker packaging, permanent name reservations, and a server
-  configuration file are outside MVP scope.
+  UDP, Windows, permanent name reservations, and a server configuration file
+  are outside MVP scope.
 - SQLite is local persistent state. Filesystem snapshots must account for WAL,
   and network filesystems are not an assumed/supported database substrate.
 - Sink imposes no application body-size or deliberately low tunnel-concurrency

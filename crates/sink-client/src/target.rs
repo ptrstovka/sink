@@ -370,10 +370,10 @@ mod tests {
 
     #[test]
     fn public_url_keeps_full_hostname_and_validates_claim() -> Result<(), PublicUrlError> {
-        let public = PublicUrl::from_str("https://Demo-42.serus.eu")?;
-        assert_eq!(public.requested_hostname(), "demo-42.serus.eu");
+        let public = PublicUrl::from_str("https://Demo-42.example.com")?;
+        assert_eq!(public.requested_hostname(), "demo-42.example.com");
         assert_eq!(public.subdomain().as_str(), "demo-42");
-        assert_eq!(public.as_url().as_str(), "https://demo-42.serus.eu/");
+        assert_eq!(public.as_url().as_str(), "https://demo-42.example.com/");
         Ok(())
     }
 
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn public_url_requires_bare_https_dns_hostname() {
         assert_eq!(
-            PublicUrl::from_str("http://demo.serus.eu"),
+            PublicUrl::from_str("http://demo.example.com"),
             Err(PublicUrlError::HttpsRequired)
         );
         assert_eq!(
@@ -396,11 +396,11 @@ mod tests {
             Err(PublicUrlError::IpAddress)
         );
         assert_eq!(
-            PublicUrl::from_str("https://demo.serus.eu/path"),
+            PublicUrl::from_str("https://demo.example.com/path"),
             Err(PublicUrlError::Path)
         );
         assert_eq!(
-            PublicUrl::from_str("https://demo.serus.eu:443"),
+            PublicUrl::from_str("https://demo.example.com:443"),
             Err(PublicUrlError::Port)
         );
     }
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn public_url_rejects_reserved_connect_claim() {
         assert!(matches!(
-            PublicUrl::from_str("https://connect.serus.eu"),
+            PublicUrl::from_str("https://connect.example.com"),
             Err(PublicUrlError::InvalidSubdomain(SubdomainError::Reserved))
         ));
     }

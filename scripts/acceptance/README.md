@@ -14,7 +14,7 @@ export SINK_ACCEPTANCE_CONFIRM=I_UNDERSTAND
 The runner never prints a Sink token and does not enable shell tracing. Keep
 tokens out of hook output and process logs. Hooks are absolute executable paths,
 receive no token arguments from the runner, and should read credentials from a
-restricted operator-controlled source.
+restricted owner-controlled source.
 
 ## Fixture and tunnel setup
 

@@ -1,4 +1,4 @@
-//! Clap command model and operator command execution.
+//! Clap command model and server administration command execution.
 
 use std::io::{self, Write};
 
@@ -106,7 +106,7 @@ pub enum AdminOutput {
 }
 
 impl AdminOutput {
-    /// Write operator-facing output. Creation and rotation are the only paths
+    /// Write administration output. Creation and rotation are the only paths
     /// that intentionally reveal a reusable token.
     pub fn write_terminal(&self, mut writer: impl Write) -> io::Result<()> {
         match self {
@@ -186,6 +186,7 @@ mod tests {
             "debug",
         ])?;
         assert!(matches!(serve.command, ServerCommand::Serve(_)));
+        assert!(Cli::try_parse_from(["sink-server", "serve"]).is_err());
 
         for command in ["create", "rotate-token", "disable", "enable"] {
             let parsed = Cli::try_parse_from([

@@ -1,6 +1,6 @@
 # Manual acceptance tests
 
-These workloads are release/operator gates, not normal CI. Run them only in an
+These workloads are release and deployment gates, not normal CI. Run them only in an
 isolated environment with enough disk, bandwidth, time, and permission to
 interrupt processes. Record server/client versions, OS/architecture, Traefik
 version/config hash, timestamps, public hostname, and results.

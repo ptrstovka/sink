@@ -40,7 +40,7 @@ Traefik. It does not protect a vulnerable local application merely by placing
 it behind a random URL. Request/response bodies are not captured for audit or
 replay.
 
-Operators remain responsible for host hardening, timely upgrades, DNS and
+You remain responsible for host hardening, timely upgrades, DNS and
 certificate control, firewalling, backups, log retention, abuse handling,
 capacity limits, and securely issuing tokens. See
 [deployment boundaries](deployment-boundaries.md).

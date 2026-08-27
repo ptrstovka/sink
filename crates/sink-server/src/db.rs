@@ -174,7 +174,7 @@ impl Database {
         self.set_enabled(username, true).await
     }
 
-    /// List only operator-safe user metadata. The query intentionally never
+    /// List only safe account metadata. The query intentionally never
     /// selects the token digest.
     pub async fn list_users(&self) -> Result<Vec<UserSummary>, DbError> {
         let rows = sqlx::query_as::<_, UserRow>(

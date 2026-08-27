@@ -20,4 +20,5 @@ installed release's `--help` when automating across versions.
   `SINK_SERVER_LOG_LEVEL`.
 
 The deployment examples use these exact server settings. Never compensate for
-a version mismatch by weakening TLS defaults.
+a version mismatch by weakening TLS defaults. The public base domain and client
+server address have no defaults; both must be configured explicitly.

@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "sink-client"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "clap",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "sink-e2e"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "bytes",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "sink-protocol"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "futures",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "sink-server"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "base64",

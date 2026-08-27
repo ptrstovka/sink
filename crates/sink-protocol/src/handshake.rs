@@ -155,7 +155,7 @@ mod tests {
     fn hello_round_trips_without_token_material() -> Result<(), Box<dyn std::error::Error>> {
         let hello = ClientHello::new(
             Uuid::parse_str("f3ebc60f-6e4f-45b9-836e-3d1ed9c76e58")?,
-            Some("demo.serus.eu".to_owned()),
+            Some("demo.example.com".to_owned()),
             "0.1.0",
         );
         let json = serde_json::to_string(&hello)?;

@@ -1,4 +1,4 @@
-//! Persistence, configuration, and operator-facing foundations for `sink-server`.
+//! Persistence, configuration, and administration foundations for `sink-server`.
 
 pub mod admin;
 pub mod config;

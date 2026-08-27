@@ -1,4 +1,4 @@
-# Client guide
+# Client reference
 
 ## Install and configure
 
@@ -12,7 +12,7 @@ install -m 0755 sink ~/.local/bin/sink
 ```
 
 On macOS, use `shasum -a 256 -c SHA256SUMS` if `sha256sum` is unavailable.
-Store the operator-issued token and the control address:
+Store the token you created on your server and its control address:
 
 ```console
 sink config add-server-addr https://connect.example.com
@@ -36,7 +36,7 @@ sink http 3000 --url https://demo.example.com
 A number means HTTP on localhost. A target without a scheme defaults to HTTP;
 an explicit `https://` uses TLS to the local service. With no `--url`, the
 server allocates a subdomain. A chosen URL must be one valid DNS label below
-the operator's base domain, and `connect` is reserved.
+your server's base domain, and `connect` is reserved.
 
 The client prints its local target, public HTTP and HTTPS URLs, connection
 state, and completed-request summaries. Keep it running. After a transient
@@ -54,13 +54,13 @@ validated by default; `--local-tls-insecure` applies only to an explicit
 
 ## Common failures
 
-- Authentication rejected permanently: ask the operator whether the user was
-  disabled or the token rotated, then save the new token.
+- Authentication rejected permanently: check whether you disabled the account
+  or rotated its token on your server, then save the current token.
 - Address conflict: choose another name or wait until the active claimant exits.
 - Public `503`: the client is disconnected or its local target is unavailable;
   start the target and retry a new request.
 - Local HTTPS certificate error: fix the certificate trust/hostname. Use the
   development opt-out only for a target you control.
-- Missing token configuration: save the token or pass `--authtoken`. The
-  server address defaults to `https://connect.serus.eu`; save or override it
-  when using another deployment.
+- Missing configuration: save the token and server address, or pass
+  `--authtoken` and `--server-addr` for that run. Sink has no built-in server
+  address.
