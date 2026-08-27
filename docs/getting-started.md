@@ -1,15 +1,13 @@
 # Get Sink running
 
-Sink has two small programs, but you do not need to think of them as tools for
-two different kinds of people:
+One Sink installation has two programs:
 
 - `sink-server` runs on your internet-facing server, behind Traefik.
 - `sink` runs on your computer and connects one of your local apps to that
   server.
 
-For a personal setup, you manage both. Sink supports more accounts if you need
-them later, but the friendly default is one server, one account, and one token
-for you.
+You normally manage both. Start with one server, one account, and one token;
+you can add more accounts later.
 
 ## 1. Start your server
 
@@ -98,7 +96,6 @@ hosts to `http://127.0.0.1:42424`. Adapt the supplied files under
 `deploy/traefik/` and replace `example.com` with your domain. Keep HTTP enabled
 for public tunnel hosts; only plaintext control traffic is redirected to HTTPS.
 
-That is the complete personal setup. Use the [server deployment
-reference](server-reference.md) for DNS, TLS, backups, upgrades, and hardening,
-and the [client reference](client-reference.md) when you need less common target or
-TLS options.
+Use the [server deployment reference](server-reference.md) for DNS, TLS,
+backups, upgrades, and hardening. The [client reference](client-reference.md)
+covers target formats, reconnect behavior, and TLS options.

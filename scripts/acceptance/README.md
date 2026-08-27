@@ -12,14 +12,13 @@ export SINK_ACCEPTANCE_CONFIRM=I_UNDERSTAND
 ```
 
 The runner never prints a Sink token and does not enable shell tracing. Keep
-tokens out of hook output and process logs. Hooks are absolute executable paths,
-receive no token arguments from the runner, and should read credentials from a
-restricted owner-controlled source.
+tokens out of hook output and process logs. Hooks are absolute executable
+paths, receive no token arguments from the runner, and should read credentials
+from a restricted file or secret store.
 
 ## Fixture and tunnel setup
 
-After the workspace lockfile has been reconciled by the integration owner,
-build the manual fixture:
+Build the manual fixture from a clean checkout with the committed lockfile:
 
 ```sh
 cargo build --locked --release -p sink-e2e --bin acceptance-fixture
@@ -33,7 +32,7 @@ target/release/acceptance-fixture
 ```
 
 In separate terminals, start an isolated `sink-server`, create a dedicated
-user, and run `sink http 127.0.0.1:3000` with a chosen acceptance hostname.
+account, and run `sink http 127.0.0.1:3000` with a chosen acceptance hostname.
 Use the explicit plaintext-control override only when the control listener is a
 loopback `http://127.0.0.1:<port>` address. Then set:
 
@@ -42,7 +41,7 @@ export SINK_ACCEPTANCE_PUBLIC_URL=http://chosen-host.example.test
 export SINK_ACCEPTANCE_FIXTURE_URL=http://127.0.0.1:3000
 ```
 
-The fixture contract is `/health`, `/ordinary/<id>`, `PUT /upload`,
+The fixture exposes `/health`, `/ordinary/<id>`, `PUT /upload`,
 `GET /download`, `/sse`, `/ws`, `POST /side-effect`, and `/stats`.
 
 ## Data, mixed traffic, soak, and cancellation
@@ -82,14 +81,14 @@ assumes a process manager. Each check hook must exit zero only when the expected
 state is observed. Configure the following executable paths:
 
 ```sh
-# claims: this hook is the raw conflicting start and must itself exit nonzero
+# Claims
 export SINK_ACCEPTANCE_CONFLICT_HOOK=/absolute/path/start-conflicting-client
 export SINK_ACCEPTANCE_LINK_INTERRUPT_HOOK=/absolute/path/cut-and-restore-link
 export SINK_ACCEPTANCE_PRIMARY_STOP_HOOK=/absolute/path/stop-primary-client
 export SINK_ACCEPTANCE_REPLACEMENT_START_HOOK=/absolute/path/start-replacement-client
 scripts/acceptance/run.sh claims
 
-# revocation: rotate, prove old client stopped permanently, start new, disable, prove stop
+# Revocation
 export SINK_ACCEPTANCE_ROTATE_HOOK=/absolute/path/rotate-dedicated-user-token
 export SINK_ACCEPTANCE_OLD_CREDENTIAL_CHECK_HOOK=/absolute/path/assert-old-client-stopped
 export SINK_ACCEPTANCE_NEW_CLIENT_START_HOOK=/absolute/path/start-new-token-client
@@ -97,7 +96,7 @@ export SINK_ACCEPTANCE_DISABLE_HOOK=/absolute/path/disable-dedicated-user
 export SINK_ACCEPTANCE_DISABLED_CLIENT_CHECK_HOOK=/absolute/path/assert-disabled-client-stopped
 scripts/acceptance/run.sh revocation
 
-# shutdown: signal once/check bounded drain, then independently exercise a repeated signal
+# Shutdown
 export SINK_ACCEPTANCE_CLIENT_SHUTDOWN_HOOK=/absolute/path/signal-client-once
 export SINK_ACCEPTANCE_CLIENT_EXIT_CHECK_HOOK=/absolute/path/assert-client-exited
 export SINK_ACCEPTANCE_CLIENT_REPEAT_SIGNAL_HOOK=/absolute/path/test-client-repeated-signal
@@ -107,7 +106,7 @@ export SINK_ACCEPTANCE_SERVER_REPEAT_SIGNAL_HOOK=/absolute/path/test-server-repe
 scripts/acceptance/run.sh shutdown
 ```
 
-Hook scripts should refuse broad or production targets, avoid `eval`, avoid
-printing commands containing credentials, and record the exact process IDs or
-service names they intend to affect before mutating anything. Remove the
-dedicated acceptance user and payload directory manually after review.
+Scope hooks to the isolated test processes. Resolve exact process IDs or
+service names before changing their state, do not use `eval`, and do not print
+credentials. Remove the acceptance account and payload directory when
+finished.

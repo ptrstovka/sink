@@ -1,13 +1,12 @@
 # sink
 
-Sink is a minimal self-hosted HTTP/HTTPS reverse tunnel. A developer runs the
-`sink` client beside a local web service; `sink-server` makes that service
-available at a generated or chosen subdomain of their own domain.
+Sink is a self-hosted reverse tunnel for HTTP and HTTPS. Run the `sink` client
+beside a local web service, and `sink-server` makes it available at a generated
+or chosen subdomain of your own domain.
 
-The MVP is implemented as a Rust workspace. Its contract includes streaming
-bodies, large transfers, SSE, WebSockets,
-concurrent requests, reconnect with the same public address, and multi-user
-bearer-token authentication.
+Sink streams request and response bodies without buffering them in full. It
+supports large transfers, SSE, WebSockets, concurrent requests, reconnecting
+with the same public address, and bearer-token accounts.
 
 ## How it fits together
 
@@ -29,11 +28,9 @@ arm64/x86_64. Linux archives use musl targets. Each archive contains `sink` and
 `SHA256SUMS` before installing. Published releases also produce a multi-platform
 server image at `ghcr.io/ptrstovka/sink-server`.
 
-For the shortest path from an empty server to your first tunnel, follow
-[Get Sink running](docs/getting-started.md). It treats the server and client as
-two pieces managed by the same person. The [server deployment
-reference](docs/server-reference.md) and [client reference](docs/client-reference.md)
-cover the details.
+[Get Sink running](docs/getting-started.md) installs both programs and opens the
+first tunnel. Use the [server deployment reference](docs/server-reference.md)
+and [client reference](docs/client-reference.md) for the remaining options.
 
 ## Quick client use
 
@@ -51,26 +48,24 @@ connection and local HTTPS targets validate certificates by default.
 
 ```console
 sink-server serve --public-base-domain example.com
-sink-server user create alice
+sink-server user create me
 sink-server user list
-sink-server user rotate-token alice
-sink-server user disable alice
-sink-server user enable alice
+sink-server user rotate-token me
+sink-server user disable me
+sink-server user enable me
 ```
 
-The command families above are part of the MVP contract; all current options
-are summarized in the [CLI reference](docs/cli-reference.md). Check each
-installed binary's `--help` before automating across versions.
+The [CLI reference](docs/cli-reference.md) summarizes the available commands
+and settings.
 
-## Verification policy
+## Tests
 
-Normal CI runs formatting, Clippy with warnings denied, and bounded workspace
-tests. The 1 GiB transfer checks, one-hour soak, and disruption/performance
-stress workloads are deliberately manual and opt-in. See
-[manual acceptance tests](docs/acceptance-tests.md).
+CI runs formatting, Clippy with warnings denied, and bounded workspace tests.
+Run the 1 GiB transfers, one-hour soak, and disruption/performance workloads
+manually. See [manual acceptance tests](docs/acceptance-tests.md).
 
-## Scope and license
+## Limits and license
 
-Known infrastructure and product limits are recorded in
-[deployment boundaries](docs/deployment-boundaries.md). Sink is dual-licensed
-under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+See [deployment boundaries](docs/deployment-boundaries.md) before changing the
+documented topology. Sink is available under either the [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE) license.

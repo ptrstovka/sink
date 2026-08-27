@@ -19,10 +19,9 @@ sink config add-server-addr https://connect.example.com
 sink config add-authtoken TOKEN
 ```
 
-The credential file is user-private. Do not copy it into a repository, image,
-shell history, ticket, or chat. A one-run override is available with
-`--authtoken` and `--server-addr`; command-line secrets may be visible in local
-process listings, so saved configuration is preferable.
+The config file is readable only by your account. Keep it out of repositories
+and images. One-run overrides are available with `--authtoken` and
+`--server-addr`, but command-line secrets may be visible in process listings.
 
 ## Open a tunnel
 
@@ -54,8 +53,9 @@ validated by default; `--local-tls-insecure` applies only to an explicit
 
 ## Common failures
 
-- Authentication rejected permanently: check whether you disabled the account
-  or rotated its token on your server, then save the current token.
+- Authentication rejected: the client will not retry invalid credentials.
+  Check whether the account is disabled or its token was rotated, then save the
+  current token.
 - Address conflict: choose another name or wait until the active claimant exits.
 - Public `503`: the client is disconnected or its local target is unavailable;
   start the target and retry a new request.

@@ -1,22 +1,19 @@
 # Manual acceptance tests
 
-These workloads are release and deployment gates, not normal CI. Run them only in an
-isolated environment with enough disk, bandwidth, time, and permission to
-interrupt processes. Record server/client versions, OS/architecture, Traefik
-version/config hash, timestamps, public hostname, and results.
+These tests transfer multi-gigabyte data, run for an hour, and deliberately
+interrupt connections and processes. Run them manually in an isolated
+environment.
 
-Use the repository's guarded harness under `scripts/acceptance/`. The checks
-below describe the required observable behavior and remain useful for
-independent verification.
+Use the guarded harness under `scripts/acceptance/`.
 
 ## Baseline setup
 
-Create two enabled users and start local fixtures that can echo request bodies,
-serve deterministic downloads, stream SSE indefinitely, and echo WebSockets.
-Start a tunnel, record both printed URLs, then verify ordinary methods, paths,
-queries, status codes, end-to-end headers, public forwarded headers, and local
-virtual-host routing. Confirm an unknown host is distinct from a known tunnel
-whose client/local target is unavailable.
+Create two enabled accounts and start local fixtures that can echo request
+bodies, serve deterministic downloads, stream SSE indefinitely, and echo
+WebSockets. Start a tunnel, record both printed URLs, then verify ordinary
+methods, paths, queries, status codes, end-to-end headers, public forwarded
+headers, and local virtual-host routing. Confirm an unknown host is distinct
+from a known tunnel whose client/local target is unavailable.
 
 ## Required manual gates
 
@@ -44,16 +41,8 @@ whose client/local target is unavailable.
    must be released promptly without disrupting unrelated traffic.
 8. Claims/auth: prove two clients cannot simultaneously claim one custom name;
    prove same-run reconnect reclaims it; prove a clean stop releases it. Rotate
-   one user's token and disable another while tunnels are active, confirming
+   one account's token and disable another while tunnels are active, confirming
    immediate closure and permanent authentication failure for old credentials.
 9. Shutdown: send one normal termination and observe bounded drain; send a
    second termination and observe immediate exit. Claims must release and
    interrupted application operations must not replay.
-
-## Pass record
-
-Preserve command transcripts with secrets redacted, request/result counts,
-hashes for both 1 GiB directions, reconnect durations, resource samples, and
-relevant logs. A failure is not waived merely because a later retry passes;
-capture it, determine the cause, fix or document the infrastructure boundary,
-and rerun the affected gate.

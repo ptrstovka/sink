@@ -7,49 +7,42 @@
 - Traefik is the public TLS boundary. It forwards plaintext HTTP to one
   `sink-server` listener, so that hop must stay on loopback or an equivalently
   trusted private network.
-- Client control traffic authenticates with a per-user bearer token over TLS.
-  The client validates the control hostname and never silently downgrades.
-- The client-to-local-service hop is controlled by the user. Explicit HTTPS
-  validates the target certificate by default.
+- Client control traffic authenticates with a per-account bearer token over
+  TLS. The client validates the control hostname and never silently
+  downgrades.
+- You control the client-to-local-service hop. Explicit HTTPS validates the
+  target certificate by default.
 - SQLite and the server host are trusted administrative assets. Compromise of
-  either can alter users, traffic routing, or service behavior.
+  either can alter accounts, traffic routing, or service behavior.
 
-## Product controls
+## Credentials and tunnel claims
 
 Tokens are high-entropy, shown only when created or rotated, and stored by the
-server only as one-way digests. The client stores its token in a user-private
-file. Tokens are excluded from logs, routine errors, user listings, forwarded
-headers, and local request summaries. Disable or rotation revokes active
-sessions and releases their claims.
+server only as one-way digests. The client stores its token in a private config
+file. Tokens are excluded from logs, routine errors, account listings,
+forwarded headers, and local request summaries. Disable or rotation revokes
+active sessions and releases their claims.
 
 The `connect` subdomain is reserved. Other valid single-label names are
-first-claim active-session leases; a conflict cannot displace the owner. A
-transiently disconnected run may reclaim its name during a bounded grace
-period. Sink does not replay interrupted application requests.
+first-claim active-session leases; a conflict cannot displace the active
+claimant. A transiently disconnected run may reclaim its name during a bounded
+grace period. Sink does not replay interrupted application requests.
 
-End-to-end HTTP semantics are preserved, including forwarded public host,
-scheme, and visitor address. Traefik must sanitize client-supplied forwarded
-headers and trust such headers from an upstream load balancer only by explicit
-source range.
+## Forwarded headers
 
-## Not provided by the MVP
+Sink forwards the public host, scheme, and visitor address to the local
+application. Traefik must replace visitor-supplied forwarding headers. If
+another proxy sits in front of Traefik, trust its headers only from its known
+source addresses.
 
-Sink is not a WAF, DDoS service, malware scanner, content inspector, tenant
-quota system, public visitor identity layer, or end-to-end TLS tunnel through
-Traefik. It does not protect a vulnerable local application merely by placing
-it behind a random URL. Request/response bodies are not captured for audit or
-replay.
+## Outside Sink's scope
 
-You remain responsible for host hardening, timely upgrades, DNS and
-certificate control, firewalling, backups, log retention, abuse handling,
-capacity limits, and securely issuing tokens. See
-[deployment boundaries](deployment-boundaries.md).
+Sink does not authenticate public visitors, inspect or retain HTTP bodies, or
+apply per-account quotas. It is not a WAF, DDoS service, or malware scanner.
+Public TLS ends at Traefik, and a random tunnel URL is not access control.
 
-## Incident actions
+## Leaked token
 
-For a suspected token leak, rotate the user's token immediately, confirm their
-active tunnels closed, issue the replacement through a secret channel, and
-review authentication/tunnel lifecycle logs. For host or database compromise,
-take the service out of rotation, preserve evidence, rotate all user tokens and
-TLS material as appropriate, restore from a known-good system, and validate
-with the acceptance checklist before returning traffic.
+If a token leaks, rotate it immediately, confirm the affected tunnels closed,
+and save the replacement in the client config. Rotation invalidates the old
+token and closes its active tunnels.

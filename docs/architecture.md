@@ -31,10 +31,10 @@ clean exit releases it, while an unexpected disconnect retains it briefly for
 same-run reconnection. Requests during that gap return service unavailable.
 Interrupted in-flight traffic fails and is never automatically replayed.
 
-SQLite stores users, enabled state, token digest/generation, and other durable
-administrative data. Public claims are runtime leases rather than permanent
-reservations. A short revocation check closes active sessions after user
-disable or token rotation.
+SQLite stores accounts, enabled state, token digest/generation, and other
+durable administrative data. Public claims are runtime leases rather than
+permanent reservations. A short revocation check closes active sessions after
+account disable or token rotation.
 
 Forwarding preserves method, path, query, body, status, and end-to-end headers.
 The local Host targets the local service; standard forwarded headers carry the

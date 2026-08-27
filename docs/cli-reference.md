@@ -1,8 +1,5 @@
 # CLI reference
 
-These names are implemented by the client and server command models. Check the
-installed release's `--help` when automating across versions.
-
 - Client: `sink http <target>`, `sink config add-authtoken TOKEN`, and `sink
   config add-server-addr SERVER`.
 - Client tunnel options: `--url`, `--authtoken`, and `--server-addr`.
@@ -19,6 +16,5 @@ installed release's `--help` when automating across versions.
   `SINK_SERVER_SQLITE_PATH`, and `--log-level` /
   `SINK_SERVER_LOG_LEVEL`.
 
-The deployment examples use these exact server settings. Never compensate for
-a version mismatch by weakening TLS defaults. The public base domain and client
-server address have no defaults; both must be configured explicitly.
+The public base domain and client server address have no defaults; configure
+both explicitly.
