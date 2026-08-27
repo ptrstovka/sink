@@ -67,5 +67,4 @@ manually. See [manual acceptance tests](docs/acceptance-tests.md).
 ## Limits and license
 
 See [deployment boundaries](docs/deployment-boundaries.md) before changing the
-documented topology. Sink is available under either the [MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE-APACHE) license.
+documented topology. Sink is available under the [MIT](LICENSE-MIT) license.

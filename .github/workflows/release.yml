@@ -80,9 +80,8 @@ jobs:
           install -m 0755 "target/${{ matrix.target }}/release/sink" dist/package/sink
           install -m 0755 "target/${{ matrix.target }}/release/sink-server" dist/package/sink-server
           install -m 0644 LICENSE-MIT dist/package/LICENSE-MIT
-          install -m 0644 LICENSE-APACHE dist/package/LICENSE-APACHE
           tar -C dist/package -czf "dist/${archive}" \
-            sink sink-server LICENSE-MIT LICENSE-APACHE
+            sink sink-server LICENSE-MIT
 
       - name: Store release archive
         uses: actions/upload-artifact@v7

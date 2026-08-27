@@ -22,7 +22,7 @@ RUN addgroup -S -g 10001 sink \
     && chown sink:sink /data
 
 COPY --from=builder /tmp/sink-server /usr/local/bin/sink-server
-COPY LICENSE-MIT LICENSE-APACHE /licenses/
+COPY LICENSE-MIT /licenses/
 
 ENV SINK_SERVER_LISTEN_ADDRESS=0.0.0.0:8080 \
     SINK_SERVER_SQLITE_PATH=/data/sink.sqlite3
