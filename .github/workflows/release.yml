@@ -49,6 +49,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install target
         run: rustup target add "${{ matrix.target }}"
@@ -83,7 +85,7 @@ jobs:
             sink sink-server LICENSE-MIT LICENSE-APACHE
 
       - name: Store release archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.archive_suffix }}
           path: dist/*.tar.gz
@@ -97,7 +99,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
@@ -110,4 +112,6 @@ jobs:
       - name: Upload assets to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${RELEASE_TAG}" dist/*.tar.gz dist/SHA256SUMS --clobber
+        run: >-
+          gh release upload "${RELEASE_TAG}" dist/*.tar.gz dist/SHA256SUMS
+          --clobber --repo "${GITHUB_REPOSITORY}"
