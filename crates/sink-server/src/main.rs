@@ -31,6 +31,10 @@ async fn run() -> Result<(), BoxError> {
             Ok(())
         }
         ServerCommand::Serve(arguments) => serve(arguments).await,
+        ServerCommand::Version => {
+            println!("sink-server {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }
 

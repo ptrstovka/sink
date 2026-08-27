@@ -26,6 +26,8 @@ pub enum SinkCommand {
     Http(Box<HttpArgs>),
     /// Save client configuration.
     Config(ConfigArgs),
+    /// Print the Sink client version.
+    Version,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -185,6 +187,13 @@ mod tests {
                 command: ConfigCommand::AddServerAddr { .. }
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_version_command() -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from(["sink", "version"])?;
+        assert!(matches!(cli.command, SinkCommand::Version));
         Ok(())
     }
 

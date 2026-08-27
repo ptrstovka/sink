@@ -33,6 +33,10 @@ async fn run() -> Result<(), BoxError> {
             Ok(())
         }
         SinkCommand::Http(arguments) => run_tunnel(*arguments).await,
+        SinkCommand::Version => {
+            println!("sink {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }
 

@@ -27,6 +27,8 @@ pub enum ServerCommand {
     Serve(ServeArgs),
     /// Manage users and one-time bearer tokens.
     User(UserArgs),
+    /// Print the Sink server version.
+    Version,
 }
 
 #[derive(Args, Debug)]
@@ -214,6 +216,9 @@ mod tests {
                 ..
             })
         ));
+
+        let version = Cli::try_parse_from(["sink-server", "version"])?;
+        assert!(matches!(version.command, ServerCommand::Version));
         Ok(())
     }
 
