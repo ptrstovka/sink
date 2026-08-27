@@ -58,8 +58,7 @@ docker compose exec sink-server sink-server user create me
 
 The example binds only `127.0.0.1:42424` on the host for a same-host Traefik
 service. Keep the named volume for upgrades. When replacing it with a bind
-mount, make the host directory writable by UID/GID `10001`. The GHCR package
-may require `docker login ghcr.io` until its package visibility is made public.
+mount, make the host directory writable by UID/GID `10001`.
 
 ## 3. Configure Traefik
 

@@ -34,10 +34,6 @@ named `sink-data` volume, so recreating or upgrading the container does not
 remove your account or token state. `docker compose ps` shows whether the
 server's built-in HTTP health check is passing.
 
-If GHCR asks you to authenticate, run `docker login ghcr.io`. After the first
-image is published, you can make the package public in its GitHub package
-settings if you want anonymous pulls.
-
 Replace `example.com` with your own domain. Sink has no built-in domain and the
 server refuses to start until `SINK_SERVER_PUBLIC_BASE_DOMAIN` or
 `--public-base-domain` is set.
