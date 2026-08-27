@@ -31,21 +31,25 @@ jobs:
           - runner: macos-15
             target: aarch64-apple-darwin
             archive_suffix: macos-arm64
+            macos: true
             install_musl: false
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             archive_suffix: macos-x86_64
+            macos: true
             install_musl: false
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive_suffix: linux-arm64
+            macos: false
             install_musl: true
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             archive_suffix: linux-x86_64
+            macos: false
             install_musl: true
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -71,17 +75,148 @@ jobs:
           cargo build --release --locked --target "${{ matrix.target }}"
           --bin sink --bin sink-server
 
-      - name: Package binaries
+      - name: Prepare release package
         shell: bash
         run: |
           set -euo pipefail
-          archive="sink-${RELEASE_TAG}-${{ matrix.archive_suffix }}.tar.gz"
           mkdir -p dist/package
           install -m 0755 "target/${{ matrix.target }}/release/sink" dist/package/sink
           install -m 0755 "target/${{ matrix.target }}/release/sink-server" dist/package/sink-server
           install -m 0644 LICENSE-MIT dist/package/LICENSE-MIT
+
+      - name: Import Apple signing certificate
+        if: matrix.macos
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_DEVELOPER_ID_P12:?Missing APPLE_DEVELOPER_ID_P12 secret}"
+          : "${APPLE_DEVELOPER_ID_P12_PASSWORD:?Missing APPLE_DEVELOPER_ID_P12_PASSWORD secret}"
+          : "${APPLE_TEAM_ID:?Missing APPLE_TEAM_ID secret}"
+
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/apple-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+
+          printf '%s' "$APPLE_DEVELOPER_ID_P12" | /usr/bin/base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+
+          signing_identity="$(
+            security find-identity -v -p codesigning "$keychain_path" |
+              awk -v team="$APPLE_TEAM_ID" \
+                'index($0, "Developer ID Application:") && index($0, "(" team ")") { print $2; exit }'
+          )"
+          if [[ -z "$signing_identity" ]]; then
+            echo "No Developer ID Application identity found for team $APPLE_TEAM_ID" >&2
+            security find-identity -v -p codesigning "$keychain_path"
+            exit 1
+          fi
+
+          echo "APPLE_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
+          echo "APPLE_SIGNING_IDENTITY=$signing_identity" >> "$GITHUB_ENV"
+
+      - name: Sign macOS binaries
+        if: matrix.macos
+        shell: bash
+        run: |
+          set -euo pipefail
+          for binary in dist/package/sink dist/package/sink-server; do
+            codesign \
+              --force \
+              --keychain "$APPLE_KEYCHAIN_PATH" \
+              --options runtime \
+              --timestamp \
+              --sign "$APPLE_SIGNING_IDENTITY" \
+              "$binary"
+            codesign --verify --strict --verbose=2 "$binary"
+          done
+
+      - name: Notarize macOS binaries
+        if: matrix.macos
+        shell: bash
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_API_ISSUER_ID:?Missing APPLE_API_ISSUER_ID secret}"
+          : "${APPLE_API_KEY_ID:?Missing APPLE_API_KEY_ID secret}"
+          : "${APPLE_API_KEY_P8:?Missing APPLE_API_KEY_P8 secret}"
+
+          api_key_path="$RUNNER_TEMP/notary-api-key.p8"
+          submission_path="$RUNNER_TEMP/sink-${{ matrix.archive_suffix }}-notarization.zip"
+          result_path="$RUNNER_TEMP/notarization-result.json"
+          log_path="$RUNNER_TEMP/notarization-log.json"
+
+          printf '%s' "$APPLE_API_KEY_P8" > "$api_key_path"
+          chmod 0600 "$api_key_path"
+          /usr/bin/ditto -c -k --keepParent dist/package "$submission_path"
+
+          submit_exit=0
+          xcrun notarytool submit "$submission_path" \
+            --key "$api_key_path" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait \
+            --output-format json > "$result_path" || submit_exit=$?
+          cat "$result_path"
+
+          submission_id="$(
+            /usr/bin/plutil -extract id raw -o - "$result_path" 2>/dev/null || true
+          )"
+          status="$(
+            /usr/bin/plutil -extract status raw -o - "$result_path" 2>/dev/null || true
+          )"
+          if [[ -z "$submission_id" ]]; then
+            echo "Notary service did not return a submission ID" >&2
+            exit 1
+          fi
+
+          xcrun notarytool log "$submission_id" \
+            --key "$api_key_path" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            "$log_path"
+          cat "$log_path"
+
+          if (( submit_exit != 0 )) || [[ "$status" != "Accepted" ]]; then
+            echo "Apple notarization failed with status: ${status:-unknown}" >&2
+            exit 1
+          fi
+
+          for binary in dist/package/sink dist/package/sink-server; do
+            spctl --assess --type execute --verbose=4 "$binary"
+          done
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="sink-${RELEASE_TAG}-${{ matrix.archive_suffix }}.tar.gz"
           tar -C dist/package -czf "dist/${archive}" \
             sink sink-server LICENSE-MIT
+
+      - name: Remove temporary Apple credentials
+        if: always() && matrix.macos
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/apple-signing.keychain-db" 2>/dev/null || true
+          rm -f \
+            "$RUNNER_TEMP/developer-id.p12" \
+            "$RUNNER_TEMP/notary-api-key.p8"
 
       - name: Store release archive
         uses: actions/upload-artifact@v7

@@ -26,7 +26,8 @@ GitHub Releases contain archives for macOS arm64/x86_64 and Linux
 arm64/x86_64. Linux archives use musl targets. Each archive contains `sink` and
 `sink-server` plus both license texts; verify it against the release's
 `SHA256SUMS` before installing. Published releases also produce a multi-platform
-server image at `ghcr.io/ptrstovka/sink-server`.
+server image at `ghcr.io/ptrstovka/sink-server`. The macOS executables are
+Developer ID signed and notarized by Apple.
 
 [Get Sink running](docs/getting-started.md) installs both programs and opens the
 first tunnel. Use the [server deployment reference](docs/server-reference.md)
@@ -63,6 +64,12 @@ and settings.
 CI runs formatting, Clippy with warnings denied, and bounded workspace tests.
 Run the 1 GiB transfers, one-hour soak, and disruption/performance workloads
 manually. See [manual acceptance tests](docs/acceptance-tests.md).
+
+## Releasing
+
+Published releases build all supported binaries and the server container. The
+[release guide](docs/releasing.md) documents the Apple credentials required for
+macOS signing and notarization.
 
 ## Limits and license
 
