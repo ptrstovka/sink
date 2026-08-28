@@ -134,10 +134,19 @@ jobs:
           security import "$certificate_path" \
             -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" \
             -A -t cert -f pkcs12 -k "$keychain_path"
-          security import "$g1_intermediate_path" \
-            -A -t cert -f x509 -k "$keychain_path"
-          security import "$g2_intermediate_path" \
-            -A -t cert -f x509 -k "$keychain_path"
+          for intermediate_path in "$g1_intermediate_path" "$g2_intermediate_path"; do
+            if ! import_output="$(
+              security import "$intermediate_path" \
+                -A -t cert -f x509 -k "$keychain_path" 2>&1
+            )"; then
+              printf '%s\n' "$import_output"
+              if [[ "$import_output" != *'already exists in the keychain'* ]]; then
+                exit 1
+              fi
+            else
+              printf '%s\n' "$import_output"
+            fi
+          done
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: -s \
             -k "$keychain_password" "$keychain_path"
