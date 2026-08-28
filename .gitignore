@@ -4,3 +4,5 @@
 *.db-wal
 .DS_Store
 .env
+.playwright-cli/
+.playwright-mcp/

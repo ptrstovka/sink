@@ -44,3 +44,29 @@ Forwarding preserves method, path, query, body, status, and end-to-end headers.
 The local Host targets the local service; standard forwarded headers carry the
 original public host/scheme and visitor address. Control credentials never
 enter the forwarded HTTP exchange.
+
+## Local traffic inspector
+
+Inspection is a client-process side branch of the streaming proxy, not a hop in
+the forwarding path. When enabled, capture writes lightweight metadata and
+bounded body previews to a mutex-protected, process-local memory store. Event
+publication uses a bounded non-blocking channel, so a slow dashboard cannot
+backpressure tunneled traffic. The list API builds lightweight summaries; the
+detail API fetches one retained request/response snapshot, and an SSE stream
+announces create, update, removal, clear, pause, and resynchronization events.
+
+The store retains at most 100 transactions and 1 MiB from each request or
+response body by default. Oldest entries are evicted. Full transferred byte
+counts remain available when a preview is truncated, and binary body bytes are
+omitted. Delete, clear, eviction, shutdown, and process exit release ownership;
+they do not promise physical-memory zeroization. A late capture update cannot
+resurrect an entry after removal.
+
+The dashboard binds only to IPv4 loopback and is supervised separately from the
+tunnel connection. An automatic bind failure is reported while the tunnel can
+continue; failure of an explicitly selected port fails startup. On graceful
+client shutdown, the dashboard closes its SSE streams and listener and releases
+its in-memory services. The production Vite output is built once before Cargo;
+Cargo embeds those exact files in `sink` and never runs npm or downloads assets.
+At runtime the binary serves only embedded bytes and needs no Node.js,
+dashboard filesystem, or CDN.

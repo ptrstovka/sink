@@ -11,9 +11,12 @@ name = "sink"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
+brotli = "8.0.4"
 bytes.workspace = true
 clap.workspace = true
 directories.workspace = true
+flate2 = "1.1.10"
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
@@ -37,6 +40,9 @@ uuid.workspace = true
 webpki-roots = "1"
 yamux.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true

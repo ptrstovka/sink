@@ -56,6 +56,19 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
+      - name: Set up Node.js with npm cache
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Build and verify embedded dashboard
+        working-directory: dashboard
+        run: |
+          npm ci
+          npm run verify
+
       - name: Install target
         run: rustup target add "${{ matrix.target }}"
 
@@ -204,6 +217,157 @@ jobs:
           archive="sink-${RELEASE_TAG}-${{ matrix.archive_suffix }}.tar.gz"
           tar -C dist/package -czf "dist/${archive}" \
             sink sink-server LICENSE-MIT
+
+      - name: Verify unpacked release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="sink-${RELEASE_TAG}-${{ matrix.archive_suffix }}.tar.gz"
+          verification_dir="$RUNNER_TEMP/release-verification-${{ matrix.archive_suffix }}"
+          mkdir -p "$verification_dir"
+          tar -C "$verification_dir" -xzf "dist/${archive}"
+          release_version="${RELEASE_TAG#v}"
+          sink_version="$("$verification_dir/sink" version)"
+          server_version="$("$verification_dir/sink-server" version)"
+          if [[ "$sink_version" != "sink $release_version" ]]; then
+            echo "Packaged sink version does not match $RELEASE_TAG: $sink_version" >&2
+            exit 1
+          fi
+          if [[ "$server_version" != "sink-server $release_version" ]]; then
+            echo "Packaged sink-server version does not match $RELEASE_TAG: $server_version" >&2
+            exit 1
+          fi
+
+      - name: Smoke packaged embedded dashboard
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          verification_dir="$RUNNER_TEMP/release-verification-${{ matrix.archive_suffix }}"
+          smoke_root="$RUNNER_TEMP/embedded-dashboard-smoke"
+          smoke_bin="$smoke_root/bin"
+          empty_cwd="$smoke_root/empty-cwd"
+          stdout_log="$smoke_root/sink.stdout"
+          stderr_log="$smoke_root/sink.stderr"
+          html_file="$smoke_root/index.html"
+          api_file="$smoke_root/transactions.json"
+          js_file="$smoke_root/application.js"
+          mkdir -p "$smoke_bin" "$empty_cwd"
+          install -m 0755 "$verification_dir/sink" "$smoke_bin/sink"
+
+          if (PATH="$smoke_bin"; command -v node >/dev/null); then
+            echo "Node unexpectedly available in the packaged smoke PATH" >&2
+            exit 1
+          fi
+
+          dashboard_port="$(python3 - <<'PY'
+          import socket
+
+          with socket.socket() as listener:
+              listener.bind(("127.0.0.1", 0))
+              print(listener.getsockname()[1])
+          PY
+          )"
+          base_url="http://127.0.0.1:${dashboard_port}"
+          sink_pid=""
+
+          cleanup() {
+            if [[ -n "$sink_pid" ]] && kill -0 "$sink_pid" 2>/dev/null; then
+              kill -TERM "$sink_pid" 2>/dev/null || true
+              for _ in {1..20}; do
+                kill -0 "$sink_pid" 2>/dev/null || break
+                sleep 0.25
+              done
+              kill -KILL "$sink_pid" 2>/dev/null || true
+              wait "$sink_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          workspace="$PWD"
+          cd "$empty_cwd"
+          PATH="$smoke_bin" "$smoke_bin/sink" http 1 \
+            --authtoken inspector-smoke-token \
+            --server-addr http://127.0.0.1:1 \
+            --allow-plaintext-control \
+            --dashboard-port "$dashboard_port" \
+            >"$stdout_log" 2>"$stderr_log" &
+          sink_pid=$!
+          cd "$workspace"
+
+          ready=false
+          for _ in {1..80}; do
+            if curl --fail --silent --show-error "$base_url/" > "$html_file"; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$sink_pid" 2>/dev/null; then
+              echo "Packaged sink exited before the dashboard became ready" >&2
+              cat "$stdout_log" "$stderr_log" >&2
+              exit 1
+            fi
+            sleep 0.25
+          done
+          if [[ "$ready" != true ]]; then
+            echo "Packaged dashboard did not become ready" >&2
+            cat "$stdout_log" "$stderr_log" >&2
+            exit 1
+          fi
+
+          grep -F '<title>Sink traffic inspector</title>' "$html_file"
+          js_path="$(sed -nE 's#.*src="(/assets/[^"]+\.js)".*#\1#p' "$html_file" | head -n 1)"
+          if [[ ! "$js_path" =~ ^/assets/.+-[A-Za-z0-9_-]+\.js$ ]]; then
+            echo "Dashboard HTML did not reference a hashed JavaScript asset" >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error "$base_url$js_path" > "$js_file"
+          test -s "$js_file"
+          curl --fail --silent --show-error \
+            "$base_url/api/v1/transactions" > "$api_file"
+          python3 - "$api_file" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert payload["transactions"] == []
+          assert payload["capture"] == {"paused": False}
+          PY
+
+          kill -TERM "$sink_pid"
+          for _ in {1..40}; do
+            kill -0 "$sink_pid" 2>/dev/null || break
+            sleep 0.25
+          done
+          if kill -0 "$sink_pid" 2>/dev/null; then
+            echo "Packaged sink did not stop after SIGTERM" >&2
+            exit 1
+          fi
+          set +e
+          wait "$sink_pid"
+          sink_status=$?
+          set -e
+          sink_pid=""
+          if (( sink_status != 0 )); then
+            echo "Packaged sink exited with status $sink_status" >&2
+            cat "$stdout_log" "$stderr_log" >&2
+            exit 1
+          fi
+
+          grep -Fx "inspector dashboard: $base_url" "$stdout_log"
+          if grep -F 'inspector-smoke-token' "$stdout_log" "$stderr_log"; then
+            echo "Control token appeared in packaged sink output" >&2
+            exit 1
+          fi
+          python3 - "$dashboard_port" <<'PY'
+          import socket
+          import sys
+
+          with socket.socket() as listener:
+              listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              listener.bind(("127.0.0.1", int(sys.argv[1])))
+          PY
 
       - name: Remove temporary Apple credentials
         if: always() && matrix.macos

@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, task::Poll};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, MutexGuard},
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 use futures::{AsyncRead, AsyncWrite, future::poll_fn};
 use thiserror::Error;
@@ -19,15 +24,23 @@ enum DriverCommand {
 #[derive(Clone, Debug)]
 pub(crate) struct StreamBroker {
     commands: mpsc::UnboundedSender<DriverCommand>,
+    liveness: ControlLinkLiveness,
 }
 
 impl StreamBroker {
     pub(crate) fn channel() -> (Self, StreamRequests) {
         let (commands, requests) = mpsc::unbounded_channel();
-        (Self { commands }, StreamRequests { requests })
+        (
+            Self {
+                commands,
+                liveness: ControlLinkLiveness::default(),
+            },
+            StreamRequests { requests },
+        )
     }
 
     pub(crate) async fn open_stream(&self) -> Result<Stream, BrokerError> {
+        self.liveness.record_public_stream_request();
         let (reply, response) = oneshot::channel();
         self.commands
             .send(DriverCommand::Open(reply))
@@ -39,6 +52,14 @@ impl StreamBroker {
         !self.commands.is_closed()
     }
 
+    pub(crate) fn liveness(&self) -> ControlLinkLiveness {
+        self.liveness.clone()
+    }
+
+    pub(crate) fn liveness_snapshot(&self, now: Instant) -> ControlLinkSnapshot {
+        self.liveness.snapshot(now)
+    }
+
     pub(crate) fn shutdown(&self) {
         let _ = self.commands.send(DriverCommand::Shutdown);
     }
@@ -47,6 +68,147 @@ impl StreamBroker {
     /// authenticated client run has taken ownership of its claim.
     pub(crate) fn replace(&self) {
         let _ = self.commands.send(DriverCommand::Replace);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlInboundKind {
+    Binary,
+    Ping,
+    Pong,
+}
+
+impl ControlInboundKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControlLinkSnapshot {
+    pub(crate) client_version: Option<Arc<str>>,
+    pub(crate) connected_for: Duration,
+    pub(crate) last_inbound_ago: Option<Duration>,
+    pub(crate) last_inbound_kind: Option<ControlInboundKind>,
+    pub(crate) last_ping_sent_ago: Option<Duration>,
+    pub(crate) last_pong_received_ago: Option<Duration>,
+    pub(crate) heartbeat_pings_sent: u64,
+    pub(crate) heartbeat_pongs_received: u64,
+    pub(crate) heartbeat_timeouts: u64,
+    pub(crate) binary_messages_received: u64,
+    pub(crate) public_stream_requests: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ControlLinkLiveness {
+    inner: Arc<Mutex<ControlLinkLivenessInner>>,
+}
+
+#[derive(Debug)]
+struct ControlLinkLivenessInner {
+    created_at: Instant,
+    client_version: Option<Arc<str>>,
+    last_inbound_at: Option<Instant>,
+    last_inbound_kind: Option<ControlInboundKind>,
+    last_ping_sent_at: Option<Instant>,
+    last_pong_received_at: Option<Instant>,
+    heartbeat_pings_sent: u64,
+    heartbeat_pongs_received: u64,
+    heartbeat_timeouts: u64,
+    binary_messages_received: u64,
+    public_stream_requests: u64,
+}
+
+impl Default for ControlLinkLiveness {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ControlLinkLivenessInner {
+                created_at: Instant::now(),
+                client_version: None,
+                last_inbound_at: None,
+                last_inbound_kind: None,
+                last_ping_sent_at: None,
+                last_pong_received_at: None,
+                heartbeat_pings_sent: 0,
+                heartbeat_pongs_received: 0,
+                heartbeat_timeouts: 0,
+                binary_messages_received: 0,
+                public_stream_requests: 0,
+            })),
+        }
+    }
+}
+
+impl ControlLinkLiveness {
+    pub(crate) fn set_client_version(&self, client_version: impl AsRef<str>) {
+        self.lock().client_version = Some(Arc::from(client_version.as_ref()));
+    }
+
+    pub(crate) fn record_inbound(&self, kind: ControlInboundKind) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner.last_inbound_at = Some(now);
+        inner.last_inbound_kind = Some(kind);
+        match kind {
+            ControlInboundKind::Binary => {
+                inner.binary_messages_received = inner.binary_messages_received.saturating_add(1);
+            }
+            ControlInboundKind::Pong => {
+                inner.last_pong_received_at = Some(now);
+                inner.heartbeat_pongs_received = inner.heartbeat_pongs_received.saturating_add(1);
+            }
+            ControlInboundKind::Ping => {}
+        }
+    }
+
+    pub(crate) fn record_heartbeat_ping(&self) {
+        let mut inner = self.lock();
+        inner.last_ping_sent_at = Some(Instant::now());
+        inner.heartbeat_pings_sent = inner.heartbeat_pings_sent.saturating_add(1);
+    }
+
+    pub(crate) fn record_heartbeat_timeout(&self) {
+        let mut inner = self.lock();
+        inner.heartbeat_timeouts = inner.heartbeat_timeouts.saturating_add(1);
+    }
+
+    fn record_public_stream_request(&self) {
+        let mut inner = self.lock();
+        inner.public_stream_requests = inner.public_stream_requests.saturating_add(1);
+    }
+
+    pub(crate) fn snapshot(&self, now: Instant) -> ControlLinkSnapshot {
+        let inner = self.lock();
+        ControlLinkSnapshot {
+            client_version: inner.client_version.clone(),
+            connected_for: now.saturating_duration_since(inner.created_at),
+            last_inbound_ago: inner
+                .last_inbound_at
+                .map(|at| now.saturating_duration_since(at)),
+            last_inbound_kind: inner.last_inbound_kind,
+            last_ping_sent_ago: inner
+                .last_ping_sent_at
+                .map(|at| now.saturating_duration_since(at)),
+            last_pong_received_ago: inner
+                .last_pong_received_at
+                .map(|at| now.saturating_duration_since(at)),
+            heartbeat_pings_sent: inner.heartbeat_pings_sent,
+            heartbeat_pongs_received: inner.heartbeat_pongs_received,
+            heartbeat_timeouts: inner.heartbeat_timeouts,
+            binary_messages_received: inner.binary_messages_received,
+            public_stream_requests: inner.public_stream_requests,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ControlLinkLivenessInner> {
+        match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -195,7 +357,7 @@ mod tests {
                 Ok(Message::Close(None)),
             ]),
         };
-        let (adapter, _) = AxumMessageAdapter::new(socket);
+        let (adapter, _) = AxumMessageAdapter::new(socket, ControlLinkLiveness::default());
         let server_io = MessageIo::new(adapter);
 
         let (broker, requests) = StreamBroker::channel();

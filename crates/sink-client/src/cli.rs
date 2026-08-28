@@ -1,3 +1,5 @@
+use std::num::{NonZeroU16, NonZeroUsize};
+
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
@@ -54,6 +56,30 @@ pub struct HttpArgs {
     /// Permit an http:// control server for this run (local development only).
     #[arg(long)]
     pub allow_plaintext_control: bool,
+
+    /// Enable the local request inspector and dashboard; use --inspect=false to disable.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        require_equals = true,
+        value_name = "BOOL"
+    )]
+    pub inspect: bool,
+
+    /// Bind the inspection dashboard to this specific loopback TCP port.
+    ///
+    /// When omitted, the dashboard automatically searches from port 4040 upward.
+    #[arg(long, value_name = "PORT")]
+    pub dashboard_port: Option<NonZeroU16>,
+
+    /// Maximum number of requests retained by the inspector.
+    #[arg(long, default_value = "100", value_name = "COUNT")]
+    pub inspect_request_limit: NonZeroUsize,
+
+    /// Maximum bytes retained from each request or response body preview.
+    #[arg(long, default_value = "1048576", value_name = "BYTES")]
+    pub inspect_body_limit: NonZeroUsize,
 }
 
 impl HttpArgs {
@@ -143,6 +169,13 @@ mod tests {
             "http://127.0.0.1:8080",
             "--local-tls-insecure",
             "--allow-plaintext-control",
+            "--inspect=false",
+            "--dashboard-port",
+            "4042",
+            "--inspect-request-limit",
+            "25",
+            "--inspect-body-limit",
+            "65536",
         ])?;
         let SinkCommand::Http(args) = cli.command else {
             return Err("expected http command".into());
@@ -162,7 +195,37 @@ mod tests {
         );
         assert!(args.local_tls_insecure);
         assert!(args.allow_plaintext_control);
+        assert!(!args.inspect);
+        assert_eq!(args.dashboard_port.map(NonZeroU16::get), Some(4042));
+        assert_eq!(args.inspect_request_limit.get(), 25);
+        assert_eq!(args.inspect_body_limit.get(), 65_536);
         Ok(())
+    }
+
+    #[test]
+    fn inspection_settings_use_approved_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from(["sink", "http", "3000"])?;
+        let SinkCommand::Http(args) = cli.command else {
+            return Err("expected http command".into());
+        };
+
+        assert!(args.inspect);
+        assert_eq!(args.dashboard_port, None);
+        assert_eq!(args.inspect_request_limit.get(), 100);
+        assert_eq!(args.inspect_body_limit.get(), 1_048_576);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_zero_inspection_limits_and_dashboard_port() {
+        for flag in [
+            "--dashboard-port",
+            "--inspect-request-limit",
+            "--inspect-body-limit",
+        ] {
+            let result = Cli::try_parse_from(["sink", "http", "3000", flag, "0"]);
+            assert!(result.is_err(), "{flag} accepted zero");
+        }
     }
 
     #[test]

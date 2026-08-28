@@ -6,7 +6,9 @@ or chosen subdomain of your own domain.
 
 Sink streams request and response bodies without buffering them in full. It
 supports large transfers, SSE, WebSockets, concurrent requests, reconnecting
-with the same public address, and bearer-token accounts.
+with the same public address, and bearer-token accounts. The client also has a
+loopback traffic inspector for viewing and deliberately replaying bounded
+request/response previews while a tunnel is running.
 
 ## How it fits together
 
@@ -24,7 +26,7 @@ route to one loopback-bound `sink-server` listener. See
 
 GitHub Releases contain archives for macOS arm64/x86_64 and Linux
 arm64/x86_64. Linux archives use musl targets. Each archive contains `sink` and
-`sink-server` plus both license texts; verify it against the release's
+`sink-server` plus the MIT license; verify it against the release's
 `SHA256SUMS` before installing. Published releases also produce a multi-platform
 server image at `ghcr.io/ptrstovka/sink-server`. The macOS executables are
 Developer ID signed and notarized by Apple.
@@ -45,6 +47,14 @@ sink http 3000 --url https://demo.example.com
 Targets may also be `host:port`, `http://...`, or `https://...`. The control
 connection and local HTTPS targets validate certificates by default.
 
+The inspector is enabled by default. `sink` prints a URL such as
+`http://127.0.0.1:4040`; the URL contains no mutation token. Its HTML,
+JavaScript, and styles are embedded in the `sink` executable, so an installed
+binary needs no Node.js, dashboard directory, or CDN. Use `--inspect=false` to
+disable it or `--dashboard-port PORT` to choose its loopback port. See the
+[client reference](docs/client-reference.md) for inspector behavior and the
+[security model](docs/security-model.md) before revealing or exporting secrets.
+
 ## Quick server use
 
 ```console
@@ -59,17 +69,22 @@ sink-server user enable me
 The [CLI reference](docs/cli-reference.md) summarizes the available commands
 and settings.
 
-## Tests
+## Tests and releases
 
-CI runs formatting, Clippy with warnings denied, and bounded workspace tests.
-Run the 1 GiB transfers, one-hour soak, and disruption/performance workloads
-manually. See [manual acceptance tests](docs/acceptance-tests.md).
+CI installs Node 24 with its bundled npm, runs `npm ci` and `npm run verify` in
+`dashboard`, then reuses that production `dashboard/dist` for formatting,
+locked Clippy-with-warnings-denied, and locked bounded workspace tests. The npm
+commands already include the frontend tests, typecheck, production build, and
+source and bundle guards. Run the 1 GiB transfers, one-hour soak, and
+disruption/performance workloads manually. See
+[acceptance tests](docs/acceptance-tests.md).
 
-## Releasing
-
-Published releases build all supported binaries and the server container. The
-[release guide](docs/releasing.md) documents the Apple credentials required for
-macOS signing and notarization.
+Published releases build all four supported binary targets from a full checkout
+and the server container. Publishing a Cargo source package is not part of that
+contract because the ignored prebuilt dashboard output is not contained in a
+workspace source archive. The [release guide](docs/releasing.md) documents the
+Apple credentials required for macOS signing and notarization and the packaged
+inspector smoke.
 
 ## Limits and license
 

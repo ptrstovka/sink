@@ -59,6 +59,8 @@ pub(crate) async fn run_control_socket(
     };
 
     let (broker, requests) = StreamBroker::channel();
+    let liveness = broker.liveness();
+    liveness.set_client_version(&hello.client_version);
     let owner = ClaimOwner {
         user_id: user.id,
         session_id: hello.session_id,
@@ -69,14 +71,48 @@ pub(crate) async fn run_control_socket(
     {
         Ok(lease) => lease,
         Err(ClaimError::Conflict(conflict)) => {
+            let incumbent_client_version = conflict
+                .liveness
+                .client_version
+                .as_deref()
+                .unwrap_or("<unknown>");
+            let incumbent_last_inbound_ago_ms = conflict
+                .liveness
+                .last_inbound_ago
+                .map(|duration| duration.as_millis());
+            let incumbent_last_inbound_kind = conflict
+                .liveness
+                .last_inbound_kind
+                .map_or("<none>", |kind| kind.as_str());
+            let incumbent_last_ping_sent_ago_ms = conflict
+                .liveness
+                .last_ping_sent_ago
+                .map(|duration| duration.as_millis());
+            let incumbent_last_pong_received_ago_ms = conflict
+                .liveness
+                .last_pong_received_ago
+                .map(|duration| duration.as_millis());
             tracing::warn!(
                 user_id = user.id,
                 session_id = %hello.session_id,
+                client_version = hello.client_version,
                 requested_subdomain = requested.as_ref().map_or("<generated>", |value| value.as_str()),
                 incumbent_subdomain = %conflict.subdomain,
                 incumbent_user_id = conflict.owner.user_id,
                 incumbent_session_id = %conflict.owner.session_id,
                 incumbent_status = conflict.status.as_str(),
+                incumbent_broker_available = conflict.broker_available,
+                incumbent_client_version,
+                incumbent_connected_for_ms = conflict.liveness.connected_for.as_millis(),
+                incumbent_last_inbound_ago_ms = ?incumbent_last_inbound_ago_ms,
+                incumbent_last_inbound_kind,
+                incumbent_last_ping_sent_ago_ms = ?incumbent_last_ping_sent_ago_ms,
+                incumbent_last_pong_received_ago_ms = ?incumbent_last_pong_received_ago_ms,
+                incumbent_heartbeat_pings_sent = conflict.liveness.heartbeat_pings_sent,
+                incumbent_heartbeat_pongs_received = conflict.liveness.heartbeat_pongs_received,
+                incumbent_heartbeat_timeouts = conflict.liveness.heartbeat_timeouts,
+                incumbent_binary_messages_received = conflict.liveness.binary_messages_received,
+                incumbent_public_stream_requests = conflict.liveness.public_stream_requests,
                 "tunnel hostname claim conflicted"
             );
             send_rejection(
@@ -115,6 +151,7 @@ pub(crate) async fn run_control_socket(
         tracing::warn!(
             user_id = user.id,
             session_id = %hello.session_id,
+            client_version = hello.client_version,
             subdomain = %lease.subdomain,
             "control link was lost while accepting the tunnel"
         );
@@ -125,11 +162,12 @@ pub(crate) async fn run_control_socket(
     tracing::info!(
         user_id = user.id,
         session_id = %hello.session_id,
+        client_version = hello.client_version,
         subdomain = %lease.subdomain,
         "tunnel connected"
     );
 
-    let (adapter, clean_close) = AxumMessageAdapter::new(socket);
+    let (adapter, clean_close) = AxumMessageAdapter::new(socket, liveness);
     let io = MessageIo::new(adapter);
     let driver = drive_yamux(io, requests);
     tokio::pin!(driver);
@@ -149,13 +187,17 @@ pub(crate) async fn run_control_socket(
         }
     };
 
+    let final_liveness = broker.liveness_snapshot(Instant::now());
     match exit {
         SessionExit::Driver(DriverExit::TransportError) if !clean_close.received() => {
             disconnect_and_watch_grace(&state, &lease, &user);
             tracing::warn!(
                 user_id = user.id,
                 session_id = %hello.session_id,
+                client_version = hello.client_version,
                 subdomain = %lease.subdomain,
+                driver_exit = ?DriverExit::TransportError,
+                control_liveness = ?final_liveness,
                 "tunnel disconnected unexpectedly; claim retained for reconnect grace"
             );
         }
@@ -164,7 +206,10 @@ pub(crate) async fn run_control_socket(
             tracing::info!(
                 user_id = user.id,
                 session_id = %hello.session_id,
+                client_version = hello.client_version,
                 subdomain = %lease.subdomain,
+                driver_exit = ?DriverExit::Replaced,
+                control_liveness = ?final_liveness,
                 "tunnel control link replaced by reconnect"
             );
         }
@@ -174,7 +219,9 @@ pub(crate) async fn run_control_socket(
             tracing::warn!(
                 user_id = user.id,
                 session_id = %hello.session_id,
+                client_version = hello.client_version,
                 subdomain = %lease.subdomain,
+                control_liveness = ?final_liveness,
                 "tunnel authorization was revoked"
             );
         }
@@ -184,16 +231,22 @@ pub(crate) async fn run_control_socket(
             tracing::info!(
                 user_id = user.id,
                 session_id = %hello.session_id,
+                client_version = hello.client_version,
                 subdomain = %lease.subdomain,
+                server_close_reason = ?exit,
+                control_liveness = ?final_liveness,
                 "tunnel closed by server"
             );
         }
-        SessionExit::Driver(_) => {
+        SessionExit::Driver(driver_exit) => {
             state.claims.release(&lease);
             tracing::info!(
                 user_id = user.id,
                 session_id = %hello.session_id,
+                client_version = hello.client_version,
                 subdomain = %lease.subdomain,
+                ?driver_exit,
+                control_liveness = ?final_liveness,
                 "tunnel closed"
             );
         }

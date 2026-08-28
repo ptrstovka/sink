@@ -24,6 +24,19 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
+      - name: Set up Node.js with npm cache
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Build and verify embedded dashboard
+        working-directory: dashboard
+        run: |
+          npm ci
+          npm run verify
+
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 

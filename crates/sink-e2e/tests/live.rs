@@ -4,6 +4,7 @@ use std::{
     future::Future,
     io,
     net::SocketAddr,
+    num::NonZeroUsize,
     str::FromStr as _,
     sync::{
         Arc,
@@ -29,7 +30,9 @@ use hyper::{body::Incoming, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use sha2::{Digest as _, Sha256};
 use sink_client::{
+    cli::HttpArgs,
     config::{AuthToken, RunOverrides, SavedConfig},
+    inspection::{DEFAULT_BODY_PREVIEW_LIMIT, DEFAULT_TRANSACTION_LIMIT},
     runtime::{
         ConnectionInfo, FailureDisposition, RuntimeError, RuntimeHandle, TunnelPhase, TunnelRuntime,
     },
@@ -584,7 +587,27 @@ fn client_runtime(
     let public_url = requested_hostname
         .map(|hostname| PublicUrl::from_str(&format!("https://{hostname}")))
         .transpose()?;
-    Ok(TunnelRuntime::new(config, target, public_url, false)?)
+    let runtime = TunnelRuntime::from_http(
+        &HttpArgs {
+            target,
+            url: public_url,
+            authtoken: None,
+            server_addr: None,
+            local_tls_insecure: false,
+            allow_plaintext_control: false,
+            inspect: true,
+            dashboard_port: None,
+            inspect_request_limit: NonZeroUsize::new(DEFAULT_TRANSACTION_LIMIT)
+                .ok_or_else(|| io::Error::other("default transaction limit must be non-zero"))?,
+            inspect_body_limit: NonZeroUsize::new(DEFAULT_BODY_PREVIEW_LIMIT)
+                .ok_or_else(|| io::Error::other("default body limit must be non-zero"))?,
+        },
+        config,
+    )?;
+    if runtime.handle().inspection_store().is_none() {
+        return Err(io::Error::other("live e2e runtime did not enable inspection").into());
+    }
+    Ok(runtime)
 }
 
 async fn wait_connected(
@@ -734,6 +757,10 @@ async fn generated_tunnel_preserves_and_streams_mixed_traffic() -> TestResult<()
     let issued = stack.database.create_user("generated-e2e").await?;
     let token = issued.token.expose_secret().to_owned();
     let client = ClientHarness::start(client_runtime(&token, stack.link.addr, fixture.addr, None)?);
+    let inspection = client
+        .handle
+        .inspection_store()
+        .ok_or_else(|| io::Error::other("inspection store unavailable"))?;
     let info = client.connected().await?;
     assert!(info.hostname.ends_with(".e2e.test"));
 
@@ -878,6 +905,7 @@ async fn generated_tunnel_preserves_and_streams_mixed_traffic() -> TestResult<()
         assert_eq!(body, Bytes::from(format!("ordinary-{id}")));
     }
     assert!(fixture_state.ordinary_max_active.load(Ordering::Acquire) > 1);
+    assert_eq!(inspection.len(), DEFAULT_TRANSACTION_LIMIT);
 
     drop(sse_response);
 

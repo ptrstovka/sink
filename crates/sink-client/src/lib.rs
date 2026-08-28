@@ -2,5 +2,9 @@
 
 pub mod cli;
 pub mod config;
+pub mod curl;
+pub mod dashboard;
+pub mod inspection;
+pub mod replay;
 pub mod runtime;
 pub mod target;

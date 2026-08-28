@@ -1,12 +1,15 @@
-use std::{error::Error, future::pending, io, process::ExitCode};
+use std::{error::Error, future::Future, future::pending, io, process::ExitCode};
 
 use clap::Parser as _;
 use sink_client::{
     cli::{Cli, ConfigField, SinkCommand},
     config::ConfigStore,
+    dashboard::{DashboardPort, DashboardService, production_assets},
     runtime::{RequestSummary, TunnelPhase, TunnelRuntime},
 };
+use tokio::time::{Duration, timeout};
 use tokio::{sync::broadcast, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -47,6 +50,20 @@ async fn run_tunnel(arguments: sink_client::cli::HttpArgs) -> Result<(), BoxErro
     let runtime = TunnelRuntime::from_http(&arguments, resolved)?;
     let handle = runtime.handle();
 
+    let dashboard_port = arguments
+        .dashboard_port
+        .map_or(DashboardPort::Automatic, DashboardPort::Explicit);
+    let dashboard = dashboard_bind_result(
+        arguments.dashboard_port.is_some(),
+        handle
+            .bind_dashboard(production_assets(), dashboard_port)
+            .await,
+    )?;
+    let dashboard_task = dashboard.map(|service| {
+        println!("inspector dashboard: {}", service.url());
+        DashboardTask::start(service)
+    });
+
     println!("local target: {}", arguments.target);
     let state_task = tokio::spawn(print_state_changes(handle.subscribe_state()));
     let request_task = tokio::spawn(print_request_summaries(handle.subscribe_requests()));
@@ -65,7 +82,64 @@ async fn run_tunnel(arguments: sink_client::cli::HttpArgs) -> Result<(), BoxErro
 
     stop_output_task(state_task).await;
     stop_output_task(request_task).await;
+    if let Some(task) = dashboard_task {
+        task.stop().await;
+    }
     result.map_err(Into::into)
+}
+
+fn dashboard_bind_result(
+    explicit_port: bool,
+    result: Result<Option<DashboardService>, sink_client::dashboard::DashboardBindError>,
+) -> Result<Option<DashboardService>, sink_client::dashboard::DashboardBindError> {
+    match result {
+        Err(error) if !explicit_port => {
+            tracing::error!(%error, "inspection dashboard could not start; tunnel will continue");
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+struct DashboardTask {
+    shutdown: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl DashboardTask {
+    fn start(service: DashboardService) -> Self {
+        let shutdown = CancellationToken::new();
+        let run = service.run_until_cancelled(shutdown.clone());
+        Self::spawn(shutdown, run)
+    }
+
+    fn spawn<F>(shutdown: CancellationToken, run: F) -> Self
+    where
+        F: Future<Output = io::Result<()>> + Send + 'static,
+    {
+        let task = tokio::spawn(async move {
+            if let Err(error) = run.await {
+                tracing::error!(%error, "inspection dashboard stopped unexpectedly; tunnel remains active");
+            }
+        });
+        Self { shutdown, task }
+    }
+
+    async fn stop(self) {
+        self.shutdown.cancel();
+        let mut task = self.task;
+        match timeout(Duration::from_secs(2), &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "inspection dashboard task could not be joined cleanly");
+            }
+            Err(_) => {
+                tracing::warn!("inspection dashboard exceeded its shutdown deadline");
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
 }
 
 async fn print_state_changes(
@@ -159,6 +233,41 @@ async fn termination_signal() {
             }
         }
         _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dashboard_failure_does_not_cancel_tunnel_lifecycle() {
+        let tunnel_shutdown = CancellationToken::new();
+        let dashboard_shutdown = CancellationToken::new();
+        let task = DashboardTask::spawn(dashboard_shutdown, async {
+            Err(io::Error::other("simulated dashboard task failure"))
+        });
+
+        task.stop().await;
+        assert!(!tunnel_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn automatic_bind_failure_is_isolated_but_explicit_failure_remains_actionable() {
+        let automatic = dashboard_bind_result(
+            false,
+            Err(sink_client::dashboard::DashboardBindError::AutomaticPortsExhausted),
+        );
+        assert!(matches!(automatic, Ok(None)));
+
+        let explicit = dashboard_bind_result(
+            true,
+            Err(sink_client::dashboard::DashboardBindError::AutomaticPortsExhausted),
+        );
+        assert!(matches!(
+            explicit,
+            Err(sink_client::dashboard::DashboardBindError::AutomaticPortsExhausted)
+        ));
     }
 }
 

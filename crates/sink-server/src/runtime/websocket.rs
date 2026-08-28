@@ -18,6 +18,8 @@ use rand::RngCore as _;
 use sink_protocol::MAX_TRANSPORT_MESSAGE_BYTES;
 use tokio::time::{Instant, Sleep, sleep};
 
+use super::broker::{ControlInboundKind, ControlLinkLiveness};
+
 const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -31,14 +33,16 @@ pub(crate) struct AxumMessageAdapter<S> {
     outgoing: VecDeque<Bytes>,
     clean_close: Arc<AtomicBool>,
     heartbeat: Heartbeat,
+    liveness: ControlLinkLiveness,
 }
 
 impl<S> AxumMessageAdapter<S> {
-    pub(crate) fn new(socket: S) -> (Self, CleanClose) {
+    pub(crate) fn new(socket: S, liveness: ControlLinkLiveness) -> (Self, CleanClose) {
         Self::with_heartbeat(
             socket,
             CONTROL_HEARTBEAT_INTERVAL,
             CONTROL_HEARTBEAT_TIMEOUT,
+            liveness,
         )
     }
 
@@ -46,6 +50,7 @@ impl<S> AxumMessageAdapter<S> {
         socket: S,
         heartbeat_interval: Duration,
         heartbeat_timeout: Duration,
+        liveness: ControlLinkLiveness,
     ) -> (Self, CleanClose) {
         let clean_close = Arc::new(AtomicBool::new(false));
         (
@@ -56,6 +61,7 @@ impl<S> AxumMessageAdapter<S> {
                 outgoing: VecDeque::new(),
                 clean_close: Arc::clone(&clean_close),
                 heartbeat: Heartbeat::new(heartbeat_interval, heartbeat_timeout),
+                liveness,
             },
             CleanClose { clean_close },
         )
@@ -77,6 +83,7 @@ impl<S> AxumMessageAdapter<S> {
                 Poll::Ready(Some(Ok(Message::Binary(bytes))))
                     if bytes.len() <= MAX_TRANSPORT_MESSAGE_BYTES =>
                 {
+                    self.liveness.record_inbound(ControlInboundKind::Binary);
                     self.heartbeat.observe_activity();
                     self.incoming.push_back(Ok(bytes));
                     return true;
@@ -102,10 +109,12 @@ impl<S> AxumMessageAdapter<S> {
                 }
                 Poll::Ready(Some(Ok(Message::Ping(_)))) => {
                     // Tungstenite queued the mandatory pong while reading.
+                    self.liveness.record_inbound(ControlInboundKind::Ping);
                     self.heartbeat.observe_activity();
                     self.heartbeat.needs_flush = true;
                 }
                 Poll::Ready(Some(Ok(Message::Pong(_)))) => {
+                    self.liveness.record_inbound(ControlInboundKind::Pong);
                     self.heartbeat.observe_activity();
                 }
                 Poll::Ready(Some(Err(error))) => {
@@ -125,6 +134,9 @@ impl<S> AxumMessageAdapter<S> {
                         return false;
                     }
                     Err(error) => {
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            self.liveness.record_heartbeat_timeout();
+                        }
                         self.incoming.push_back(Err(error));
                         return true;
                     }
@@ -146,6 +158,7 @@ impl<S> AxumMessageAdapter<S> {
                     Pin::new(&mut self.socket)
                         .start_send(Message::Ping(payload))
                         .map_err(websocket_error)?;
+                    self.liveness.record_heartbeat_ping();
                     self.heartbeat.ping_sent();
                 }
                 Poll::Ready(Err(error)) => return Err(websocket_error(error)),
@@ -364,10 +377,12 @@ mod tests {
     async fn silent_websocket_fails_after_the_heartbeat_deadline() -> io::Result<()> {
         let socket = MockWebSocket::new(false);
         let state = Arc::clone(&socket.state);
+        let liveness = ControlLinkLiveness::default();
         let (mut adapter, _) = AxumMessageAdapter::with_heartbeat(
             socket,
             Duration::from_millis(10),
             Duration::from_millis(10),
+            liveness.clone(),
         );
 
         let incoming = tokio::time::timeout(Duration::from_millis(250), adapter.next())
@@ -382,6 +397,10 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, Message::Ping(_)))
         );
+        let snapshot = liveness.snapshot(std::time::Instant::now());
+        assert_eq!(snapshot.heartbeat_pings_sent, 1);
+        assert_eq!(snapshot.heartbeat_pongs_received, 0);
+        assert_eq!(snapshot.heartbeat_timeouts, 1);
         Ok(())
     }
 
@@ -389,10 +408,12 @@ mod tests {
     async fn heartbeat_pongs_keep_an_idle_websocket_alive() -> io::Result<()> {
         let socket = MockWebSocket::new(true);
         let state = Arc::clone(&socket.state);
+        let liveness = ControlLinkLiveness::default();
         let (mut adapter, _) = AxumMessageAdapter::with_heartbeat(
             socket,
             Duration::from_millis(10),
             Duration::from_millis(20),
+            liveness.clone(),
         );
 
         let result = tokio::time::timeout(Duration::from_millis(100), adapter.next()).await;
@@ -406,16 +427,24 @@ mod tests {
             .filter(|message| matches!(message, Message::Ping(_)))
             .count();
         assert!(ping_count >= 2, "expected repeated heartbeat pings");
+        let snapshot = liveness.snapshot(std::time::Instant::now());
+        assert_eq!(snapshot.heartbeat_pings_sent, ping_count as u64);
+        assert_eq!(snapshot.heartbeat_pongs_received, ping_count as u64);
+        assert_eq!(snapshot.heartbeat_timeouts, 0);
+        assert_eq!(snapshot.last_inbound_kind, Some(ControlInboundKind::Pong));
+        assert!(snapshot.last_pong_received_ago.is_some());
         Ok(())
     }
 
     #[tokio::test]
     async fn heartbeat_deadline_also_bounds_a_blocked_ping_write() -> io::Result<()> {
         let socket = MockWebSocket::new_with_write_readiness(false, false);
+        let liveness = ControlLinkLiveness::default();
         let (mut adapter, _) = AxumMessageAdapter::with_heartbeat(
             socket,
             Duration::from_millis(10),
             Duration::from_millis(10),
+            liveness.clone(),
         );
 
         let incoming = tokio::time::timeout(Duration::from_millis(250), adapter.next())
@@ -424,6 +453,9 @@ mod tests {
             .ok_or_else(|| io::Error::other("adapter closed without heartbeat error"))?;
         let error = incoming.expect_err("blocked heartbeat write must time out");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let snapshot = liveness.snapshot(std::time::Instant::now());
+        assert_eq!(snapshot.heartbeat_pings_sent, 0);
+        assert_eq!(snapshot.heartbeat_timeouts, 1);
         Ok(())
     }
 

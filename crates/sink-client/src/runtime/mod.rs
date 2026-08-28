@@ -5,7 +5,7 @@ mod control;
 mod proxy;
 mod websocket_io;
 
-use std::{fmt, future::poll_fn, time::Duration};
+use std::{fmt, future::poll_fn, sync::Arc, time::Duration};
 
 use futures::{AsyncRead, AsyncWrite};
 use sink_protocol::{ClientHello, MessageIo, RejectCode, Subdomain};
@@ -20,6 +20,10 @@ use yamux::{Config as YamuxConfig, Connection, Mode};
 use crate::{
     cli::{CliValidationError, HttpArgs},
     config::ResolvedConfig,
+    curl::CurlService,
+    dashboard::{DashboardBindError, DashboardPort, DashboardService, EmbeddedAssetSource},
+    inspection::{InspectionLimitError, InspectionLimits, InspectionStore},
+    replay::ReplayService,
     target::{LocalTarget, PublicUrl},
 };
 
@@ -68,6 +72,9 @@ pub struct RuntimeHandle {
     shutdown: CancellationToken,
     state: watch::Receiver<TunnelState>,
     summaries: broadcast::Sender<RequestSummary>,
+    inspection: Option<InspectionStore>,
+    replay: Option<ReplayService>,
+    curl: Option<CurlService>,
 }
 
 impl fmt::Debug for RuntimeHandle {
@@ -101,6 +108,52 @@ impl RuntimeHandle {
         self.summaries.subscribe()
     }
 
+    /// Access the process-local inspection store when this run enabled capture.
+    #[must_use]
+    pub fn inspection_store(&self) -> Option<InspectionStore> {
+        self.inspection.clone()
+    }
+
+    /// Access direct-local replay when this run enabled inspection.
+    #[must_use]
+    pub fn replay_service(&self) -> Option<ReplayService> {
+        self.replay.clone()
+    }
+
+    /// Access local-target cURL generation when this run enabled inspection.
+    #[must_use]
+    pub fn curl_service(&self) -> Option<CurlService> {
+        self.curl.clone()
+    }
+
+    /// Bind the inspector dashboard only when this run enabled inspection.
+    ///
+    /// Binding consumes clones of the exact store, replay, and cURL services
+    /// constructed with the tunnel proxy and current local target.
+    pub async fn bind_dashboard(
+        &self,
+        assets: Arc<dyn EmbeddedAssetSource>,
+        port: DashboardPort,
+    ) -> Result<Option<DashboardService>, DashboardBindError> {
+        let (Some(store), Some(replay), Some(curl)) = (&self.inspection, &self.replay, &self.curl)
+        else {
+            debug_assert!(
+                self.inspection.is_none() && self.replay.is_none() && self.curl.is_none(),
+                "inspection runtime services must be configured together"
+            );
+            return Ok(None);
+        };
+        DashboardService::bind_with_actions(
+            store.clone(),
+            assets,
+            port,
+            replay.clone(),
+            curl.clone(),
+        )
+        .await
+        .map(Some)
+    }
+
     /// Stop accepting new tunnel streams and give active exchanges a bounded
     /// drain opportunity. Repeated forced termination remains binary-owned.
     pub fn begin_graceful_shutdown(&self) {
@@ -117,6 +170,9 @@ pub struct TunnelRuntime {
     shutdown: CancellationToken,
     state: watch::Sender<TunnelState>,
     summaries: broadcast::Sender<RequestSummary>,
+    inspection: Option<InspectionStore>,
+    replay: Option<ReplayService>,
+    curl: Option<CurlService>,
     drain_timeout: Duration,
 }
 
@@ -141,11 +197,22 @@ impl TunnelRuntime {
     /// Build the runtime directly from the lead-owned CLI/config wiring types.
     pub fn from_http(args: &HttpArgs, config: ResolvedConfig) -> Result<Self, RuntimeError> {
         args.validate()?;
-        Self::new(
+        let inspection = args
+            .inspect
+            .then(|| {
+                InspectionLimits::new(
+                    args.inspect_request_limit.get(),
+                    args.inspect_body_limit.get(),
+                )
+                .map(InspectionStore::new)
+            })
+            .transpose()?;
+        Self::new_with_inspection(
             config,
             args.target.clone(),
             args.url.clone(),
             args.local_tls_insecure,
+            inspection,
         )
     }
 
@@ -154,6 +221,22 @@ impl TunnelRuntime {
         target: LocalTarget,
         requested_public_url: Option<PublicUrl>,
         local_tls_insecure: bool,
+    ) -> Result<Self, RuntimeError> {
+        Self::new_with_inspection(
+            config,
+            target,
+            requested_public_url,
+            local_tls_insecure,
+            None,
+        )
+    }
+
+    fn new_with_inspection(
+        config: ResolvedConfig,
+        target: LocalTarget,
+        requested_public_url: Option<PublicUrl>,
+        local_tls_insecure: bool,
+        inspection: Option<InspectionStore>,
     ) -> Result<Self, RuntimeError> {
         let session_id = Uuid::new_v4();
         let initial_requested_hostname =
@@ -169,7 +252,21 @@ impl TunnelRuntime {
         };
         let (state, _) = watch::channel(initial_state);
         let (summaries, _) = broadcast::channel(REQUEST_SUMMARY_CAPACITY);
-        let local_proxy = LocalProxy::new(target, local_tls_insecure, summaries.clone())?;
+        let local_proxy = match &inspection {
+            Some(store) => LocalProxy::new_with_inspection(
+                target.clone(),
+                local_tls_insecure,
+                summaries.clone(),
+                Some(store.clone()),
+            )?,
+            None => LocalProxy::new(target.clone(), local_tls_insecure, summaries.clone())?,
+        };
+        let replay = inspection
+            .as_ref()
+            .map(|store| ReplayService::new(store.clone(), Arc::new(local_proxy.clone())));
+        let curl = inspection
+            .as_ref()
+            .map(|store| CurlService::new(store.clone(), target, local_tls_insecure));
         Ok(Self {
             config,
             local_proxy,
@@ -179,6 +276,9 @@ impl TunnelRuntime {
             shutdown,
             state,
             summaries,
+            inspection,
+            replay,
+            curl,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         })
     }
@@ -190,6 +290,9 @@ impl TunnelRuntime {
             shutdown: self.shutdown.clone(),
             state: self.state.subscribe(),
             summaries: self.summaries.clone(),
+            inspection: self.inspection.clone(),
+            replay: self.replay.clone(),
+            curl: self.curl.clone(),
         }
     }
 
@@ -427,6 +530,8 @@ pub enum RuntimeError {
     TunnelDisconnected,
     #[error("could not configure the local HTTP(S) proxy: {0}")]
     LocalProxySetup(#[from] ProxySetupError),
+    #[error("could not configure local traffic inspection: {0}")]
+    InspectionLimits(#[from] InspectionLimitError),
 }
 
 impl RuntimeError {
@@ -440,16 +545,18 @@ impl RuntimeError {
             | Self::UpgradeRejected { .. }
             | Self::Rejected { .. }
             | Self::ProtocolViolation
-            | Self::LocalProxySetup(_) => FailureDisposition::Permanent,
+            | Self::LocalProxySetup(_)
+            | Self::InspectionLimits(_) => FailureDisposition::Permanent,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{num::NonZeroU16, str::FromStr};
 
     use bytes::Bytes;
+    use clap::Parser as _;
     use futures::future::join_all;
     use http::{Request, StatusCode};
     use http_body_util::{BodyExt, Empty};
@@ -458,7 +565,10 @@ mod tests {
     use sink_protocol::{SessionAccepted, Subdomain};
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
-    use crate::config::{AuthToken, RunOverrides, SavedConfig};
+    use crate::{
+        cli::{Cli, SinkCommand},
+        config::{AuthToken, RunOverrides, SavedConfig},
+    };
 
     use super::*;
 
@@ -468,6 +578,83 @@ mod tests {
             server_addr: Some("https://connect.example.test".parse()?),
             allow_plaintext_control: false,
         })?)
+    }
+
+    #[test]
+    fn http_cli_controls_process_local_inspection_store() -> Result<(), proxy::BoxError> {
+        let enabled = Cli::try_parse_from([
+            "sink",
+            "http",
+            "3000",
+            "--inspect-request-limit",
+            "7",
+            "--inspect-body-limit",
+            "4096",
+        ])?;
+        let SinkCommand::Http(enabled) = enabled.command else {
+            return Err("expected http command".into());
+        };
+        let enabled = TunnelRuntime::from_http(&enabled, resolved_config()?)?;
+        let handle = enabled.handle();
+        let store = handle
+            .inspection_store()
+            .ok_or("inspection should be enabled by default")?;
+        assert_eq!(store.limits().transaction_limit(), 7);
+        assert_eq!(store.limits().body_preview_limit(), 4096);
+        assert!(handle.replay_service().is_some());
+        assert!(handle.curl_service().is_some());
+
+        let disabled = Cli::try_parse_from(["sink", "http", "3000", "--inspect=false"])?;
+        let SinkCommand::Http(disabled) = disabled.command else {
+            return Err("expected http command".into());
+        };
+        let disabled = TunnelRuntime::from_http(&disabled, resolved_config()?)?;
+        let handle = disabled.handle();
+        assert!(handle.inspection_store().is_none());
+        assert!(handle.replay_service().is_none());
+        assert!(handle.curl_service().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dashboard_lifecycle_binds_only_for_inspection_and_preserves_explicit_errors()
+    -> Result<(), proxy::BoxError> {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let occupied_port = NonZeroU16::new(occupied.local_addr()?.port())
+            .ok_or("ephemeral listener returned port zero")?;
+        let explicit = DashboardPort::Explicit(occupied_port);
+
+        let disabled = Cli::try_parse_from(["sink", "http", "3000", "--inspect=false"])?;
+        let SinkCommand::Http(disabled) = disabled.command else {
+            return Err("expected http command".into());
+        };
+        let disabled = TunnelRuntime::from_http(&disabled, resolved_config()?)?;
+        assert!(
+            disabled
+                .handle()
+                .bind_dashboard(crate::dashboard::production_assets(), explicit)
+                .await?
+                .is_none(),
+            "inspection-disabled runs must not attempt even an occupied explicit port"
+        );
+
+        let enabled = Cli::try_parse_from(["sink", "http", "3000"])?;
+        let SinkCommand::Http(enabled) = enabled.command else {
+            return Err("expected http command".into());
+        };
+        let enabled = TunnelRuntime::from_http(&enabled, resolved_config()?)?;
+        let error = enabled
+            .handle()
+            .bind_dashboard(crate::dashboard::production_assets(), explicit)
+            .await
+            .err()
+            .ok_or("inspection-enabled run ignored an occupied explicit dashboard port")?;
+        assert!(matches!(
+            error,
+            DashboardBindError::ExplicitAddressInUse { address, .. }
+                if address.port() == occupied_port.get()
+        ));
+        Ok(())
     }
 
     #[test]

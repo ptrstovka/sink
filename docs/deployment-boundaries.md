@@ -26,8 +26,11 @@ not support clustering, shared tunnel claims, or active/active replicas.
 - Long-lived streams keep connections and other resources open. Apply
   connection and abuse controls at the host or edge without buffering bodies,
   imposing low size caps, or cutting off expected streams.
-- Sink writes operational logs but has no dashboard, metrics endpoint,
+- `sink-server` writes operational logs but has no dashboard, metrics endpoint,
   per-account quota, public visitor authentication, body capture, or replay.
+  The separate `sink` client can expose its bounded traffic inspector only on
+  the same machine's IPv4 loopback interface; it does not add a public or
+  server-side dashboard.
 
 ## Public exposure and proxies
 

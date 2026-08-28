@@ -5,6 +5,31 @@ two macOS jobs sign `sink` and `sink-server` with a Developer ID Application
 certificate, submit the signed files to Apple's notary service, and publish the
 archive only after Apple returns `Accepted`.
 
+The binary matrix has exactly four native lanes:
+
+- `aarch64-apple-darwin` (`macos-arm64`)
+- `x86_64-apple-darwin` (`macos-x86_64`)
+- `aarch64-unknown-linux-musl` (`linux-arm64`)
+- `x86_64-unknown-linux-musl` (`linux-x86_64`)
+
+Every lane uses Node 24 with its bundled npm and the package-lock v3 file as the
+npm cache key input. It runs this order once before Cargo:
+
+```console
+cd dashboard
+npm ci
+npm run verify
+cd ..
+cargo build --release --locked --target TARGET --bin sink --bin sink-server
+```
+
+`npm run verify` already runs the Vitest and production-source guard through
+`npm test`, then typechecking, the Vite production build, and the
+production-bundle guard through `npm run build`. Do not duplicate or bypass
+those guards. The resulting `dashboard/dist` is generated once and kept
+unchanged for the job's release Cargo build. Cargo only consumes and embeds
+those bytes; it must not invoke npm or fetch frontend assets.
+
 The release remains a `.tar.gz`. Apple publishes notarization tickets online
 for the two standalone executables, so they don't need to be wrapped in an app,
 disk image, or installer. Standalone binaries can't carry stapled tickets and
@@ -65,7 +90,8 @@ both private keys after the secrets are configured.
 
 ## Release behavior
 
-The workflow performs this sequence for each macOS architecture:
+The workflow performs this sequence for each macOS architecture after the
+frontend verification and locked Cargo build:
 
 1. Import the `.p12` into a temporary runner keychain.
 2. Sign both executables with the hardened runtime and a secure timestamp.
@@ -73,7 +99,19 @@ The workflow performs this sequence for each macOS architecture:
 4. Submit a temporary ZIP to `notarytool` and wait for completion.
 5. Print Apple's notarization log and require an `Accepted` result.
 6. Create the release `.tar.gz` from the exact signed, accepted bytes.
-7. Delete the temporary certificate, API key, and keychain.
+7. Extract the archive on its native runner and require both `sink version` and
+   `sink-server version` to match the release tag.
+8. Delete the temporary certificate, API key, and keychain.
+
+Linux follows the same build, package, archive, and native binary-version
+verification without Apple operations. The native Linux x86_64 lane also copies
+the unpacked `sink` into an isolated directory and runs it from an empty working
+directory with a PATH containing no Node.js. It uses an explicit loopback
+dashboard port and an unreachable loopback control endpoint, then requires the
+packaged binary to serve embedded HTML, a hashed JavaScript asset, and
+`/api/v1/transactions`. Finally it sends SIGTERM, requires a clean exit, and
+proves that the dashboard port can be rebound. The smoke uses no repository or
+Apple secrets.
 
 If signing or notarization fails, the macOS matrix jobs fail and the publish job
 doesn't attach any rebuilt release archives.
@@ -81,6 +119,14 @@ doesn't attach any rebuilt release archives.
 After configuring the secrets, use the workflow's `Run workflow` action with an
 existing release tag to replace that release's unsigned archives. New published
 releases use the same workflow automatically.
+
+This is a binary-release workflow from a full repository checkout. Publishing
+the Cargo workspace or `sink-client` as a crates.io/source package is out of
+scope: ignored `dashboard/dist` is deliberately prebuilt and is not included in
+a Cargo source archive. Supporting source packages would require a separate,
+explicit asset-packaging design. Running the workflow, publishing assets, and
+the manual one-hour soak are release-operator gates; documentation or CI
+changes do not claim they have run.
 
 ## Verify a downloaded release
 

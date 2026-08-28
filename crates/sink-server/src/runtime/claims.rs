@@ -8,7 +8,7 @@ use rand::RngCore as _;
 use sink_protocol::Subdomain;
 use uuid::Uuid;
 
-use super::broker::StreamBroker;
+use super::broker::{ControlLinkLiveness, ControlLinkSnapshot, StreamBroker};
 
 pub(crate) const RECONNECT_GRACE: Duration = Duration::from_secs(30);
 
@@ -36,7 +36,7 @@ pub(crate) enum ClaimLookup {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClaimError {
-    Conflict(ClaimConflict),
+    Conflict(Box<ClaimConflict>),
     GenerationExhausted,
 }
 
@@ -45,6 +45,8 @@ pub(crate) struct ClaimConflict {
     pub(crate) subdomain: Subdomain,
     pub(crate) owner: ClaimOwner,
     pub(crate) status: ClaimStatusKind,
+    pub(crate) broker_available: bool,
+    pub(crate) liveness: ControlLinkSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +73,7 @@ enum ClaimStatus {
 #[derive(Debug)]
 struct Claim {
     owner: ClaimOwner,
+    liveness: ControlLinkLiveness,
     status: ClaimStatus,
 }
 
@@ -105,7 +108,9 @@ impl ClaimRegistry {
                 .as_ref()
                 .is_none_or(|requested| requested == subdomain);
             if !requested_matches {
-                return Err(ClaimError::Conflict(conflict(subdomain, claim)));
+                return Err(ClaimError::Conflict(Box::new(conflict(
+                    subdomain, claim, now,
+                ))));
             }
 
             let subdomain = subdomain.clone();
@@ -123,7 +128,9 @@ impl ClaimRegistry {
         let subdomain = match requested {
             Some(subdomain) => {
                 if let Some(claim) = inner.by_subdomain.get(&subdomain) {
-                    return Err(ClaimError::Conflict(conflict(&subdomain, claim)));
+                    return Err(ClaimError::Conflict(Box::new(conflict(
+                        &subdomain, claim, now,
+                    ))));
                 }
                 subdomain
             }
@@ -211,14 +218,17 @@ impl ClaimRegistry {
     }
 }
 
-fn conflict(subdomain: &Subdomain, claim: &Claim) -> ClaimConflict {
+fn conflict(subdomain: &Subdomain, claim: &Claim, now: Instant) -> ClaimConflict {
+    let (status, broker_available) = match &claim.status {
+        ClaimStatus::Active { broker, .. } => (ClaimStatusKind::Active, broker.is_available()),
+        ClaimStatus::Disconnected { .. } => (ClaimStatusKind::Disconnected, false),
+    };
     ClaimConflict {
         subdomain: subdomain.clone(),
         owner: claim.owner,
-        status: match claim.status {
-            ClaimStatus::Active { .. } => ClaimStatusKind::Active,
-            ClaimStatus::Disconnected { .. } => ClaimStatusKind::Disconnected,
-        },
+        status,
+        broker_available,
+        liveness: claim.liveness.snapshot(now),
     }
 }
 
@@ -230,10 +240,12 @@ fn activate_locked(
 ) -> ClaimLease {
     inner.next_lease_id = inner.next_lease_id.wrapping_add(1).max(1);
     let lease_id = inner.next_lease_id;
+    let liveness = broker.liveness();
     inner.by_subdomain.insert(
         subdomain.clone(),
         Claim {
             owner,
+            liveness,
             status: ClaimStatus::Active { broker, lease_id },
         },
     );
@@ -270,6 +282,8 @@ fn generate_available_subdomain(inner: &ClaimsInner) -> Result<Subdomain, ClaimE
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::broker::ControlInboundKind;
+
     use super::*;
 
     fn owner(user_id: i64, session: u128) -> ClaimOwner {
@@ -289,6 +303,10 @@ mod tests {
         let now = Instant::now();
         let subdomain = Subdomain::parse("demo").expect("valid test subdomain");
         let (active_broker, _active_requests) = StreamBroker::channel();
+        let active_liveness = active_broker.liveness();
+        active_liveness.set_client_version("0.0.3");
+        active_liveness.record_heartbeat_ping();
+        active_liveness.record_inbound(ControlInboundKind::Pong);
         let first = registry
             .acquire(owner(1, 1), Some(subdomain.clone()), active_broker, now)
             .expect("first claim");
@@ -296,13 +314,19 @@ mod tests {
         let conflict = registry
             .acquire(owner(2, 2), Some(subdomain.clone()), broker(), now)
             .expect_err("different owner must conflict");
+        let ClaimError::Conflict(conflict) = conflict else {
+            panic!("expected a claim conflict");
+        };
+        assert_eq!(conflict.subdomain, subdomain);
+        assert_eq!(conflict.owner, owner(1, 1));
+        assert_eq!(conflict.status, ClaimStatusKind::Active);
+        assert!(conflict.broker_available);
+        assert_eq!(conflict.liveness.client_version.as_deref(), Some("0.0.3"));
+        assert_eq!(conflict.liveness.heartbeat_pings_sent, 1);
+        assert_eq!(conflict.liveness.heartbeat_pongs_received, 1);
         assert_eq!(
-            conflict,
-            ClaimError::Conflict(ClaimConflict {
-                subdomain: subdomain.clone(),
-                owner: owner(1, 1),
-                status: ClaimStatusKind::Active,
-            })
+            conflict.liveness.last_inbound_kind,
+            Some(ControlInboundKind::Pong)
         );
         assert!(matches!(
             registry.lookup(&subdomain, now),
