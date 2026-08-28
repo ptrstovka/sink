@@ -111,16 +111,33 @@ jobs:
           : "${APPLE_TEAM_ID:?Missing APPLE_TEAM_ID secret}"
 
           certificate_path="$RUNNER_TEMP/developer-id.p12"
+          g1_intermediate_path="$RUNNER_TEMP/developer-id-g1.cer"
+          g2_intermediate_path="$RUNNER_TEMP/developer-id-g2.cer"
           keychain_path="$RUNNER_TEMP/apple-signing.keychain-db"
           keychain_password="$(openssl rand -hex 32)"
 
           printf '%s' "$APPLE_DEVELOPER_ID_P12" | /usr/bin/base64 -D > "$certificate_path"
+          curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDCA.cer \
+            --output "$g1_intermediate_path"
+          curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+            --output "$g2_intermediate_path"
+          printf '%s  %s\n%s  %s\n' \
+            '7afc9d01a62f03a2de9637936d4afe68090d2de18d03f29c88cfb0b1ba63587f' \
+            "$g1_intermediate_path" \
+            'f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a' \
+            "$g2_intermediate_path" | shasum --algorithm 256 --check
           security create-keychain -p "$keychain_password" "$keychain_path"
           security set-keychain-settings -lut 21600 "$keychain_path"
           security unlock-keychain -p "$keychain_password" "$keychain_path"
           security import "$certificate_path" \
             -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" \
             -A -t cert -f pkcs12 -k "$keychain_path"
+          security import "$g1_intermediate_path" \
+            -A -t cert -f x509 -k "$keychain_path"
+          security import "$g2_intermediate_path" \
+            -A -t cert -f x509 -k "$keychain_path"
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: -s \
             -k "$keychain_password" "$keychain_path"
@@ -154,6 +171,16 @@ jobs:
               --sign "$APPLE_SIGNING_IDENTITY" \
               "$binary"
             codesign --verify --strict --verbose=2 "$binary"
+
+            binary_name="${binary##*/}"
+            chain_prefix="$RUNNER_TEMP/${binary_name}-${{ matrix.archive_suffix }}-codesign"
+            codesign --display \
+              --extract-certificates="$chain_prefix" \
+              "$binary"
+            test -s "${chain_prefix}0"
+            test -s "${chain_prefix}1"
+            openssl x509 -inform DER -in "${chain_prefix}1" \
+              -noout -subject | grep -F 'Developer ID Certification Authority'
           done
 
       - name: Notarize macOS binaries
@@ -376,7 +403,27 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/apple-signing.keychain-db" 2>/dev/null || true
           rm -f \
             "$RUNNER_TEMP/developer-id.p12" \
+            "$RUNNER_TEMP/developer-id-g1.cer" \
+            "$RUNNER_TEMP/developer-id-g2.cer" \
             "$RUNNER_TEMP/notary-api-key.p8"
+
+      - name: Verify packaged macOS signatures independently
+        if: matrix.macos
+        shell: bash
+        run: |
+          set -euo pipefail
+          verification_dir="$RUNNER_TEMP/release-verification-${{ matrix.archive_suffix }}"
+          for binary in "$verification_dir/sink" "$verification_dir/sink-server"; do
+            codesign --verify --strict --verbose=2 "$binary"
+
+            binary_name="${binary##*/}"
+            chain_prefix="$RUNNER_TEMP/packaged-${binary_name}-${{ matrix.archive_suffix }}-codesign"
+            codesign --display \
+              --extract-certificates="$chain_prefix" \
+              "$binary"
+            test -s "${chain_prefix}0"
+            test -s "${chain_prefix}1"
+          done
 
       - name: Store release archive
         uses: actions/upload-artifact@v7
