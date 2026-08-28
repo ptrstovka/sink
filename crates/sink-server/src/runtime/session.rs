@@ -65,13 +65,18 @@ pub(crate) async fn run_control_socket(
     };
     let lease = match state
         .claims
-        .acquire(owner, requested, broker.clone(), Instant::now())
+        .acquire(owner, requested.clone(), broker.clone(), Instant::now())
     {
         Ok(lease) => lease,
-        Err(ClaimError::Conflict) => {
+        Err(ClaimError::Conflict(conflict)) => {
             tracing::warn!(
                 user_id = user.id,
                 session_id = %hello.session_id,
+                requested_subdomain = requested.as_ref().map_or("<generated>", |value| value.as_str()),
+                incumbent_subdomain = %conflict.subdomain,
+                incumbent_user_id = conflict.owner.user_id,
+                incumbent_session_id = %conflict.owner.session_id,
+                incumbent_status = conflict.status.as_str(),
                 "tunnel hostname claim conflicted"
             );
             send_rejection(
@@ -152,6 +157,15 @@ pub(crate) async fn run_control_socket(
                 session_id = %hello.session_id,
                 subdomain = %lease.subdomain,
                 "tunnel disconnected unexpectedly; claim retained for reconnect grace"
+            );
+        }
+        SessionExit::Driver(DriverExit::Replaced) => {
+            state.claims.release(&lease);
+            tracing::info!(
+                user_id = user.id,
+                session_id = %hello.session_id,
+                subdomain = %lease.subdomain,
+                "tunnel control link replaced by reconnect"
             );
         }
         SessionExit::Revoked => {

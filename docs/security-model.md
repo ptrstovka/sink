@@ -26,7 +26,10 @@ active sessions and releases their claims.
 The `connect` subdomain is reserved. Other valid single-label names are
 first-claim active-session leases; a conflict cannot displace the active
 claimant. A transiently disconnected run may reclaim its name during a bounded
-grace period. Sink does not replay interrupted application requests.
+grace period, and an authenticated reconnect with the same client-run UUID may
+replace its own older control link. Control-channel heartbeats bound how long a
+silently lost link can remain active. Sink does not replay interrupted
+application requests.
 
 ## Forwarded headers
 

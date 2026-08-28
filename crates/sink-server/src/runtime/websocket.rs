@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    future::Future as _,
     io,
     pin::Pin,
     sync::{
@@ -7,12 +8,18 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, ready},
+    time::Duration,
 };
 
 use axum::extract::ws::Message;
 use bytes::Bytes;
 use futures::{Sink, Stream};
+use rand::RngCore as _;
 use sink_protocol::MAX_TRANSPORT_MESSAGE_BYTES;
+use tokio::time::{Instant, Sleep, sleep};
+
+const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const CONTROL_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Axum WebSocket adapter consumed by `sink_protocol::MessageIo` after the
 /// JSON handshake. It exposes binary messages only and chunks large yamux
@@ -23,10 +30,23 @@ pub(crate) struct AxumMessageAdapter<S> {
     incoming_closed: bool,
     outgoing: VecDeque<Bytes>,
     clean_close: Arc<AtomicBool>,
+    heartbeat: Heartbeat,
 }
 
 impl<S> AxumMessageAdapter<S> {
     pub(crate) fn new(socket: S) -> (Self, CleanClose) {
+        Self::with_heartbeat(
+            socket,
+            CONTROL_HEARTBEAT_INTERVAL,
+            CONTROL_HEARTBEAT_TIMEOUT,
+        )
+    }
+
+    fn with_heartbeat(
+        socket: S,
+        heartbeat_interval: Duration,
+        heartbeat_timeout: Duration,
+    ) -> (Self, CleanClose) {
         let clean_close = Arc::new(AtomicBool::new(false));
         (
             Self {
@@ -35,6 +55,7 @@ impl<S> AxumMessageAdapter<S> {
                 incoming_closed: false,
                 outgoing: VecDeque::new(),
                 clean_close: Arc::clone(&clean_close),
+                heartbeat: Heartbeat::new(heartbeat_interval, heartbeat_timeout),
             },
             CleanClose { clean_close },
         )
@@ -42,16 +63,21 @@ impl<S> AxumMessageAdapter<S> {
 
     fn prefetch_incoming(&mut self, context: &mut Context<'_>) -> bool
     where
-        S: Stream<Item = Result<Message, axum::Error>> + Unpin,
+        S: Stream<Item = Result<Message, axum::Error>> + Sink<Message, Error = axum::Error> + Unpin,
     {
         if !self.incoming.is_empty() || self.incoming_closed {
             return true;
         }
         loop {
+            if let Err(error) = self.poll_control_outgoing(context) {
+                self.incoming.push_back(Err(error));
+                return true;
+            }
             match Pin::new(&mut self.socket).poll_next(context) {
                 Poll::Ready(Some(Ok(Message::Binary(bytes))))
                     if bytes.len() <= MAX_TRANSPORT_MESSAGE_BYTES =>
                 {
+                    self.heartbeat.observe_activity();
                     self.incoming.push_back(Ok(bytes));
                     return true;
                 }
@@ -74,7 +100,14 @@ impl<S> AxumMessageAdapter<S> {
                     self.incoming_closed = true;
                     return true;
                 }
-                Poll::Ready(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+                Poll::Ready(Some(Ok(Message::Ping(_)))) => {
+                    // Tungstenite queued the mandatory pong while reading.
+                    self.heartbeat.observe_activity();
+                    self.heartbeat.needs_flush = true;
+                }
+                Poll::Ready(Some(Ok(Message::Pong(_)))) => {
+                    self.heartbeat.observe_activity();
+                }
                 Poll::Ready(Some(Err(error))) => {
                     self.incoming.push_back(Err(websocket_error(error)));
                     return true;
@@ -83,9 +116,51 @@ impl<S> AxumMessageAdapter<S> {
                     self.incoming_closed = true;
                     return true;
                 }
-                Poll::Pending => return false,
+                Poll::Pending => match self.heartbeat.poll_timers(context) {
+                    Ok(()) => {
+                        if let Err(error) = self.poll_control_outgoing(context) {
+                            self.incoming.push_back(Err(error));
+                            return true;
+                        }
+                        return false;
+                    }
+                    Err(error) => {
+                        self.incoming.push_back(Err(error));
+                        return true;
+                    }
+                },
             }
         }
+    }
+
+    fn poll_control_outgoing(&mut self, context: &mut Context<'_>) -> io::Result<()>
+    where
+        S: Sink<Message, Error = axum::Error> + Unpin,
+    {
+        if self.heartbeat.pending_ping.is_some() {
+            match Pin::new(&mut self.socket).poll_ready(context) {
+                Poll::Ready(Ok(())) => {
+                    let Some(payload) = self.heartbeat.pending_ping.take() else {
+                        return Ok(());
+                    };
+                    Pin::new(&mut self.socket)
+                        .start_send(Message::Ping(payload))
+                        .map_err(websocket_error)?;
+                    self.heartbeat.ping_sent();
+                }
+                Poll::Ready(Err(error)) => return Err(websocket_error(error)),
+                Poll::Pending => return Ok(()),
+            }
+        }
+
+        if self.heartbeat.needs_flush {
+            match Pin::new(&mut self.socket).poll_flush(context) {
+                Poll::Ready(Ok(())) => self.heartbeat.needs_flush = false,
+                Poll::Ready(Err(error)) => return Err(websocket_error(error)),
+                Poll::Pending => {}
+            }
+        }
+        Ok(())
     }
 
     fn poll_drain_outgoing(
@@ -118,6 +193,70 @@ impl<S> AxumMessageAdapter<S> {
     }
 }
 
+struct Heartbeat {
+    interval: Duration,
+    timeout: Duration,
+    next_ping: Pin<Box<Sleep>>,
+    deadline: Option<Pin<Box<Sleep>>>,
+    pending_ping: Option<Bytes>,
+    awaiting_activity: bool,
+    needs_flush: bool,
+}
+
+impl Heartbeat {
+    fn new(interval: Duration, timeout: Duration) -> Self {
+        Self {
+            interval,
+            timeout,
+            next_ping: Box::pin(sleep(interval)),
+            deadline: None,
+            pending_ping: None,
+            awaiting_activity: false,
+            needs_flush: false,
+        }
+    }
+
+    fn poll_timers(&mut self, context: &mut Context<'_>) -> io::Result<()> {
+        if self
+            .deadline
+            .as_mut()
+            .is_some_and(|deadline| deadline.as_mut().poll(context).is_ready())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control WebSocket heartbeat timed out",
+            ));
+        }
+
+        if !self.awaiting_activity
+            && self.pending_ping.is_none()
+            && self.next_ping.as_mut().poll(context).is_ready()
+        {
+            let nonce = rand::rng().next_u64().to_be_bytes();
+            self.pending_ping = Some(Bytes::copy_from_slice(&nonce));
+            self.awaiting_activity = true;
+            self.deadline = Some(Box::pin(sleep(self.timeout)));
+            if let Some(deadline) = self.deadline.as_mut() {
+                let _ = deadline.as_mut().poll(context);
+            }
+        }
+        Ok(())
+    }
+
+    fn ping_sent(&mut self) {
+        self.needs_flush = true;
+    }
+
+    fn observe_activity(&mut self) {
+        self.pending_ping = None;
+        self.awaiting_activity = false;
+        self.deadline = None;
+        self.next_ping
+            .as_mut()
+            .reset(Instant::now() + self.interval);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CleanClose {
     clean_close: Arc<AtomicBool>,
@@ -131,7 +270,7 @@ impl CleanClose {
 
 impl<S> Stream for AxumMessageAdapter<S>
 where
-    S: Stream<Item = Result<Message, axum::Error>> + Unpin,
+    S: Stream<Item = Result<Message, axum::Error>> + Sink<Message, Error = axum::Error> + Unpin,
 {
     type Item = io::Result<Bytes>;
 
@@ -208,4 +347,178 @@ where
 
 fn websocket_error(error: axum::Error) -> io::Error {
     io::Error::other(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Mutex, MutexGuard},
+        task::Waker,
+    };
+
+    use futures::StreamExt as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn silent_websocket_fails_after_the_heartbeat_deadline() -> io::Result<()> {
+        let socket = MockWebSocket::new(false);
+        let state = Arc::clone(&socket.state);
+        let (mut adapter, _) = AxumMessageAdapter::with_heartbeat(
+            socket,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+
+        let incoming = tokio::time::timeout(Duration::from_millis(250), adapter.next())
+            .await
+            .map_err(|_| io::Error::other("heartbeat test timed out"))?
+            .ok_or_else(|| io::Error::other("adapter closed without heartbeat error"))?;
+        let error = incoming.expect_err("silent peer must fail its heartbeat");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            lock_state(&state)
+                .outgoing
+                .iter()
+                .any(|message| matches!(message, Message::Ping(_)))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_pongs_keep_an_idle_websocket_alive() -> io::Result<()> {
+        let socket = MockWebSocket::new(true);
+        let state = Arc::clone(&socket.state);
+        let (mut adapter, _) = AxumMessageAdapter::with_heartbeat(
+            socket,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        );
+
+        let result = tokio::time::timeout(Duration::from_millis(100), adapter.next()).await;
+        assert!(
+            result.is_err(),
+            "responsive idle peer must remain connected"
+        );
+        let ping_count = lock_state(&state)
+            .outgoing
+            .iter()
+            .filter(|message| matches!(message, Message::Ping(_)))
+            .count();
+        assert!(ping_count >= 2, "expected repeated heartbeat pings");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_deadline_also_bounds_a_blocked_ping_write() -> io::Result<()> {
+        let socket = MockWebSocket::new_with_write_readiness(false, false);
+        let (mut adapter, _) = AxumMessageAdapter::with_heartbeat(
+            socket,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+
+        let incoming = tokio::time::timeout(Duration::from_millis(250), adapter.next())
+            .await
+            .map_err(|_| io::Error::other("blocked heartbeat test timed out"))?
+            .ok_or_else(|| io::Error::other("adapter closed without heartbeat error"))?;
+        let error = incoming.expect_err("blocked heartbeat write must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Ok(())
+    }
+
+    struct MockWebSocket {
+        state: Arc<Mutex<MockState>>,
+    }
+
+    struct MockState {
+        auto_pong: bool,
+        write_ready: bool,
+        incoming: VecDeque<Message>,
+        outgoing: Vec<Message>,
+        reader: Option<Waker>,
+    }
+
+    impl MockWebSocket {
+        fn new(auto_pong: bool) -> Self {
+            Self::new_with_write_readiness(auto_pong, true)
+        }
+
+        fn new_with_write_readiness(auto_pong: bool, write_ready: bool) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(MockState {
+                    auto_pong,
+                    write_ready,
+                    incoming: VecDeque::new(),
+                    outgoing: Vec::new(),
+                    reader: None,
+                })),
+            }
+        }
+    }
+
+    fn lock_state(state: &Mutex<MockState>) -> MutexGuard<'_, MockState> {
+        match state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    impl Stream for MockWebSocket {
+        type Item = Result<Message, axum::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let mut state = lock_state(&self.state);
+            match state.incoming.pop_front() {
+                Some(message) => Poll::Ready(Some(Ok(message))),
+                None => {
+                    state.reader = Some(context.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    impl Sink<Message> for MockWebSocket {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if lock_state(&self.state).write_ready {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+            let mut state = lock_state(&self.state);
+            if state.auto_pong
+                && let Message::Ping(payload) = &message
+            {
+                state.incoming.push_back(Message::Pong(payload.clone()));
+                if let Some(reader) = state.reader.take() {
+                    reader.wake();
+                }
+            }
+            state.outgoing.push(message);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 }

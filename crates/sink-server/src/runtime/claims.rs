@@ -34,10 +34,32 @@ pub(crate) enum ClaimLookup {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClaimError {
-    Conflict,
+    Conflict(ClaimConflict),
     GenerationExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClaimConflict {
+    pub(crate) subdomain: Subdomain,
+    pub(crate) owner: ClaimOwner,
+    pub(crate) status: ClaimStatusKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClaimStatusKind {
+    Active,
+    Disconnected,
+}
+
+impl ClaimStatusKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Disconnected => "disconnected",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -82,18 +104,26 @@ impl ClaimRegistry {
             let requested_matches = requested
                 .as_ref()
                 .is_none_or(|requested| requested == subdomain);
-            if !requested_matches || matches!(claim.status, ClaimStatus::Active { .. }) {
-                return Err(ClaimError::Conflict);
+            if !requested_matches {
+                return Err(ClaimError::Conflict(conflict(subdomain, claim)));
             }
 
             let subdomain = subdomain.clone();
-            return Ok(activate_locked(&mut inner, subdomain, owner, broker));
+            let replaced = match &claim.status {
+                ClaimStatus::Active { broker, .. } => Some(broker.clone()),
+                ClaimStatus::Disconnected { .. } => None,
+            };
+            let lease = activate_locked(&mut inner, subdomain, owner, broker);
+            if let Some(replaced) = replaced {
+                replaced.replace();
+            }
+            return Ok(lease);
         }
 
         let subdomain = match requested {
             Some(subdomain) => {
-                if inner.by_subdomain.contains_key(&subdomain) {
-                    return Err(ClaimError::Conflict);
+                if let Some(claim) = inner.by_subdomain.get(&subdomain) {
+                    return Err(ClaimError::Conflict(conflict(&subdomain, claim)));
                 }
                 subdomain
             }
@@ -181,6 +211,17 @@ impl ClaimRegistry {
     }
 }
 
+fn conflict(subdomain: &Subdomain, claim: &Claim) -> ClaimConflict {
+    ClaimConflict {
+        subdomain: subdomain.clone(),
+        owner: claim.owner,
+        status: match claim.status {
+            ClaimStatus::Active { .. } => ClaimStatusKind::Active,
+            ClaimStatus::Disconnected { .. } => ClaimStatusKind::Disconnected,
+        },
+    }
+}
+
 fn activate_locked(
     inner: &mut ClaimsInner,
     subdomain: Subdomain,
@@ -252,15 +293,51 @@ mod tests {
             .acquire(owner(1, 1), Some(subdomain.clone()), active_broker, now)
             .expect("first claim");
 
-        assert!(matches!(
-            registry.acquire(owner(2, 2), Some(subdomain.clone()), broker(), now),
-            Err(ClaimError::Conflict)
-        ));
+        let conflict = registry
+            .acquire(owner(2, 2), Some(subdomain.clone()), broker(), now)
+            .expect_err("different owner must conflict");
+        assert_eq!(
+            conflict,
+            ClaimError::Conflict(ClaimConflict {
+                subdomain: subdomain.clone(),
+                owner: owner(1, 1),
+                status: ClaimStatusKind::Active,
+            })
+        );
         assert!(matches!(
             registry.lookup(&subdomain, now),
             ClaimLookup::Active(_)
         ));
         assert_eq!(first.owner, owner(1, 1));
+    }
+
+    #[test]
+    fn same_active_owner_atomically_replaces_its_old_lease() {
+        let registry = ClaimRegistry::default();
+        let now = Instant::now();
+        let subdomain = Subdomain::parse("demo").expect("valid test subdomain");
+        let claim_owner = owner(1, 1);
+        let first = registry
+            .acquire(claim_owner, Some(subdomain.clone()), broker(), now)
+            .expect("first claim");
+
+        let (replacement_broker, _replacement_requests) = StreamBroker::channel();
+        let replacement = registry
+            .acquire(
+                claim_owner,
+                Some(subdomain.clone()),
+                replacement_broker,
+                now,
+            )
+            .expect("same run reconnect replaces its active socket");
+
+        assert_ne!(replacement.lease_id, first.lease_id);
+        assert!(!registry.release(&first));
+        assert!(matches!(
+            registry.lookup(&subdomain, now),
+            ClaimLookup::Active(_)
+        ));
+        assert!(registry.release(&replacement));
     }
 
     #[test]
@@ -288,7 +365,7 @@ mod tests {
                 broker(),
                 now + Duration::from_secs(29)
             ),
-            Err(ClaimError::Conflict)
+            Err(ClaimError::Conflict(_))
         ));
         let reclaimed = registry
             .acquire(claim_owner, None, broker(), now + Duration::from_secs(29))

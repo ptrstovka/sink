@@ -13,6 +13,7 @@ type OpenReply = oneshot::Sender<Result<Stream, BrokerError>>;
 enum DriverCommand {
     Open(OpenReply),
     Shutdown,
+    Replace,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +42,12 @@ impl StreamBroker {
     pub(crate) fn shutdown(&self) {
         let _ = self.commands.send(DriverCommand::Shutdown);
     }
+
+    /// Stop this driver immediately because a newer control link for the same
+    /// authenticated client run has taken ownership of its claim.
+    pub(crate) fn replace(&self) {
+        let _ = self.commands.send(DriverCommand::Replace);
+    }
 }
 
 #[derive(Debug)]
@@ -51,6 +58,7 @@ pub(crate) struct StreamRequests {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DriverExit {
     Shutdown,
+    Replaced,
     TransportClosed,
     TransportError,
     UnexpectedInboundStream,
@@ -102,6 +110,10 @@ where
                 }
                 Poll::Ready(Some(DriverCommand::Shutdown)) | Poll::Ready(None) => {
                     shutdown = true;
+                }
+                Poll::Ready(Some(DriverCommand::Replace)) => {
+                    fail_pending(&mut pending);
+                    return Poll::Ready(DriverExit::Replaced);
                 }
                 Poll::Pending => {
                     command_limit_reached = false;
@@ -250,6 +262,23 @@ mod tests {
             io::ErrorKind::BrokenPipe,
             "peer closed before server write",
         ))
+    }
+
+    #[tokio::test]
+    async fn replacement_stops_a_half_open_driver_immediately() -> Result<(), io::Error> {
+        let (server_io, _silent_peer) = tokio::io::duplex(1024);
+        let (broker, requests) = StreamBroker::channel();
+        let driver = tokio::spawn(drive_yamux(server_io.compat(), requests));
+
+        tokio::task::yield_now().await;
+        broker.replace();
+
+        let exit = tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .map_err(|_| io::Error::other("replacement did not stop the old driver"))?
+            .map_err(io::Error::other)?;
+        assert_eq!(exit, DriverExit::Replaced);
+        Ok(())
     }
 
     #[tokio::test]

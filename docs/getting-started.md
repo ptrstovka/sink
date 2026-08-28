@@ -16,7 +16,7 @@ Sink listener only on `127.0.0.1:42424`. Create a `.env` file beside it:
 
 ```dotenv
 SINK_PUBLIC_BASE_DOMAIN=example.com
-SINK_VERSION=0.0.2
+SINK_VERSION=0.0.3
 SINK_HOST_PORT=42424
 ```
 

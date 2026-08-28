@@ -28,8 +28,12 @@ WebSockets to flow without whole-body buffering.
 
 The server holds active subdomain claims. A client-run UUID owns the claim;
 clean exit releases it, while an unexpected disconnect retains it briefly for
-same-run reconnection. Requests during that gap return service unavailable.
-Interrupted in-flight traffic fails and is never automatically replayed.
+same-run reconnection. A newer control link from that same authenticated run
+atomically replaces an older half-open link. Server-initiated WebSocket
+heartbeats bound detection of silent network loss. A separately started client
+run cannot acquire the name until the old run's reconnect grace expires.
+Requests during that gap return service unavailable. Interrupted in-flight
+traffic fails and is never automatically replayed.
 
 SQLite stores accounts, enabled state, token digest/generation, and other
 durable administrative data. Public claims are runtime leases rather than
