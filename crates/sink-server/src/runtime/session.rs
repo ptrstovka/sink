@@ -58,7 +58,7 @@ pub(crate) async fn run_control_socket(
         None => None,
     };
 
-    let (broker, requests) = StreamBroker::channel();
+    let (broker, requests) = StreamBroker::channel_for_session(hello.session_id);
     let liveness = broker.liveness();
     liveness.set_client_version(&hello.client_version);
     let owner = ClaimOwner {
@@ -113,6 +113,8 @@ pub(crate) async fn run_control_socket(
                 incumbent_heartbeat_timeouts = conflict.liveness.heartbeat_timeouts,
                 incumbent_binary_messages_received = conflict.liveness.binary_messages_received,
                 incumbent_public_stream_requests = conflict.liveness.public_stream_requests,
+                incumbent_public_streams_opened = conflict.liveness.public_streams_opened,
+                incumbent_public_stream_open_timeouts = conflict.liveness.public_stream_open_timeouts,
                 "tunnel hostname claim conflicted"
             );
             send_rejection(

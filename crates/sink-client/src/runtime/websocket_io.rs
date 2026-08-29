@@ -75,7 +75,10 @@ where
                     Poll::Ready(Err(_)) => {
                         return Poll::Ready(Some(Err(control_io_error())));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    // A blocked automatic WebSocket Pong must not stop the
+                    // read half. Polling the socket below registers the read
+                    // waker as well and can relieve symmetric backpressure.
+                    Poll::Pending => {}
                 }
             }
 
@@ -174,16 +177,20 @@ fn control_io_error() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use futures::SinkExt as _;
+    use std::collections::VecDeque;
+
+    use futures::{SinkExt as _, task::noop_waker};
 
     use super::*;
 
     #[derive(Debug, Default)]
     struct MockWebSocket {
+        incoming: VecDeque<Result<Message, WebSocketError>>,
         outgoing: Vec<Message>,
         ready_calls: usize,
         pending_on_ready_call: Option<usize>,
         pending_was_returned: bool,
+        flush_pending: bool,
         flushes: usize,
         closes: usize,
     }
@@ -191,8 +198,13 @@ mod tests {
     impl Stream for MockWebSocket {
         type Item = Result<Message, WebSocketError>;
 
-        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Pending
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.incoming
+                .pop_front()
+                .map_or(Poll::Pending, |message| Poll::Ready(Some(message)))
         }
     }
 
@@ -222,7 +234,11 @@ mod tests {
             _context: &mut Context<'_>,
         ) -> Poll<Result<(), Self::Error>> {
             self.flushes += 1;
-            Poll::Ready(Ok(()))
+            if self.flush_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
 
         fn poll_close(
@@ -232,6 +248,32 @@ mod tests {
             self.closes += 1;
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[test]
+    fn blocked_control_flush_does_not_stop_inbound_binary_messages() -> io::Result<()> {
+        let socket = MockWebSocket {
+            incoming: VecDeque::from([
+                Ok(Message::Ping(Bytes::from_static(b"heartbeat"))),
+                Ok(Message::Binary(Bytes::from_static(b"yamux"))),
+            ]),
+            flush_pending: true,
+            ..MockWebSocket::default()
+        };
+        let mut adapter = WebSocketBinary::new(socket);
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        let result = Pin::new(&mut adapter).poll_next(&mut context);
+        let Poll::Ready(Some(Ok(bytes))) = result else {
+            return Err(io::Error::other(
+                "blocked WebSocket Pong prevented inbound progress",
+            ));
+        };
+        assert_eq!(bytes, Bytes::from_static(b"yamux"));
+        assert!(adapter.needs_flush);
+        assert_eq!(adapter.inner.flushes, 1);
+        Ok(())
     }
 
     #[test]

@@ -1742,7 +1742,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "sink-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "brotli",
@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "sink-e2e"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "sink-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "sink-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",

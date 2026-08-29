@@ -44,6 +44,30 @@ does not replace these gates or claim they have run.
 
 Use the guarded harness under `scripts/acceptance/`.
 
+The harness streams file-backed uploads with curl `--upload-file` while keeping
+the request method explicitly `PUT`; it never uses `--data-binary @file` for the
+1 GiB payload. Each connection, ordinary request, large operation, and external
+hook has a bounded timeout. Upload/download counters and SSE/WebSocket output
+sizes are sampled throughout mixed and soak workloads, and a no-growth window
+fails with byte-only diagnostics. Tracked children are terminated and reaped on
+success, failure, or signal without printing curl/hook logs, request content,
+public URLs, or credentials.
+
+Timeouts can be tuned within enforced bounds with
+`SINK_ACCEPTANCE_CONNECT_TIMEOUT_SECONDS` (default 5),
+`SINK_ACCEPTANCE_REQUEST_TIMEOUT_SECONDS` (10),
+`SINK_ACCEPTANCE_ORDINARY_CONCURRENCY` (25, allowed 1–100),
+`SINK_ACCEPTANCE_OPERATION_TIMEOUT_SECONDS` (1800),
+`SINK_ACCEPTANCE_STALL_TIMEOUT_SECONDS` (60),
+`SINK_ACCEPTANCE_PROGRESS_INTERVAL_SECONDS` (5), and
+`SINK_ACCEPTANCE_HOOK_TIMEOUT_SECONDS` (120). The progress interval must remain
+shorter than the stall timeout. `SINK_ACCEPTANCE_SOAK_SECONDS` defaults to 3600
+and allows 3600–86400 seconds. It defines the nominal workload-admission and
+observation window. Work admitted before that boundary retains its bounded
+request or operation timeout; an admitted upload/download pair completes
+atomically with a fresh timeout for each leg. See `scripts/acceptance/README.md`
+for the complete allowed ranges and maximum bounded overrun.
+
 ## Baseline setup
 
 Create two enabled accounts and start local fixtures that can echo request
@@ -58,14 +82,21 @@ from a known tunnel whose client/local target is unavailable.
 1. Large transfer: upload a deterministic 1 GiB body and compare its SHA-256 at
    the local receiver; download a deterministic 1 GiB response and compare the
    source/received SHA-256. No truncation, corruption, whole-body memory spike,
-   or Sink size rejection is acceptable.
+   stalled byte counter, deadline overrun, or Sink size rejection is acceptable.
 2. Long-lived traffic: keep one SSE stream and one WebSocket open for one hour.
    During that hour send periodic ordinary requests and uploads/downloads.
-   Check responsiveness and sample RSS, file descriptors, tasks, and disk use
-   for progressive growth.
+   Require both output byte counts to grow within every configured stall window,
+   check responsiveness, and sample RSS, file descriptors, tasks, and disk use
+   for progressive growth. Stop admitting new work at the nominal soak
+   boundary, but let an already-admitted ordinary request or upload/download
+   pair finish under its own request, operation, and stall limits. Continue
+   monitoring the long-lived streams during this bounded completion window.
 3. Mixed concurrency: while an upload, SSE, and WebSocket are active, issue at
-   least 100 ordinary requests concurrently through the same tunnel. Validate
-   every response and confirm long-lived operations keep progressing.
+   least 100 ordinary requests through the same tunnel with a bounded in-flight
+   window (25 by default). Validate every response, wait for and hash-check both
+   1 GiB transfers, and confirm the transfer, SSE, and WebSocket byte counters
+   keep progressing. The bounded window keeps this focused on tunnel fairness,
+   rather than public TLS/proxy connection admission.
 4. Link disruption: interrupt the client-to-server path at least 20 times.
    Each in-flight operation must fail without replay; within 10 seconds of path
    recovery, new traffic must work at the identical public URL.

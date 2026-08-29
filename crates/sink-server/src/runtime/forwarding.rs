@@ -1,4 +1,8 @@
-use std::{net::IpAddr, str::FromStr as _};
+use std::{
+    net::IpAddr,
+    str::FromStr as _,
+    time::{Duration, Instant},
+};
 
 use axum::body::Body;
 use http::{
@@ -29,7 +33,7 @@ pub(crate) struct ForwardingContext {
 
 #[derive(Debug, Error)]
 pub(crate) enum ForwardError {
-    #[error("tunnel stream unavailable")]
+    #[error(transparent)]
     Broker(#[from] BrokerError),
     #[error("could not start an HTTP exchange on the tunnel stream")]
     Handshake(#[source] hyper::Error),
@@ -44,26 +48,97 @@ pub(crate) async fn forward_request(
     mut request: Request<Body>,
     context: ForwardingContext,
 ) -> Result<Response<Body>, ForwardError> {
+    let forwarding_started_at = Instant::now();
     let request_is_upgrade = is_generic_upgrade(request.headers());
     let public_upgrade = request_is_upgrade.then(|| hyper::upgrade::on(&mut request));
     prepare_request_headers(request.headers_mut(), &context, request_is_upgrade)?;
 
-    let stream = broker.open_stream().await?;
+    let session_id = broker.session_id();
+    let open_wait_started_at = Instant::now();
+    let opened = match broker.open_stream_observed().await {
+        Ok(opened) => opened,
+        Err(error) => {
+            tracing::info!(
+                tunnel_session_id = %session_id,
+                stage = "stream_open_failed",
+                broker_wait_us = duration_micros(open_wait_started_at.elapsed()),
+                total_us = duration_micros(forwarding_started_at.elapsed()),
+                error = %error,
+                "tunneled request stage latency"
+            );
+            return Err(ForwardError::Broker(error));
+        }
+    };
+    let stream_id = opened.stream.id().val();
+    tracing::info!(
+        tunnel_session_id = %opened.session_id,
+        stream_id,
+        stage = "stream_opened",
+        broker_queue_us = duration_micros(opened.broker_queue),
+        yamux_open_us = duration_micros(opened.yamux_open),
+        total_us = duration_micros(forwarding_started_at.elapsed()),
+        "tunneled request stage latency"
+    );
+
+    let stream = opened.stream;
     let io = TokioIo::new(stream.compat());
-    let (mut sender, connection) = http1::handshake(io)
-        .await
-        .map_err(ForwardError::Handshake)?;
+    let handshake_started_at = Instant::now();
+    let (mut sender, connection) = match http1::handshake(io).await {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::info!(
+                tunnel_session_id = %session_id,
+                stream_id,
+                stage = "http_handshake_failed",
+                http_handshake_us = duration_micros(handshake_started_at.elapsed()),
+                total_us = duration_micros(forwarding_started_at.elapsed()),
+                error = %error,
+                "tunneled request stage latency"
+            );
+            return Err(ForwardError::Handshake(error));
+        }
+    };
+    let http_handshake = handshake_started_at.elapsed();
     tokio::spawn(async move {
         if let Err(error) = connection.with_upgrades().await {
-            tracing::debug!(%error, "tunneled HTTP connection ended with an error");
+            tracing::debug!(
+                tunnel_session_id = %session_id,
+                stream_id,
+                %error,
+                "tunneled HTTP connection ended with an error"
+            );
         }
     });
 
-    let mut response = sender
-        .send_request(request)
-        .await
-        .map_err(ForwardError::Exchange)?;
+    let response_head_started_at = Instant::now();
+    let mut response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::info!(
+                tunnel_session_id = %session_id,
+                stream_id,
+                stage = "response_head_failed",
+                http_handshake_us = duration_micros(http_handshake),
+                tunneled_response_head_us = duration_micros(response_head_started_at.elapsed()),
+                total_us = duration_micros(forwarding_started_at.elapsed()),
+                error = %error,
+                "tunneled request stage latency"
+            );
+            return Err(ForwardError::Exchange(error));
+        }
+    };
     drop(sender);
+
+    tracing::info!(
+        tunnel_session_id = %session_id,
+        stream_id,
+        stage = "response_head",
+        status = response.status().as_u16(),
+        http_handshake_us = duration_micros(http_handshake),
+        tunneled_response_head_us = duration_micros(response_head_started_at.elapsed()),
+        total_us = duration_micros(forwarding_started_at.elapsed()),
+        "tunneled request stage latency"
+    );
 
     let response_is_upgrade = response.status() == StatusCode::SWITCHING_PROTOCOLS
         && is_generic_upgrade(response.headers());
@@ -88,6 +163,10 @@ pub(crate) async fn forward_request(
 
     let (parts, body) = response.into_parts();
     Ok(Response::from_parts(parts, Body::new(body)))
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn prepare_request_headers(

@@ -429,7 +429,14 @@ mod tests {
         assert!(ping_count >= 2, "expected repeated heartbeat pings");
         let snapshot = liveness.snapshot(std::time::Instant::now());
         assert_eq!(snapshot.heartbeat_pings_sent, ping_count as u64);
-        assert_eq!(snapshot.heartbeat_pongs_received, ping_count as u64);
+        let outstanding_pings = snapshot
+            .heartbeat_pings_sent
+            .checked_sub(snapshot.heartbeat_pongs_received)
+            .expect("heartbeat pong count must not exceed the ping count");
+        assert!(
+            outstanding_pings <= 1,
+            "at most one heartbeat ping may be awaiting its pong"
+        );
         assert_eq!(snapshot.heartbeat_timeouts, 0);
         assert_eq!(snapshot.last_inbound_kind, Some(ControlInboundKind::Pong));
         assert!(snapshot.last_pong_received_ago.is_some());

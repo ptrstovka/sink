@@ -1,6 +1,6 @@
 services:
   sink-server:
-    image: ghcr.io/ptrstovka/sink-server:${SINK_VERSION:-0.1.0}
+    image: ghcr.io/ptrstovka/sink-server:${SINK_VERSION:-0.2.0}
     restart: unless-stopped
     environment:
       SINK_SERVER_PUBLIC_BASE_DOMAIN: ${SINK_PUBLIC_BASE_DOMAIN:?set SINK_PUBLIC_BASE_DOMAIN}

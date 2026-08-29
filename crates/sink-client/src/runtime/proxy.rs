@@ -45,6 +45,7 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::{
     inspection::{
@@ -67,6 +68,27 @@ const RESPONSE_BODY_FAILURE: &str = "response body transfer failed";
 
 pub(crate) type BoxError = Box<dyn StdError + Send + Sync>;
 pub(crate) type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
+
+#[derive(Clone, Copy, Debug)]
+struct LocalResponseTimings {
+    connect: Duration,
+    http_handshake: Duration,
+    response_head: Duration,
+}
+
+#[derive(Debug)]
+struct LocalResponse {
+    response: Response<Incoming>,
+    timings: LocalResponseTimings,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TunnelRequestTiming {
+    session_id: Uuid,
+    stream_id: u32,
+    accepted_at: Instant,
+    request_head_at: Instant,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestSummary {
@@ -146,7 +168,7 @@ impl LocalProxy {
         &self,
         mut request: Request<B>,
         spawn_connection: Spawn,
-    ) -> Result<Response<Incoming>, ReplayTransportError>
+    ) -> Result<LocalResponse, ReplayTransportError>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<BoxError>,
@@ -156,6 +178,7 @@ impl LocalProxy {
             return Err(ReplayTransportError::Rewrite);
         }
 
+        let connect_started_at = Instant::now();
         let io = match self.connect_local().await {
             Ok(io) => io,
             Err(error) => {
@@ -163,6 +186,8 @@ impl LocalProxy {
                 return Err(ReplayTransportError::Connect);
             }
         };
+        let connect = connect_started_at.elapsed();
+        let handshake_started_at = Instant::now();
         let handshake = timeout(
             self.connect_timeout,
             http1::handshake::<_, B>(TokioIo::new(io)),
@@ -175,6 +200,7 @@ impl LocalProxy {
                 return Err(ReplayTransportError::Handshake);
             }
         };
+        let http_handshake = handshake_started_at.elapsed();
 
         spawn_connection(Box::pin(async move {
             if connection.with_upgrades().await.is_err() {
@@ -184,9 +210,18 @@ impl LocalProxy {
             }
         }));
 
-        sender.send_request(request).await.map_err(|_| {
+        let response_head_started_at = Instant::now();
+        let response = sender.send_request(request).await.map_err(|_| {
             warn!(target = %self.target, "local HTTP request failed");
             ReplayTransportError::Request
+        })?;
+        Ok(LocalResponse {
+            response,
+            timings: LocalResponseTimings {
+                connect,
+                http_handshake,
+                response_head: response_head_started_at.elapsed(),
+            },
         })
     }
 
@@ -234,7 +269,7 @@ impl ReplayTransport for LocalProxy {
                     drop(tokio::spawn(connection));
                 })
                 .await
-                .map(|response| response.map(boxed_body) as Response<ReplayResponseBody>)
+                .map(|local| local.response.map(boxed_body) as Response<ReplayResponseBody>)
         })
     }
 }
@@ -247,7 +282,32 @@ pub(crate) struct ExchangeProxy {
 }
 
 impl ExchangeProxy {
-    pub(crate) async fn forward<B>(&self, mut request: Request<B>) -> Response<ProxyBody>
+    #[cfg(test)]
+    pub(crate) async fn forward<B>(&self, request: Request<B>) -> Response<ProxyBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        self.forward_inner(request, None).await
+    }
+
+    async fn forward_tunnel<B>(
+        &self,
+        request: Request<B>,
+        timing: TunnelRequestTiming,
+    ) -> Response<ProxyBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        self.forward_inner(request, Some(timing)).await
+    }
+
+    async fn forward_inner<B>(
+        &self,
+        mut request: Request<B>,
+        tunnel_timing: Option<TunnelRequestTiming>,
+    ) -> Response<ProxyBody>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<BoxError>,
@@ -291,14 +351,39 @@ impl ExchangeProxy {
                 });
             })
             .await;
-        let response = match response {
-            Ok(response) => response,
+        let local = match response {
+            Ok(local) => local,
             Err(error) => {
+                if let Some(timing) = tunnel_timing {
+                    tracing::info!(
+                        tunnel_session_id = %timing.session_id,
+                        stream_id = timing.stream_id,
+                        stage = "local_response_failed",
+                        accept_to_failure_us = duration_micros(timing.accepted_at.elapsed()),
+                        request_to_failure_us = duration_micros(timing.request_head_at.elapsed()),
+                        error = %error,
+                        "tunneled request stage latency"
+                    );
+                }
                 inspection_guard.fail(error.capture_message());
                 return service_unavailable(stats);
             }
         };
-        let response = self.prepare_response(response, public_upgrade, stats, inspection);
+        if let Some(timing) = tunnel_timing {
+            tracing::info!(
+                tunnel_session_id = %timing.session_id,
+                stream_id = timing.stream_id,
+                stage = "local_response_head",
+                status = local.response.status().as_u16(),
+                accept_to_response_head_us = duration_micros(timing.accepted_at.elapsed()),
+                request_to_response_head_us = duration_micros(timing.request_head_at.elapsed()),
+                local_connect_us = duration_micros(local.timings.connect),
+                local_http_handshake_us = duration_micros(local.timings.http_handshake),
+                local_response_head_us = duration_micros(local.timings.response_head),
+                "tunneled request stage latency"
+            );
+        }
+        let response = self.prepare_response(local.response, public_upgrade, stats, inspection);
         inspection_guard.disarm();
         response
     }
@@ -360,12 +445,33 @@ pub(crate) async fn serve_stream<S>(
     stream: S,
     proxy: ExchangeProxy,
     force_shutdown: CancellationToken,
+    session_id: Uuid,
+    stream_id: u32,
+    accepted_at: Instant,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |request| {
         let proxy = proxy.clone();
-        async move { Ok::<_, Infallible>(proxy.forward(request).await) }
+        async move {
+            let request_head_at = Instant::now();
+            tracing::info!(
+                tunnel_session_id = %session_id,
+                stream_id,
+                stage = "request_head",
+                accept_to_request_head_us = duration_micros(
+                    request_head_at.saturating_duration_since(accepted_at)
+                ),
+                "tunneled request stage latency"
+            );
+            let timing = TunnelRequestTiming {
+                session_id,
+                stream_id,
+                accepted_at,
+                request_head_at,
+            };
+            Ok::<_, Infallible>(proxy.forward_tunnel(request, timing).await)
+        }
     });
     // Keep Hyper's HTTP/1 upgrade handling enabled. Forcing keep-alive off
     // rewrites a valid `Connection: upgrade` response to `Connection: close`.
@@ -377,7 +483,12 @@ pub(crate) async fn serve_stream<S>(
     tokio::select! {
         result = connection => {
             if result.is_err() {
-                tracing::debug!("tunnel HTTP exchange ended with an error");
+                tracing::debug!(
+                    tunnel_session_id = %session_id,
+                    stream_id,
+                    accepted_for_us = duration_micros(accepted_at.elapsed()),
+                    "tunnel HTTP exchange ended with an error"
+                );
             }
         }
         () = force_shutdown.cancelled() => {}
@@ -1145,6 +1256,10 @@ fn add_bytes(counter: &AtomicU64, amount: u64) {
     });
 }
 
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 trait LocalIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> LocalIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxedLocalIo = Box<dyn LocalIo>;
@@ -1865,7 +1980,20 @@ mod tests {
             .method(Method::POST)
             .uri("/stream")
             .body(StreamBody::new(first.chain(second)))?;
-        let response = timeout(Duration::from_secs(1), proxy.forward(request)).await?;
+        let request_head_at = Instant::now();
+        let response = timeout(
+            Duration::from_secs(1),
+            proxy.forward_tunnel(
+                request,
+                TunnelRequestTiming {
+                    session_id: Uuid::from_u128(42),
+                    stream_id: 2,
+                    accepted_at: request_head_at,
+                    request_head_at,
+                },
+            ),
+        )
+        .await?;
         assert_eq!(response.status(), StatusCode::OK);
         let _ = release_tx.send(());
         assert_eq!(

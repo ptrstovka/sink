@@ -52,7 +52,7 @@ and stores SQLite state under `/data`. For the supplied Compose deployment:
 
 ```console
 cd deploy/docker
-SINK_PUBLIC_BASE_DOMAIN=example.com SINK_VERSION=0.1.0 docker compose up -d
+SINK_PUBLIC_BASE_DOMAIN=example.com SINK_VERSION=0.2.0 docker compose up -d
 docker compose exec sink-server sink-server user create me
 ```
 

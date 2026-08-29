@@ -5,7 +5,12 @@ mod control;
 mod proxy;
 mod websocket_io;
 
-use std::{fmt, future::poll_fn, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    future::poll_fn,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures::{AsyncRead, AsyncWrite};
 use sink_protocol::{ClientHello, MessageIo, RejectCode, Subdomain};
@@ -15,7 +20,7 @@ use tokio::{
 };
 use tokio_util::{compat::FuturesAsyncReadCompatExt, sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
-use yamux::{Config as YamuxConfig, Connection, Mode};
+use yamux::{Config as YamuxConfig, Connection, DEFAULT_CREDIT, Mode};
 
 use crate::{
     cli::{CliValidationError, HttpArgs},
@@ -38,6 +43,20 @@ const REQUEST_SUMMARY_CAPACITY: usize = 512;
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const FORCED_TASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const YAMUX_MAX_STREAMS: usize = 512;
+// yamux 0.13 draws auto-tuned per-stream credit from the aggregate receive
+// window's surplus. Reserving exactly the 256 KiB minimum for every stream
+// leaves no surplus for bulk streams to queue ahead of later SYN frames.
+const YAMUX_MAX_CONNECTION_RECEIVE_WINDOW_BYTES: usize =
+    YAMUX_MAX_STREAMS * DEFAULT_CREDIT as usize;
+
+fn yamux_config() -> YamuxConfig {
+    let mut config = YamuxConfig::default();
+    config
+        .set_max_num_streams(YAMUX_MAX_STREAMS)
+        .set_max_connection_receive_window(Some(YAMUX_MAX_CONNECTION_RECEIVE_WINDOW_BYTES));
+    config
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionInfo {
@@ -339,7 +358,7 @@ impl TunnelRuntime {
         self.publish(TunnelPhase::Connected(info));
         let bytes = WebSocketBinary::new(websocket);
         let io = MessageIo::new(bytes);
-        let connection = Connection::new(io, YamuxConfig::default(), Mode::Client);
+        let connection = Connection::new(io, yamux_config(), Mode::Client);
         self.drive_connection(connection).await
     }
 
@@ -417,9 +436,24 @@ impl TunnelRuntime {
                 inbound = poll_fn(|context| connection.poll_next_inbound(context)) => {
                     match inbound {
                         Some(Ok(stream)) => {
+                            let accepted_at = Instant::now();
+                            let stream_id = stream.id().val();
+                            tracing::info!(
+                                tunnel_session_id = %self.session_id,
+                                stream_id,
+                                stage = "stream_accepted",
+                                "tunneled request stage latency"
+                            );
                             let proxy = exchange_proxy.clone();
                             let force = force_shutdown.clone();
-                            tasks.spawn(proxy::serve_stream(stream.compat(), proxy, force));
+                            tasks.spawn(proxy::serve_stream(
+                                stream.compat(),
+                                proxy,
+                                force,
+                                self.session_id,
+                                stream_id,
+                                accepted_at,
+                            ));
                         }
                         Some(Err(_)) | None => {
                             cleanup_tasks(&tasks, &force_shutdown).await;
@@ -553,7 +587,7 @@ impl RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU16, str::FromStr};
+    use std::{io, num::NonZeroU16, str::FromStr};
 
     use bytes::Bytes;
     use clap::Parser as _;
@@ -563,6 +597,7 @@ mod tests {
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
     use sink_protocol::{SessionAccepted, Subdomain};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
     use crate::{
@@ -721,6 +756,113 @@ mod tests {
             RuntimeError::ProtocolViolation.disposition(),
             FailureDisposition::Permanent
         );
+    }
+
+    #[tokio::test]
+    async fn yamux_receive_budget_disables_bulk_window_auto_tuning() -> Result<(), proxy::BoxError>
+    {
+        let default_credit = first_window_update_credit(YamuxConfig::default()).await?;
+        assert!(
+            default_credit > DEFAULT_CREDIT,
+            "test setup did not trigger yamux's default receive-window auto-tuner"
+        );
+
+        let bounded_credit = first_window_update_credit(yamux_config()).await?;
+        assert!(
+            bounded_credit <= DEFAULT_CREDIT,
+            "configured bulk stream grew beyond its fixed receive-window floor"
+        );
+        Ok(())
+    }
+
+    async fn first_window_update_credit(config: YamuxConfig) -> Result<u32, proxy::BoxError> {
+        const HEADER_BYTES: usize = 12;
+        const DATA_TAG: u8 = 0;
+        const WINDOW_UPDATE_TAG: u8 = 1;
+        const PING_TAG: u8 = 2;
+        const SYN_FLAG: u16 = 1;
+        const ACK_FLAG: u16 = 2;
+        const SERVER_STREAM_ID: u32 = 2;
+        const FRAME_BODY_BYTES: usize = 16 * 1024;
+
+        let (client_transport, mut raw_peer) = tokio::io::duplex(1024 * 1024);
+        let mut connection = Connection::new(client_transport.compat(), config, Mode::Client);
+        let client_driver = tokio::spawn(async move {
+            let stream = poll_fn(|context| connection.poll_next_inbound(context))
+                .await
+                .ok_or_else(|| io::Error::other("yamux closed before the test stream"))?
+                .map_err(io::Error::other)?;
+            tokio::spawn(async move {
+                let mut stream = stream.compat();
+                let mut received = 0_usize;
+                let mut buffer = [0_u8; FRAME_BODY_BYTES];
+                while received < DEFAULT_CREDIT as usize {
+                    let count = stream.read(&mut buffer).await?;
+                    if count == 0 {
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                    }
+                    received += count;
+                }
+                Ok::<_, io::Error>(())
+            });
+
+            while poll_fn(|context| connection.poll_next_inbound(context))
+                .await
+                .is_some()
+            {}
+            Ok::<_, io::Error>(())
+        });
+
+        let mut ping = [0_u8; HEADER_BYTES];
+        timeout(Duration::from_secs(1), raw_peer.read_exact(&mut ping)).await??;
+        assert_eq!(ping[1], PING_TAG);
+        assert_eq!(u16::from_be_bytes([ping[2], ping[3]]), SYN_FLAG);
+        assert_eq!(&ping[4..8], &[0; 4]);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let nonce = u32::from_be_bytes([ping[8], ping[9], ping[10], ping[11]]);
+        raw_peer
+            .write_all(&yamux_test_header(PING_TAG, ACK_FLAG, 0, nonce))
+            .await?;
+
+        let body = [0_u8; FRAME_BODY_BYTES];
+        for index in 0..(DEFAULT_CREDIT as usize / FRAME_BODY_BYTES) {
+            let flags = if index == 0 { SYN_FLAG } else { 0 };
+            raw_peer
+                .write_all(&yamux_test_header(
+                    DATA_TAG,
+                    flags,
+                    SERVER_STREAM_ID,
+                    FRAME_BODY_BYTES as u32,
+                ))
+                .await?;
+            raw_peer.write_all(&body).await?;
+        }
+        raw_peer.flush().await?;
+
+        let mut update = [0_u8; HEADER_BYTES];
+        timeout(Duration::from_secs(1), raw_peer.read_exact(&mut update)).await??;
+        assert_eq!(update[1], WINDOW_UPDATE_TAG);
+        assert_eq!(u16::from_be_bytes([update[2], update[3]]), ACK_FLAG);
+        assert_eq!(
+            u32::from_be_bytes([update[4], update[5], update[6], update[7]]),
+            SERVER_STREAM_ID
+        );
+
+        client_driver.abort();
+        let _ = client_driver.await;
+        Ok(u32::from_be_bytes([
+            update[8], update[9], update[10], update[11],
+        ]))
+    }
+
+    fn yamux_test_header(tag: u8, flags: u16, stream_id: u32, value: u32) -> [u8; 12] {
+        let mut header = [0_u8; 12];
+        header[1] = tag;
+        header[2..4].copy_from_slice(&flags.to_be_bytes());
+        header[4..8].copy_from_slice(&stream_id.to_be_bytes());
+        header[8..12].copy_from_slice(&value.to_be_bytes());
+        header
     }
 
     #[tokio::test]
