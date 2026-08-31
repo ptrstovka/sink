@@ -28,6 +28,8 @@ pub enum SinkCommand {
     Http(Box<HttpArgs>),
     /// Save client configuration.
     Config(ConfigArgs),
+    /// Update the Sink client to the latest stable release.
+    Update,
     /// Print the Sink client version.
     Version,
 }
@@ -257,6 +259,13 @@ mod tests {
     fn parses_version_command() -> Result<(), Box<dyn std::error::Error>> {
         let cli = Cli::try_parse_from(["sink", "version"])?;
         assert!(matches!(cli.command, SinkCommand::Version));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_update_command_without_arguments() -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from(["sink", "update"])?;
+        assert!(matches!(cli.command, SinkCommand::Update));
         Ok(())
     }
 

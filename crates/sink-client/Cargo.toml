@@ -23,8 +23,10 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 rustls.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+self_update.workspace = true
 sink-protocol = { path = "../sink-protocol" }
 tempfile.workspace = true
 thiserror.workspace = true
@@ -42,6 +44,8 @@ yamux.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
+tar.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 [lints]

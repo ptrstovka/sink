@@ -31,6 +31,13 @@ arm64/x86_64. Linux archives use musl targets. Each archive contains `sink` and
 server image at `ghcr.io/ptrstovka/sink-server`. The macOS executables are
 Developer ID signed and notarized by Apple.
 
+After installing the client, `sink update` immediately installs the matching
+client from the latest stable GitHub Release once its exact platform archive
+and `SHA256SUMS` are attached. The command does not ask for a second
+confirmation and never updates `sink-server`. It supports the same four
+standalone macOS/Linux architectures and verifies the GitHub asset digest,
+`SHA256SUMS`, and staged client version before replacement.
+
 [Get Sink running](docs/getting-started.md) installs both programs and opens the
 first tunnel. Use the [server deployment reference](docs/server-reference.md)
 and [client reference](docs/client-reference.md) for the remaining options.
@@ -46,6 +53,12 @@ sink http 3000 --url https://demo.example.com
 
 Targets may also be `host:port`, `http://...`, or `https://...`. The control
 connection and local HTTPS targets validate certificates by default.
+
+An interactive `sink http` start checks for a stable client update in the
+background at most once per 24 hours. A cached available version is shown on
+every interactive start. Service and other noninteractive runs do not check;
+`SINK_NO_UPDATE_CHECK=1` disables only this startup check and notice, not the
+explicit `sink update` command.
 
 The inspector is enabled by default. `sink` prints a URL such as
 `http://127.0.0.1:4040`; the URL contains no mutation token. Its HTML,

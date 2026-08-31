@@ -1,4 +1,10 @@
-use std::{error::Error, future::Future, future::pending, io, process::ExitCode};
+use std::{
+    error::Error,
+    future::Future,
+    future::pending,
+    io::{self, IsTerminal as _},
+    process::ExitCode,
+};
 
 use clap::Parser as _;
 use sink_client::{
@@ -6,6 +12,10 @@ use sink_client::{
     config::ConfigStore,
     dashboard::{DashboardPort, DashboardService, production_assets},
     runtime::{RequestSummary, TunnelPhase, TunnelRuntime},
+    update::{
+        AvailableUpdate, UpdateResult, automatic_check_disabled, check_for_update_if_due,
+        install_latest,
+    },
 };
 use tokio::time::{Duration, timeout};
 use tokio::{sync::broadcast, task::JoinHandle};
@@ -35,7 +45,29 @@ async fn run() -> Result<(), BoxError> {
             }
             Ok(())
         }
-        SinkCommand::Http(arguments) => run_tunnel(*arguments).await,
+        SinkCommand::Http(arguments) => {
+            let check_for_update = should_run_automatic_update_check(
+                true,
+                io::stderr().is_terminal(),
+                automatic_check_disabled(),
+                cfg!(test),
+            );
+            run_tunnel(*arguments, check_for_update).await
+        }
+        SinkCommand::Update => {
+            match install_latest().await? {
+                UpdateResult::UpToDate { version } => {
+                    println!("sink {version} is already up to date");
+                }
+                UpdateResult::Updated {
+                    previous_version,
+                    current_version,
+                } => {
+                    println!("updated sink {previous_version} -> {current_version}");
+                }
+            }
+            Ok(())
+        }
         SinkCommand::Version => {
             println!("sink {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -43,7 +75,10 @@ async fn run() -> Result<(), BoxError> {
     }
 }
 
-async fn run_tunnel(arguments: sink_client::cli::HttpArgs) -> Result<(), BoxError> {
+async fn run_tunnel(
+    arguments: sink_client::cli::HttpArgs,
+    check_for_update: bool,
+) -> Result<(), BoxError> {
     let store = ConfigStore::platform()?;
     let saved = store.load()?;
     let resolved = arguments.resolve_config(&saved)?;
@@ -65,6 +100,9 @@ async fn run_tunnel(arguments: sink_client::cli::HttpArgs) -> Result<(), BoxErro
     });
 
     println!("local target: {}", arguments.target);
+    if check_for_update {
+        drop(tokio::spawn(print_update_notice()));
+    }
     let state_task = tokio::spawn(print_state_changes(handle.subscribe_state()));
     let request_task = tokio::spawn(print_request_summaries(handle.subscribe_requests()));
 
@@ -86,6 +124,31 @@ async fn run_tunnel(arguments: sink_client::cli::HttpArgs) -> Result<(), BoxErro
         task.stop().await;
     }
     result.map_err(Into::into)
+}
+
+const fn should_run_automatic_update_check(
+    is_http_run: bool,
+    stderr_is_terminal: bool,
+    disabled: bool,
+    is_test_run: bool,
+) -> bool {
+    is_http_run && stderr_is_terminal && !disabled && !is_test_run
+}
+
+async fn print_update_notice() {
+    match check_for_update_if_due().await {
+        Ok(Some(update)) => print_available_update(&update),
+        Ok(None) => {}
+        Err(error) => tracing::debug!(%error, "automatic update check failed"),
+    }
+}
+
+fn print_available_update(update: &AvailableUpdate) {
+    eprintln!(
+        "update available: {} -> {}; run `sink update`",
+        update.current_version(),
+        update.latest_version()
+    );
 }
 
 fn dashboard_bind_result(
@@ -239,6 +302,25 @@ async fn termination_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_update_check_requires_an_interactive_enabled_non_test_http_run() {
+        assert!(should_run_automatic_update_check(true, true, false, false));
+
+        for (is_http_run, stderr_is_terminal, disabled, is_test_run) in [
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, true, false),
+            (true, true, false, true),
+        ] {
+            assert!(!should_run_automatic_update_check(
+                is_http_run,
+                stderr_is_terminal,
+                disabled,
+                is_test_run
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn dashboard_failure_does_not_cancel_tunnel_lifecycle() {

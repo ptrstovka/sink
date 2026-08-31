@@ -8,3 +8,4 @@ pub mod inspection;
 pub mod replay;
 pub mod runtime;
 pub mod target;
+pub mod update;

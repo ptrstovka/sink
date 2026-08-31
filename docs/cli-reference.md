@@ -2,6 +2,14 @@
 
 ## Client
 
+```text
+sink http <target> [OPTIONS]
+sink config add-authtoken TOKEN
+sink config add-server-addr SERVER
+sink update
+sink version
+```
+
 `sink http <target>` accepts a local port, `host:port`, or an `http://` or
 `https://` URL. Its options are:
 
@@ -24,8 +32,21 @@ enabled, stdout contains `inspector dashboard: http://127.0.0.1:PORT`; this URL
 has no query token or fragment. The dashboard obtains its per-run mutation token
 through its loopback session API.
 
-Other client commands are `sink config add-authtoken TOKEN`, `sink config
-add-server-addr SERVER`, and `sink version`.
+`sink update` immediately installs the matching `sink` client from the latest
+stable GitHub Release without another confirmation. The exact platform archive
+and `SHA256SUMS` must both be attached. It supports the four standalone
+macOS/Linux architectures, verifies the GitHub asset digest, `SHA256SUMS`, and
+staged client version before replacement, and never updates `sink-server`. The
+install path must be writable; Sink fails without invoking `sudo` otherwise.
+Use the appropriate privilege for a system-owned install or reinstall the
+client in a user-writable directory. Prereleases, channels, pinned versions,
+and downgrades are not supported.
+
+Interactive `sink http` starts, with standard error attached to a terminal,
+check GitHub in the background at most once per 24 hours and show a cached
+available version on every interactive start. Service and noninteractive runs
+do not check. `SINK_NO_UPDATE_CHECK=1` disables only the startup check and
+notice; it does not disable `sink update`.
 
 ## Server and release executables
 

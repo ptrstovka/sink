@@ -116,6 +116,18 @@ Apple secrets.
 If signing or notarization fails, the macOS matrix jobs fail and the publish job
 doesn't attach any rebuilt release archives.
 
+The release workflow is unchanged for client self-update. `sink update`
+considers the latest stable release ready for a platform only after both that
+platform's exact archive and `SHA256SUMS` are attached. This avoids treating the
+release as installable during the window after publication but before all
+assets finish uploading. A missing archive or checksum file makes that release
+unavailable to the client rather than partially ready.
+
+During installation, the client verifies the archive's GitHub asset digest,
+its entry in `SHA256SUMS`, and the staged `sink version` before replacing the
+installed client. It extracts only `sink`; release archives and the workflow
+continue to include `sink-server` independently.
+
 After configuring the secrets, use the workflow's `Run workflow` action with an
 existing release tag to replace that release's unsigned archives. New published
 releases use the same workflow automatically.
@@ -126,7 +138,8 @@ scope: ignored `dashboard/dist` is deliberately prebuilt and is not included in
 a Cargo source archive. Supporting source packages would require a separate,
 explicit asset-packaging design. Running the workflow, publishing assets, and
 the manual one-hour soak are release-operator gates; documentation or CI
-changes do not claim they have run.
+changes do not claim they have run. They also do not claim that a live update
+against a published release or an in-place replacement was exercised.
 
 ## Verify a downloaded release
 

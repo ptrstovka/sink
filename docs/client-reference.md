@@ -13,6 +13,36 @@ install -m 0755 sink ~/.local/bin/sink
 
 On macOS, use `shasum -a 256 -c SHA256SUMS --ignore-missing` if `sha256sum` is
 unavailable.
+
+The standalone client can update itself after installation:
+
+```console
+sink update
+```
+
+This explicit command is consent to install immediately and does not ask for a
+second confirmation. It selects the matching client archive from the latest
+stable GitHub Release, extracts only `sink`, and never updates `sink-server`.
+The supported release assets are:
+
+| System | Architecture | Asset |
+| --- | --- | --- |
+| macOS | arm64 | `sink-v<version>-macos-arm64.tar.gz` |
+| macOS | x86_64 | `sink-v<version>-macos-x86_64.tar.gz` |
+| Linux | arm64 | `sink-v<version>-linux-arm64.tar.gz` |
+| Linux | x86_64 | `sink-v<version>-linux-x86_64.tar.gz` |
+
+Before replacing the running client, Sink verifies the GitHub asset digest,
+the archive checksum in the release's `SHA256SUMS`, and that the staged
+client's `sink version` matches the selected release. A release is eligible
+only when both the exact platform archive and `SHA256SUMS` exist. There is no
+prerelease, channel, pinned-version, or downgrade support.
+
+The installed client's path must be writable. If it is not, the update fails
+without invoking `sudo` or replacing the binary. Have the administrator update
+the system installation, explicitly run the command with the privilege
+appropriate for that path, or reinstall `sink` in a user-writable directory.
+
 Store the token you created on your server and its control address:
 
 ```console
@@ -94,6 +124,18 @@ For fully retained bodies, the dashboard decodes bounded `gzip`, `deflate`, and
 bytes and headers remain unchanged. Unsupported, incomplete, or truncated
 encoded bodies are shown as metadata-only instead of rendering compressed bytes
 as text.
+
+## Client update notices
+
+At each interactive `sink http` start (with standard error attached to a
+terminal), Sink shows a cached newer stable version when one is available. If a
+check is due, it checks GitHub in the background; network checks happen at most
+once per 24 hours. Between checks, the cached version is shown on every
+interactive start without another network request.
+
+Service and noninteractive runs do not perform the startup check. Set
+`SINK_NO_UPDATE_CHECK=1` to disable only the startup check and notice. It does
+not disable `sink update`, and startup never installs an update automatically.
 
 ## TLS behavior
 
