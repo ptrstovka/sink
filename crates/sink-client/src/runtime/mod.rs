@@ -5,6 +5,8 @@ mod control;
 mod proxy;
 mod websocket_io;
 
+use crate::cors::CorsPolicy;
+
 use std::{
     fmt,
     future::poll_fn,
@@ -232,6 +234,8 @@ impl TunnelRuntime {
             args.url.clone(),
             args.local_tls_insecure,
             inspection,
+            CorsPolicy::new(args.cors_allow_origin.clone(), args.cors_allow_credentials)
+                .map_err(crate::cli::CliValidationError::from)?,
         )
     }
 
@@ -247,6 +251,7 @@ impl TunnelRuntime {
             requested_public_url,
             local_tls_insecure,
             None,
+            CorsPolicy::default(),
         )
     }
 
@@ -256,6 +261,7 @@ impl TunnelRuntime {
         requested_public_url: Option<PublicUrl>,
         local_tls_insecure: bool,
         inspection: Option<InspectionStore>,
+        cors: CorsPolicy,
     ) -> Result<Self, RuntimeError> {
         let session_id = Uuid::new_v4();
         let initial_requested_hostname =
@@ -279,7 +285,8 @@ impl TunnelRuntime {
                 Some(store.clone()),
             )?,
             None => LocalProxy::new(target.clone(), local_tls_insecure, summaries.clone())?,
-        };
+        }
+        .with_cors(cors);
         let replay = inspection
             .as_ref()
             .map(|store| ReplayService::new(store.clone(), Arc::new(local_proxy.clone())));

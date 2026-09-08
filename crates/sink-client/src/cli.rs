@@ -8,6 +8,7 @@ use crate::{
         AuthToken, ConfigError, ConfigStore, ControlServerAddr, ResolvedConfig, RunOverrides,
         SavedConfig,
     },
+    cors::{CorsError, CorsOrigin, CorsPolicy},
     target::{LocalTarget, PublicUrl},
 };
 
@@ -55,6 +56,14 @@ pub struct HttpArgs {
     #[arg(long)]
     pub local_tls_insecure: bool,
 
+    /// Allow a cross-origin caller (repeat for multiple http(s) origins, or use '*').
+    #[arg(long, value_name = "ORIGIN")]
+    pub cors_allow_origin: Vec<CorsOrigin>,
+
+    /// Allow CORS credentials; requires concrete --cors-allow-origin values.
+    #[arg(long)]
+    pub cors_allow_credentials: bool,
+
     /// Permit an http:// control server for this run (local development only).
     #[arg(long)]
     pub allow_plaintext_control: bool,
@@ -89,6 +98,7 @@ impl HttpArgs {
         if self.local_tls_insecure && !self.target.uses_tls() {
             return Err(CliValidationError::LocalTlsInsecureRequiresHttps);
         }
+        CorsPolicy::new(self.cors_allow_origin.clone(), self.cors_allow_credentials)?;
         Ok(())
     }
 
@@ -149,6 +159,8 @@ pub enum ConfigField {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CliValidationError {
+    #[error(transparent)]
+    Cors(#[from] CorsError),
     #[error("--local-tls-insecure requires an https:// local target")]
     LocalTlsInsecureRequiresHttps,
 }
@@ -156,6 +168,62 @@ pub enum CliValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cors_options_validate_before_startup() {
+        for args in [
+            vec![],
+            vec!["--cors-allow-origin", "*"],
+            vec!["--cors-allow-origin", "https://app.example.com"],
+            vec![
+                "--cors-allow-origin",
+                "https://app.example.com",
+                "--cors-allow-origin",
+                "http://localhost:3000",
+                "--cors-allow-credentials",
+            ],
+        ] {
+            let cli =
+                Cli::try_parse_from(["sink", "http", "3000"].into_iter().chain(args)).expect("CLI");
+            let SinkCommand::Http(args) = cli.command else {
+                panic!("HTTP command")
+            };
+            assert!(args.validate().is_ok());
+        }
+        for args in [
+            vec!["--cors-allow-credentials"],
+            vec!["--cors-allow-origin", "*", "--cors-allow-credentials"],
+            vec![
+                "--cors-allow-origin",
+                "*",
+                "--cors-allow-origin",
+                "https://app.example.com",
+            ],
+        ] {
+            let cli =
+                Cli::try_parse_from(["sink", "http", "3000"].into_iter().chain(args)).expect("CLI");
+            let SinkCommand::Http(args) = cli.command else {
+                panic!("HTTP command")
+            };
+            assert!(args.validate().is_err());
+        }
+        for origin in [
+            "app.example.com",
+            "https://*.example.com",
+            "https://app.example.com/path",
+            "https://app.example.com?x=1",
+            "https://app.example.com#x",
+            "https://user@app.example.com",
+            "null",
+            "ftp://app.example.com",
+        ] {
+            assert!(
+                Cli::try_parse_from(["sink", "http", "3000", "--cors-allow-origin", origin])
+                    .is_err(),
+                "{origin}"
+            );
+        }
+    }
 
     #[test]
     fn parses_http_command_and_all_run_overrides() -> Result<(), Box<dyn std::error::Error>> {

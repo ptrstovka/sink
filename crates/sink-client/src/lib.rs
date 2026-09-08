@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod cors;
 pub mod curl;
 pub mod dashboard;
 pub mod inspection;

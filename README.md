@@ -54,6 +54,11 @@ sink http 3000 --url https://demo.example.com
 Targets may also be `host:port`, `http://...`, or `https://...`. The control
 connection and local HTTPS targets validate certificates by default.
 
+For cross-origin assets, use `--cors-allow-origin https://other.example.com`
+or `--cors-allow-origin '*'`. Credentialed requests additionally require
+`--cors-allow-credentials` and concrete origins. See the
+[CORS reference](docs/client-reference.md#cross-origin-assets-and-requests).
+
 An interactive `sink http` start checks for a stable client update in the
 background at most once per 24 hours. A cached available version is shown on
 every interactive start. Service and other noninteractive runs do not check;

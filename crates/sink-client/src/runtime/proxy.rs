@@ -48,6 +48,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    cors::{CorsDecision, CorsPolicy},
     inspection::{
         BodyConstraints, BodyContentKind, CaptureDecision, HeaderSnapshots, InspectionStore,
         RequestSnapshot, ResponseSnapshot, TransactionId, TransactionOrigin,
@@ -107,6 +108,7 @@ pub(crate) struct LocalProxy {
     summaries: broadcast::Sender<RequestSummary>,
     inspection: Option<InspectionStore>,
     connect_timeout: Duration,
+    cors: CorsPolicy,
 }
 
 impl fmt::Debug for LocalProxy {
@@ -149,7 +151,13 @@ impl LocalProxy {
             summaries,
             inspection,
             connect_timeout: LOCAL_CONNECT_TIMEOUT,
+            cors: CorsPolicy::default(),
         })
+    }
+
+    pub(crate) fn with_cors(mut self, cors: CorsPolicy) -> Self {
+        self.cors = cors;
+        self
     }
 
     pub(crate) fn for_connection(
@@ -324,10 +332,32 @@ impl ExchangeProxy {
             self.inner.summaries.clone(),
         ));
         let wants_upgrade = request_wants_upgrade(&request);
+        let cors = if wants_upgrade || method == Method::CONNECT {
+            CorsDecision::default()
+        } else {
+            self.inner.cors.evaluate(&request)
+        };
         let inspection = self.inner.inspection.as_ref().and_then(|store| {
             InspectionCapture::begin(store, &request, received_at, stats.started, wants_upgrade)
         });
         let mut inspection_guard = InspectionGuard::new(inspection.clone());
+        if let Some(status) = cors.preflight {
+            let mut response = Response::new(empty_body());
+            *response.status_mut() = status;
+            cors.apply(response.headers_mut());
+            if let Some(capture) = &inspection {
+                capture.start_response(&response, false);
+                if request.body().is_end_stream() {
+                    capture.finish_body(CaptureDirection::Request);
+                } else {
+                    capture.body_dropped(CaptureDirection::Request);
+                }
+                capture.finish_body(CaptureDirection::Response);
+            }
+            stats.emit(status);
+            inspection_guard.disarm();
+            return response;
+        }
         let public_upgrade = wants_upgrade.then(|| upgrade::on(&mut request));
 
         let request = request.map(|body| {
@@ -351,7 +381,7 @@ impl ExchangeProxy {
                 });
             })
             .await;
-        let local = match response {
+        let mut local = match response {
             Ok(local) => local,
             Err(error) => {
                 if let Some(timing) = tunnel_timing {
@@ -365,8 +395,15 @@ impl ExchangeProxy {
                         "tunneled request stage latency"
                     );
                 }
+                let mut response = service_unavailable(stats);
+                cors.apply(response.headers_mut());
+                if cors.is_enabled()
+                    && let Some(capture) = &inspection
+                {
+                    capture.start_response(&response, false);
+                }
                 inspection_guard.fail(error.capture_message());
-                return service_unavailable(stats);
+                return response;
             }
         };
         if let Some(timing) = tunnel_timing {
@@ -383,6 +420,7 @@ impl ExchangeProxy {
                 "tunneled request stage latency"
             );
         }
+        cors.apply(local.response.headers_mut());
         let response = self.prepare_response(local.response, public_upgrade, stats, inspection);
         inspection_guard.disarm();
         response

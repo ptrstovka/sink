@@ -18,6 +18,8 @@ sink version
 | `--url HTTPS_URL` | Ask for one public hostname; otherwise the server allocates one. |
 | `--authtoken TOKEN` | Override the saved token for this run. |
 | `--server-addr SERVER` | Override the saved control origin; there is no built-in default. |
+| `--cors-allow-origin ORIGIN` | Opt in to CORS for this tunnel; repeat for exact HTTP(S) origins, or use quoted `'*'` for any origin. Disabled by default. |
+| `--cors-allow-credentials` | Allow credentialed CORS requests; requires concrete allowed origins and rejects `'*'`. |
 | `--local-tls-insecure` | Disable certificate verification only for an explicit HTTPS local target. |
 | `--allow-plaintext-control` | Permit an explicitly configured `http://` control origin for local development. |
 | `--inspect=<BOOL>` | Enable local capture and dashboard; defaults to `true`. Use the equals form, including `--inspect=false`. |

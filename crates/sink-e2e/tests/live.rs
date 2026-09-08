@@ -840,6 +840,24 @@ fn client_runtime(
     target_addr: SocketAddr,
     requested_hostname: Option<&str>,
 ) -> TestResult<TunnelRuntime> {
+    client_runtime_with_cors(
+        token,
+        control_addr,
+        target_addr,
+        requested_hostname,
+        &[],
+        false,
+    )
+}
+
+fn client_runtime_with_cors(
+    token: &str,
+    control_addr: SocketAddr,
+    target_addr: SocketAddr,
+    requested_hostname: Option<&str>,
+    origins: &[&str],
+    credentials: bool,
+) -> TestResult<TunnelRuntime> {
     let config = SavedConfig::default().resolve(RunOverrides {
         authtoken: Some(AuthToken::new(token.to_owned())?),
         server_addr: Some(format!("http://{control_addr}").parse()?),
@@ -851,6 +869,11 @@ fn client_runtime(
         .transpose()?;
     let runtime = TunnelRuntime::from_http(
         &HttpArgs {
+            cors_allow_origin: origins
+                .iter()
+                .map(|origin| origin.parse())
+                .collect::<Result<_, _>>()?,
+            cors_allow_credentials: credentials,
             target,
             url: public_url,
             authtoken: None,
@@ -2444,5 +2467,163 @@ async fn websocket_upgrade_is_full_duplex() -> TestResult<()> {
     client.stop().await?;
     stack.stop().await?;
     fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cors_policy_survives_the_tunnel_and_captures_preflight() -> TestResult<()> {
+    use axum::http::header::*;
+    let stack = LiveStack::start().await?;
+    let token = stack
+        .database
+        .create_user("cors-user")
+        .await?
+        .token
+        .expose_secret()
+        .to_owned();
+    for (origins, credentials) in [(vec!["https://app.example.com"], true), (vec!["*"], false)] {
+        let fixture = FixtureHarness::start(FixtureState::new(&Bytes::new())).await?;
+        let client = ClientHarness::start(client_runtime_with_cors(
+            &token,
+            stack.link.addr,
+            fixture.addr,
+            None,
+            &origins,
+            credentials,
+        )?);
+        let info = client.connected().await?;
+        let store = client
+            .handle
+            .inspection_store()
+            .ok_or_else(|| io::Error::other("store missing"))?;
+        let mut summaries = client.handle.subscribe_requests();
+        let expected_origin = if credentials {
+            "https://app.example.com"
+        } else {
+            "*"
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("https://app.example.com"));
+        headers.insert(
+            ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("PATCH"),
+        );
+        headers.insert(
+            ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_static("Authorization, X-App"),
+        );
+        // This nonexistent endpoint proves the client handles preflight, not upstream.
+        let (status, response_headers, body) = public_call(
+            stack.server.addr,
+            &info.hostname,
+            Method::OPTIONS,
+            "/cors-preflight",
+            headers.clone(),
+            Body::empty(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let summary = bounded("preflight summary", summaries.recv()).await??;
+        assert_eq!(summary.status, StatusCode::NO_CONTENT);
+        assert_eq!(summary.method, Method::OPTIONS);
+        assert_eq!(summary.response_bytes, 0);
+        assert!(body.is_empty());
+        assert_eq!(
+            response_headers[ACCESS_CONTROL_ALLOW_ORIGIN],
+            expected_origin
+        );
+        assert_eq!(
+            response_headers[ACCESS_CONTROL_ALLOW_HEADERS],
+            "authorization, x-app"
+        );
+        assert_eq!(response_headers[ACCESS_CONTROL_ALLOW_METHODS], "PATCH");
+        assert_eq!(
+            response_headers.contains_key(ACCESS_CONTROL_ALLOW_CREDENTIALS),
+            credentials
+        );
+        let captured = store
+            .list()
+            .into_iter()
+            .find(|transaction| transaction.request().public_uri().path() == "/cors-preflight")
+            .ok_or_else(|| io::Error::other("preflight missing"))?;
+        assert!(captured.lifecycle().is_terminal());
+        let snapshot = captured
+            .response()
+            .ok_or_else(|| io::Error::other("response missing"))?;
+        assert_eq!(snapshot.status(), StatusCode::NO_CONTENT);
+        assert!(
+            snapshot
+                .headers()
+                .iter()
+                .any(|header| header.name() == ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+
+        headers.remove(ACCESS_CONTROL_REQUEST_METHOD);
+        headers.remove(ACCESS_CONTROL_REQUEST_HEADERS);
+        headers.insert(COOKIE, HeaderValue::from_static("session=test"));
+        let (status, response_headers, _) = public_call(
+            stack.server.addr,
+            &info.hostname,
+            Method::GET,
+            "/health",
+            headers.clone(),
+            Body::empty(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response_headers[ACCESS_CONTROL_ALLOW_ORIGIN],
+            expected_origin
+        );
+        let (status, _, _) = public_call(
+            stack.server.addr,
+            &info.hostname,
+            Method::OPTIONS,
+            "/cors-preflight",
+            headers.clone(),
+            Body::empty(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        headers.insert(ORIGIN, HeaderValue::from_static("https://other.test"));
+        let (_, response_headers, _) = public_call(
+            stack.server.addr,
+            &info.hostname,
+            Method::GET,
+            "/health",
+            headers.clone(),
+            Body::empty(),
+        )
+        .await?;
+        assert_eq!(
+            response_headers.contains_key(ACCESS_CONTROL_ALLOW_ORIGIN),
+            !credentials
+        );
+        websocket_round_trip(
+            stack.server.addr,
+            &info.hostname,
+            Bytes::from_static(b"cors-upgrade"),
+        )
+        .await?;
+        complete_generated_download(stack.server.addr, &info.hostname).await?;
+        fixture.stop().await?;
+        headers.insert(ORIGIN, HeaderValue::from_static("https://app.example.com"));
+        let (status, response_headers, _) = public_call(
+            stack.server.addr,
+            &info.hostname,
+            Method::GET,
+            "/health",
+            headers,
+            Body::empty(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_headers[ACCESS_CONTROL_ALLOW_ORIGIN],
+            expected_origin
+        );
+        client.stop().await?;
+    }
+    stack.stop().await?;
     Ok(())
 }
