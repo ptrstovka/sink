@@ -227,12 +227,19 @@ impl IssuancePolicy {
                 OrderState::RetryScheduled { retry_at } if retry_at > now => {
                     return OrderPlan::RetryNotDue { retry_at };
                 }
-                OrderState::Failed => return OrderPlan::PermanentlyFailed,
+                OrderState::Failed if request.reason == IssuanceReason::Renewal => {
+                    return OrderPlan::PermanentlyFailed;
+                }
+                // Base provisioning and namespace claims are explicit
+                // re-entry points. They start a fresh order cycle after an
+                // operator has remediated a permanent provider failure.
+                OrderState::Failed => {}
                 OrderState::RetryScheduled { .. } | OrderState::Succeeded => {}
             }
         }
 
-        if request.owner.user_id().is_some()
+        if request.reason == IssuanceReason::NamespaceClaim
+            && request.owner.user_id().is_some()
             && quota.other_pending_orders_for_user >= self.limits.max_pending_orders_per_user
         {
             return OrderPlan::Rejected(LimitExceeded::PendingOrdersPerUser);
@@ -383,6 +390,50 @@ mod tests {
                 Timestamp::from_unix_seconds(1_060),
             ),
             OrderPlan::Start
+        );
+    }
+
+    #[test]
+    fn automatic_renewal_does_not_consume_namespace_claim_quotas() {
+        let policy = IssuancePolicy::default();
+        let mut request = claim_request();
+        request.reason = IssuanceReason::Renewal;
+        let now = Timestamp::from_unix_seconds(1_000);
+
+        assert_eq!(
+            policy.plan(
+                &request,
+                QuotaSnapshot {
+                    active_claims_for_user: u32::MAX,
+                    other_pending_orders_for_user: u32::MAX,
+                    concurrent_orders: 0,
+                },
+                None,
+                None,
+                now,
+            ),
+            OrderPlan::Start
+        );
+    }
+
+    #[test]
+    fn explicit_requests_restart_failed_cycles_but_renewal_stays_terminal() {
+        let policy = IssuancePolicy::default();
+        let claim = claim_request();
+        let now = Timestamp::from_unix_seconds(1_000);
+        let mut failed = OrderRecord::queued(claim.clone(), now);
+        failed.fail_permanently("operator action required".to_owned(), now);
+
+        assert_eq!(
+            policy.plan(&claim, QuotaSnapshot::default(), None, Some(&failed), now,),
+            OrderPlan::Start
+        );
+
+        let mut renewal = claim;
+        renewal.reason = IssuanceReason::Renewal;
+        assert_eq!(
+            policy.plan(&renewal, QuotaSnapshot::default(), None, Some(&failed), now,),
+            OrderPlan::PermanentlyFailed
         );
     }
 }

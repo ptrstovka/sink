@@ -8,8 +8,8 @@ use axum::body::Body;
 use http::{
     HeaderMap, HeaderValue, Request, Response, StatusCode,
     header::{
-        CONNECTION, FORWARDED, HeaderName, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
-        TRANSFER_ENCODING, UPGRADE,
+        CONNECTION, FORWARDED, HOST, HeaderName, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
+        TRAILER, TRANSFER_ENCODING, UPGRADE,
     },
 };
 use hyper::client::conn::http1;
@@ -29,6 +29,9 @@ const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection")
 pub(crate) struct ForwardingContext {
     pub(crate) public_host: String,
     pub(crate) peer_ip: Option<IpAddr>,
+    /// Set by the public listener. `None` is retained only for direct router
+    /// embedding/tests that predate listener metadata.
+    pub(crate) public_scheme: Option<&'static str>,
 }
 
 #[derive(Debug, Error)]
@@ -174,7 +177,9 @@ fn prepare_request_headers(
     context: &ForwardingContext,
     preserve_upgrade: bool,
 ) -> Result<(), ForwardError> {
-    let scheme = forwarded_scheme(headers);
+    let scheme = context
+        .public_scheme
+        .unwrap_or_else(|| forwarded_scheme(headers));
     let visitor = forwarded_visitor(headers).or(context.peer_ip);
     strip_hop_by_hop(headers, preserve_upgrade);
     headers.remove(FORWARDED);
@@ -182,6 +187,11 @@ fn prepare_request_headers(
     headers.remove(&X_FORWARDED_HOST);
     headers.remove(&X_FORWARDED_PROTO);
 
+    headers.insert(
+        HOST,
+        HeaderValue::from_str(&context.public_host)
+            .map_err(|_| ForwardError::InvalidForwardedMetadata)?,
+    );
     headers.insert(
         X_FORWARDED_HOST,
         HeaderValue::from_str(&context.public_host)
@@ -344,6 +354,7 @@ mod tests {
             &ForwardingContext {
                 public_host: "demo.example.test".to_owned(),
                 peer_ip: None,
+                public_scheme: None,
             },
             false,
         )
@@ -359,6 +370,27 @@ mod tests {
         );
         assert!(!headers.contains_key(CONNECTION));
         assert!(!headers.contains_key("x-remove-me"));
+    }
+
+    #[test]
+    fn listener_scheme_overrides_untrusted_forwarding_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("demo.example.test"));
+        headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+
+        prepare_request_headers(
+            &mut headers,
+            &ForwardingContext {
+                public_host: "demo.example.test".to_owned(),
+                peer_ip: None,
+                public_scheme: Some("http"),
+            },
+            false,
+        )
+        .expect("safe metadata");
+
+        assert_eq!(headers[X_FORWARDED_PROTO], "http");
+        assert_eq!(headers[FORWARDED], "host=demo.example.test;proto=http");
     }
 
     #[test]
@@ -451,6 +483,7 @@ mod tests {
                 ForwardingContext {
                     public_host: "demo.example.test".to_owned(),
                     peer_ip: None,
+                    public_scheme: None,
                 },
             ),
         )

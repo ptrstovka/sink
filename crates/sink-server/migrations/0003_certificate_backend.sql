@@ -126,8 +126,23 @@ BEGIN
     SELECT RAISE(ABORT, 'certificate identity is immutable');
 END;
 
-CREATE TRIGGER certificate_orders_identity_immutable
-BEFORE UPDATE OF target, target_kind, provider, owner_kind, owner_id, reason ON certificate_orders
+CREATE TRIGGER certificate_orders_target_identity_immutable
+BEFORE UPDATE OF target, target_kind, provider ON certificate_orders
 BEGIN
-    SELECT RAISE(ABORT, 'certificate order identity is immutable');
+    SELECT RAISE(ABORT, 'certificate order target identity is immutable');
+END;
+
+CREATE TRIGGER certificate_orders_active_cycle_identity_immutable
+BEFORE UPDATE OF owner_kind, owner_id, reason ON certificate_orders
+WHEN NOT (
+        OLD.owner_kind IS NEW.owner_kind
+        AND OLD.owner_id IS NEW.owner_id
+        AND OLD.reason IS NEW.reason
+    )
+    AND NOT (
+        OLD.order_state IN ('succeeded', 'failed')
+        AND NEW.order_state IN ('queued', 'in_progress')
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'active certificate order cycle identity is immutable');
 END;

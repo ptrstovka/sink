@@ -10,6 +10,8 @@ use crate::certificates::{
 };
 
 pub const LISTEN_ADDRESS_ENV: &str = "SINK_SERVER_LISTEN_ADDRESS";
+pub const HTTP_LISTEN_ADDRESS_ENV: &str = "SINK_SERVER_HTTP_LISTEN_ADDRESS";
+pub const HTTPS_LISTEN_ADDRESS_ENV: &str = "SINK_SERVER_HTTPS_LISTEN_ADDRESS";
 pub const PUBLIC_BASE_DOMAIN_ENV: &str = "SINK_SERVER_PUBLIC_BASE_DOMAIN";
 pub const MAX_NAMESPACE_DEPTH_ENV: &str = "SINK_SERVER_MAX_NAMESPACE_DEPTH";
 pub const CERTIFICATE_PROVIDER_ENV: &str = "SINK_SERVER_CERTIFICATE_PROVIDER";
@@ -35,9 +37,18 @@ pub const DEFAULT_ACME_DIRECTORY_URL: &str =
 /// over the environment value.
 #[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
 pub struct ServeArgs {
-    /// Address on which the server accepts Traefik-forwarded traffic.
+    /// Legacy alias for `--http-listen-address`.
     #[arg(long, value_name = "ADDRESS", env = "SINK_SERVER_LISTEN_ADDRESS")]
     pub listen_address: Option<SocketAddr>,
+
+    /// Address on which Sink accepts plain HTTP traffic.
+    #[arg(long, value_name = "ADDRESS", env = "SINK_SERVER_HTTP_LISTEN_ADDRESS")]
+    pub http_listen_address: Option<SocketAddr>,
+
+    /// Address on which Sink terminates HTTPS/TLS traffic. Required when the
+    /// certificate backend is enabled and rejected when it is disabled.
+    #[arg(long, value_name = "ADDRESS", env = "SINK_SERVER_HTTPS_LISTEN_ADDRESS")]
+    pub https_listen_address: Option<SocketAddr>,
 
     /// Public DNS suffix used for tunnel and control hostnames.
     #[arg(
@@ -60,8 +71,8 @@ pub struct ServeArgs {
     )]
     pub certificate_provider: Option<String>,
 
-    /// Enable the durable ACME backend. It remains off until the later listener
-    /// wiring opts in, so existing non-TLS serve behavior needs no credentials.
+    /// Enable the durable ACME backend and HTTPS listener. Existing plain HTTP
+    /// behavior remains available with this disabled.
     #[arg(long, env = "SINK_SERVER_CERTIFICATE_BACKEND_ENABLED")]
     pub certificate_backend_enabled: Option<bool>,
 
@@ -106,7 +117,8 @@ pub struct DatabaseArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServeConfig {
-    pub listen_address: SocketAddr,
+    pub http_listen_address: SocketAddr,
+    pub https_listen_address: Option<SocketAddr>,
     /// Kept for the existing runtime until multi-domain listener wiring lands.
     pub public_base_domain: String,
     pub domains: ConfiguredDomains,
@@ -222,13 +234,7 @@ impl ServeConfig {
         args: &ServeArgs,
         environment: &impl Environment,
     ) -> Result<Self, ConfigError> {
-        let listen_address = match args.listen_address {
-            Some(address) => address,
-            None => environment_string(environment, LISTEN_ADDRESS_ENV)?
-                .unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_owned())
-                .parse()
-                .map_err(|source| ConfigError::InvalidListenAddress { source })?,
-        };
+        let http_listen_address = resolve_http_listen_address(args, environment)?;
 
         let configured_domain = match args.public_base_domain.as_deref() {
             Some(domain) => domain.to_owned(),
@@ -263,6 +269,12 @@ impl ServeConfig {
         let domains = ConfiguredDomains::new(vec![configured_domain])?;
         let certificate_backend =
             resolve_certificate_backend(args, environment, domains.as_slice()[0].hostname.clone())?;
+        let https_listen_address = resolve_https_listen_address(
+            args,
+            environment,
+            &certificate_backend,
+            http_listen_address,
+        )?;
 
         let sqlite_path = args.database.resolve_with(environment)?;
 
@@ -276,7 +288,8 @@ impl ServeConfig {
         };
 
         Ok(Self {
-            listen_address,
+            http_listen_address,
+            https_listen_address,
             public_base_domain,
             domains,
             certificate_backend,
@@ -341,6 +354,20 @@ pub enum ConfigError {
         source: std::net::AddrParseError,
     },
 
+    #[error("legacy and HTTP listener addresses disagree")]
+    ConflictingHttpListenAddresses,
+
+    #[error(
+        "HTTPS listen address is required when the certificate backend is enabled; pass `--https-listen-address ADDRESS` or set SINK_SERVER_HTTPS_LISTEN_ADDRESS"
+    )]
+    MissingHttpsListenAddress,
+
+    #[error("HTTPS listen address requires the certificate backend to be enabled")]
+    HttpsListenAddressWithoutCertificateBackend,
+
+    #[error("HTTP and HTTPS listeners must use different addresses")]
+    DuplicateListenAddresses,
+
     #[error("public base domain must be a valid DNS name without a scheme, port, or wildcard")]
     InvalidPublicBaseDomain,
 
@@ -381,6 +408,63 @@ pub enum ConfigError {
 
     #[error("Cloudflare API token is required when the certificate backend is enabled")]
     MissingCloudflareApiToken,
+}
+
+fn resolve_http_listen_address(
+    args: &ServeArgs,
+    environment: &impl Environment,
+) -> Result<SocketAddr, ConfigError> {
+    if let (Some(legacy), Some(http)) = (args.listen_address, args.http_listen_address) {
+        if legacy != http {
+            return Err(ConfigError::ConflictingHttpListenAddresses);
+        }
+        return Ok(http);
+    }
+    if let Some(address) = args.http_listen_address.or(args.listen_address) {
+        return Ok(address);
+    }
+
+    let http = environment_string(environment, HTTP_LISTEN_ADDRESS_ENV)?;
+    let legacy = environment_string(environment, LISTEN_ADDRESS_ENV)?;
+    if let (Some(http), Some(legacy)) = (&http, &legacy)
+        && http != legacy
+    {
+        return Err(ConfigError::ConflictingHttpListenAddresses);
+    }
+    http.or(legacy)
+        .unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_owned())
+        .parse()
+        .map_err(|source| ConfigError::InvalidListenAddress { source })
+}
+
+fn resolve_https_listen_address(
+    args: &ServeArgs,
+    environment: &impl Environment,
+    backend: &CertificateBackendConfig,
+    http_listen_address: SocketAddr,
+) -> Result<Option<SocketAddr>, ConfigError> {
+    let configured = match args.https_listen_address {
+        Some(address) => Some(address),
+        None => environment_string(environment, HTTPS_LISTEN_ADDRESS_ENV)?
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|source| ConfigError::InvalidListenAddress { source })
+            })
+            .transpose()?,
+    };
+
+    match (backend, configured) {
+        (CertificateBackendConfig::Disabled, None) => Ok(None),
+        (CertificateBackendConfig::Disabled, Some(_)) => {
+            Err(ConfigError::HttpsListenAddressWithoutCertificateBackend)
+        }
+        (CertificateBackendConfig::Enabled(_), None) => Err(ConfigError::MissingHttpsListenAddress),
+        (CertificateBackendConfig::Enabled(_), Some(address)) if address == http_listen_address => {
+            Err(ConfigError::DuplicateListenAddresses)
+        }
+        (CertificateBackendConfig::Enabled(_), Some(address)) => Ok(Some(address)),
+    }
 }
 
 fn resolve_certificate_backend(
@@ -530,6 +614,8 @@ mod tests {
     fn explicit_serve_arguments_override_environment() {
         let args = ServeArgs {
             listen_address: Some("127.0.0.1:9010".parse().expect("test address")),
+            http_listen_address: None,
+            https_listen_address: None,
             public_base_domain: Some("CLI.Example.".to_owned()),
             max_namespace_depth: Some(3),
             certificate_provider: Some("cloudflare".to_owned()),
@@ -553,7 +639,7 @@ mod tests {
         let resolved = ServeConfig::resolve_with(&args, &environment).expect("valid config");
 
         assert_eq!(
-            resolved.listen_address,
+            resolved.http_listen_address,
             "127.0.0.1:9010".parse().expect("test address")
         );
         assert_eq!(resolved.public_base_domain, "cli.example");
@@ -583,7 +669,7 @@ mod tests {
             .expect("valid environment config");
 
         assert_eq!(
-            resolved.listen_address,
+            resolved.http_listen_address,
             "0.0.0.0:8088".parse().expect("test address")
         );
         assert_eq!(resolved.public_base_domain, "tunnels.example");
@@ -722,6 +808,7 @@ mod tests {
             &environment(&[
                 (PUBLIC_BASE_DOMAIN_ENV, "example.test"),
                 (CERTIFICATE_BACKEND_ENABLED_ENV, "true"),
+                (HTTPS_LISTEN_ADDRESS_ENV, "127.0.0.1:8443"),
                 (ACME_TERMS_AGREED_ENV, "true"),
                 (ACME_CONTACT_ENV, "mailto:admin@example.test"),
                 (CLOUDFLARE_ZONE_ID_ENV, "0123456789abcdef0123456789abcdef"),
@@ -763,6 +850,46 @@ mod tests {
         assert!(matches!(
             ServeConfig::resolve_with(&ServeArgs::default(), &unsafe_directory),
             Err(ConfigError::InvalidAcmeDirectoryUrl)
+        ));
+    }
+
+    #[test]
+    fn listener_contract_is_explicit_and_fails_closed() {
+        let disabled_with_https = environment(&[
+            (PUBLIC_BASE_DOMAIN_ENV, "example.test"),
+            (HTTPS_LISTEN_ADDRESS_ENV, "127.0.0.1:8443"),
+        ]);
+        assert!(matches!(
+            ServeConfig::resolve_with(&ServeArgs::default(), &disabled_with_https),
+            Err(ConfigError::HttpsListenAddressWithoutCertificateBackend)
+        ));
+
+        let enabled_without_https = environment(&[
+            (PUBLIC_BASE_DOMAIN_ENV, "example.test"),
+            (CERTIFICATE_BACKEND_ENABLED_ENV, "true"),
+            (ACME_TERMS_AGREED_ENV, "true"),
+            (ACME_CONTACT_ENV, "mailto:admin@example.test"),
+            (CLOUDFLARE_ZONE_ID_ENV, "0123456789abcdef0123456789abcdef"),
+            (CLOUDFLARE_API_TOKEN_ENV, "token"),
+        ]);
+        assert!(matches!(
+            ServeConfig::resolve_with(&ServeArgs::default(), &enabled_without_https),
+            Err(ConfigError::MissingHttpsListenAddress)
+        ));
+
+        let duplicate = environment(&[
+            (PUBLIC_BASE_DOMAIN_ENV, "example.test"),
+            (HTTP_LISTEN_ADDRESS_ENV, "127.0.0.1:8443"),
+            (HTTPS_LISTEN_ADDRESS_ENV, "127.0.0.1:8443"),
+            (CERTIFICATE_BACKEND_ENABLED_ENV, "true"),
+            (ACME_TERMS_AGREED_ENV, "true"),
+            (ACME_CONTACT_ENV, "mailto:admin@example.test"),
+            (CLOUDFLARE_ZONE_ID_ENV, "0123456789abcdef0123456789abcdef"),
+            (CLOUDFLARE_API_TOKEN_ENV, "token"),
+        ]);
+        assert!(matches!(
+            ServeConfig::resolve_with(&ServeArgs::default(), &duplicate),
+            Err(ConfigError::DuplicateListenAddresses)
         ));
     }
 }

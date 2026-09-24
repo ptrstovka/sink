@@ -5,16 +5,18 @@ mod broker;
 mod claims;
 mod forwarding;
 mod host;
+mod lifecycle;
+mod listeners;
 mod management;
 mod session;
 mod websocket;
 
 use std::{
+    collections::HashSet,
     future::{Future, IntoFuture as _},
     io,
-    net::SocketAddr,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -28,6 +30,8 @@ use axum::{
         HeaderMap, HeaderValue, Response, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE, HOST, WWW_AUTHENTICATE},
     },
+    middleware,
+    middleware::Next,
     routing::any,
 };
 use sink_protocol::{CONTROL_PATH, MAX_TRANSPORT_MESSAGE_BYTES};
@@ -50,8 +54,15 @@ use self::{
     claims::{ClaimLookup, ClaimRegistry},
     forwarding::{ForwardingContext, forward_request},
     host::{HostRoute, classify_host},
+    listeners::PublicConnectionInfo,
     management::{NamespaceOperationLocks, namespace_collection_ingress, namespace_item_ingress},
     session::run_control_socket,
+};
+
+pub use lifecycle::{CertificateLifecycle, LifecycleError, provision_base_certificates};
+pub use listeners::{
+    DynamicTlsCertificateResolver, RuntimeSniAuthorization, TlsListener, build_tls_server_config,
+    default_crypto_provider,
 };
 
 pub const AUTHENTICATION_CHECK_INTERVAL: Duration = Duration::from_millis(250);
@@ -61,8 +72,9 @@ const NOT_FOUND_BODY: &str = "tunnel not found\n";
 const UNAVAILABLE_BODY: &str = "tunnel unavailable\n";
 const AUTHENTICATION_FAILED_BODY: &str = "authentication failed\n";
 const INVALID_CONTROL_REQUEST_BODY: &str = "invalid control request\n";
+const MISDIRECTED_REQUEST_BODY: &str = "TLS SNI and HTTP Host do not match\n";
 
-/// Shared state for the single Traefik-facing Axum listener.
+/// Shared state used by both public listeners.
 #[derive(Clone)]
 pub struct RuntimeState {
     pub(crate) database: Database,
@@ -72,6 +84,7 @@ pub struct RuntimeState {
     pub(crate) certificates: Arc<dyn NamespaceCertificateProvisioner>,
     pub(crate) admission_gate: Arc<Mutex<()>>,
     pub(crate) namespace_mutations: NamespaceOperationLocks,
+    pub(crate) tls_boundaries: NamespaceTlsBoundaries,
     shutdown: watch::Sender<bool>,
     sessions: Arc<SessionTracker>,
 }
@@ -122,6 +135,7 @@ impl RuntimeState {
             certificates,
             admission_gate: Arc::new(Mutex::new(())),
             namespace_mutations: NamespaceOperationLocks::default(),
+            tls_boundaries: NamespaceTlsBoundaries::default(),
             shutdown,
             sessions: Arc::new(SessionTracker::default()),
         })
@@ -130,6 +144,36 @@ impl RuntimeState {
     #[must_use]
     pub fn public_base_domain(&self) -> &str {
         &self.public_base_domain
+    }
+
+    /// Attach the live route-lease registry to the TLS authorization view.
+    /// This is a one-time startup operation performed before listeners bind.
+    pub fn attach_sni_authorization(
+        &self,
+        authorization: &RuntimeSniAuthorization,
+    ) -> Result<(), RuntimeBuildError> {
+        authorization
+            .attach_runtime(self.claims.clone(), self.tls_boundaries.clone())
+            .then_some(())
+            .ok_or(RuntimeBuildError::TlsAuthorizationAlreadyAttached)
+    }
+
+    /// Rebuild namespace certificate boundaries from durable ownership before
+    /// HTTPS readiness. The replacement is atomic for concurrent handshakes.
+    pub async fn refresh_sni_namespace_boundaries(&self) -> Result<(), crate::db::DbError> {
+        let users = self.database.list_users().await?;
+        let mut hostnames = Vec::new();
+        for user in users {
+            for claim in self.database.list_namespace_claims(user.id).await? {
+                let hostname =
+                    Hostname::parse(&claim.fqdn).map_err(|_| crate::db::DbError::InvalidFqdn {
+                        fqdn: claim.fqdn.clone(),
+                    })?;
+                hostnames.push(hostname);
+            }
+        }
+        self.tls_boundaries.replace(hostnames);
+        Ok(())
     }
 
     #[must_use]
@@ -168,12 +212,52 @@ impl RuntimeState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NamespaceTlsBoundaries {
+    hostnames: Arc<RwLock<HashSet<Hostname>>>,
+}
+
+impl NamespaceTlsBoundaries {
+    pub(crate) fn insert(&self, hostname: Hostname) {
+        self.hostnames
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(hostname);
+    }
+
+    pub(crate) fn remove(&self, hostname: &Hostname) {
+        self.hostnames
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(hostname);
+    }
+
+    fn replace(&self, hostnames: impl IntoIterator<Item = Hostname>) {
+        *self
+            .hostnames
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hostnames.into_iter().collect();
+    }
+
+    pub(crate) fn most_specific_for(&self, hostname: &Hostname) -> Option<Hostname> {
+        self.hostnames
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|namespace| matches!(hostname.depth_below(namespace), Some(0 | 1)))
+            .max_by_key(|namespace| namespace.label_count())
+            .cloned()
+    }
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum RuntimeBuildError {
     #[error("public base domain must be a valid DNS name without a scheme, port, or wildcard")]
     InvalidPublicBaseDomain,
     #[error("namespace configuration must contain the public base domain")]
     InvalidNamespaceConfiguration,
+    #[error("TLS authorization was already attached to a runtime")]
+    TlsAuthorizationAlreadyAttached,
 }
 
 /// Build the complete ingress router. The exact control host/path and public
@@ -191,6 +275,7 @@ pub fn router(state: RuntimeState) -> Router {
         )
         .fallback(any(public_ingress))
         .with_state(state)
+        .layer(middleware::from_fn(enforce_tls_host))
 }
 
 /// Serve the runtime with a bounded graceful drain. When `shutdown` resolves,
@@ -209,7 +294,7 @@ where
     let (shutdown_started, shutdown_observed) = oneshot::channel();
     let server = axum::serve(
         listener,
-        router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+        router(state.clone()).into_make_service_with_connect_info::<PublicConnectionInfo>(),
     )
     .with_graceful_shutdown(async move {
         shutdown.await;
@@ -240,11 +325,122 @@ where
     }
 }
 
+/// Serve the same runtime router on independent plain-HTTP and rustls
+/// listeners. Completion or failure of either listener initiates one shared,
+/// bounded shutdown for both listeners and the certificate lifecycle.
+pub async fn serve_http_and_https<F>(
+    http_listener: TcpListener,
+    https_listener: TlsListener,
+    state: RuntimeState,
+    shutdown: F,
+    drain_timeout: Duration,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (listener_shutdown, _) = watch::channel(false);
+    let http_shutdown = listener_shutdown.subscribe();
+    let https_shutdown = listener_shutdown.subscribe();
+    let http_server = axum::serve(
+        http_listener,
+        router(state.clone()).into_make_service_with_connect_info::<PublicConnectionInfo>(),
+    )
+    .with_graceful_shutdown(wait_for_listener_shutdown(http_shutdown))
+    .into_future();
+    let https_server = axum::serve(
+        https_listener,
+        router(state.clone()).into_make_service_with_connect_info::<PublicConnectionInfo>(),
+    )
+    .with_graceful_shutdown(wait_for_listener_shutdown(https_shutdown))
+    .into_future();
+    tokio::pin!(http_server);
+    tokio::pin!(https_server);
+    tokio::pin!(shutdown);
+
+    enum Trigger {
+        Shutdown,
+        Http(io::Result<()>),
+        Https(io::Result<()>),
+    }
+
+    let trigger = tokio::select! {
+        _ = &mut shutdown => Trigger::Shutdown,
+        result = &mut http_server => Trigger::Http(result),
+        result = &mut https_server => Trigger::Https(result),
+    };
+    state.initiate_shutdown();
+    listener_shutdown.send_replace(true);
+
+    match trigger {
+        Trigger::Shutdown => match timeout(drain_timeout, async {
+            let (http, https) = tokio::join!(&mut http_server, &mut https_server);
+            http.and(https)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                log_drain_timeout(drain_timeout);
+                Ok(())
+            }
+        },
+        Trigger::Http(http) => match timeout(drain_timeout, &mut https_server).await {
+            Ok(https) => http.and(https),
+            Err(_) => {
+                log_drain_timeout(drain_timeout);
+                http
+            }
+        },
+        Trigger::Https(https) => match timeout(drain_timeout, &mut http_server).await {
+            Ok(http) => https.and(http),
+            Err(_) => {
+                log_drain_timeout(drain_timeout);
+                https
+            }
+        },
+    }
+}
+
+fn log_drain_timeout(drain_timeout: Duration) {
+    tracing::warn!(
+        drain_timeout_ms = drain_timeout.as_millis(),
+        "server graceful drain timed out"
+    );
+}
+
+async fn wait_for_listener_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+async fn enforce_tls_host(request: Request, next: Next) -> Response<Body> {
+    let Some(connection) = request
+        .extensions()
+        .get::<ConnectInfo<PublicConnectionInfo>>()
+    else {
+        return next.run(request).await;
+    };
+    let Some(sni) = &connection.0.sni else {
+        return next.run(request).await;
+    };
+    let host = request_host(&request).and_then(|host| Hostname::parse(host).ok());
+    if host.as_ref() != Some(sni) {
+        return fixed_response(StatusCode::MISDIRECTED_REQUEST, MISDIRECTED_REQUEST_BODY);
+    }
+    next.run(request).await
+}
+
 async fn control_path_ingress(
     State(state): State<RuntimeState>,
     request: Request,
 ) -> Response<Body> {
-    match route_for_request(request.headers(), &state.public_base_domain) {
+    match route_for_request(&request, &state.public_base_domain) {
         HostRoute::Control => control_upgrade(state, request).await,
         HostRoute::Invalid if has_loopback_host(request.headers()) => {
             control_upgrade(state, request).await
@@ -299,7 +495,7 @@ async fn control_upgrade(state: RuntimeState, request: Request) -> Response<Body
 }
 
 async fn public_request(state: RuntimeState, request: Request) -> Response<Body> {
-    let route = route_for_request(request.headers(), &state.public_base_domain);
+    let route = route_for_request(&request, &state.public_base_domain);
     match route {
         HostRoute::Base => fixed_response(StatusCode::OK, ROOT_BODY),
         HostRoute::Control | HostRoute::Invalid => not_found_response(),
@@ -322,8 +518,12 @@ async fn public_request(state: RuntimeState, request: Request) -> Response<Body>
             }
             let peer_ip = request
                 .extensions()
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|peer| peer.0.ip());
+                .get::<ConnectInfo<PublicConnectionInfo>>()
+                .map(|connection| connection.0.peer_addr.ip());
+            let public_scheme = request
+                .extensions()
+                .get::<ConnectInfo<PublicConnectionInfo>>()
+                .map(|connection| connection.0.scheme.as_str());
             let public_host = hostname.to_string();
             match forward_request(
                 broker,
@@ -331,6 +531,7 @@ async fn public_request(state: RuntimeState, request: Request) -> Response<Body>
                 ForwardingContext {
                     public_host,
                     peer_ip,
+                    public_scheme,
                 },
             )
             .await
@@ -345,17 +546,26 @@ async fn public_request(state: RuntimeState, request: Request) -> Response<Body>
     }
 }
 
-fn route_for_request(headers: &HeaderMap, base_domain: &str) -> HostRoute {
+fn route_for_request(request: &Request, base_domain: &str) -> HostRoute {
+    request_host(request).map_or(HostRoute::Invalid, |host| classify_host(host, base_domain))
+}
+
+fn single_host(headers: &HeaderMap) -> Option<&str> {
     let mut hosts = headers.get_all(HOST).iter();
-    let Some(host) = hosts.next() else {
-        return HostRoute::Invalid;
-    };
-    if hosts.next().is_some() {
-        return HostRoute::Invalid;
+    let host = hosts.next()?.to_str().ok()?;
+    hosts.next().is_none().then_some(host)
+}
+
+fn request_host(request: &Request) -> Option<&str> {
+    let header = single_host(request.headers());
+    let authority = request.uri().authority().map(http::uri::Authority::as_str);
+    match (header, authority) {
+        (Some(header), Some(authority)) if header.eq_ignore_ascii_case(authority) => Some(header),
+        (Some(_), Some(_)) => None,
+        (Some(header), None) => Some(header),
+        (None, Some(authority)) => Some(authority),
+        (None, None) => None,
     }
-    host.to_str()
-        .ok()
-        .map_or(HostRoute::Invalid, |host| classify_host(host, base_domain))
 }
 
 /// Explicit plaintext development connections commonly dial the loopback
@@ -478,13 +688,15 @@ impl Drop for SessionGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, sync::Arc, time::Duration};
 
     use http_body_util::BodyExt as _;
+    use tokio::sync::oneshot;
     use tower::ServiceExt as _;
     use uuid::Uuid;
 
     use super::*;
+    use crate::certificates::{AuthorizedHostnames, FakeCertificateStorage};
     use crate::runtime::{broker::StreamBroker, claims::ClaimOwner};
 
     #[test]
@@ -630,6 +842,81 @@ mod tests {
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = unavailable.into_body().collect().await?.to_bytes();
         assert_eq!(body, UNAVAILABLE_BODY.as_bytes());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_requests_require_exact_sni_and_host_agreement() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("tls-host.sqlite3")).await?;
+        let app = router(RuntimeState::new(database, "example.test")?);
+        let connection = PublicConnectionInfo {
+            peer_addr: "127.0.0.1:443".parse()?,
+            scheme: listeners::PublicScheme::Https,
+            sni: Some(Hostname::parse("example.test")?),
+        };
+
+        let mut matching = test_request("EXAMPLE.TEST", "/");
+        matching
+            .extensions_mut()
+            .insert(ConnectInfo(connection.clone()));
+        assert_eq!(
+            app.clone().oneshot(matching).await?.status(),
+            StatusCode::OK
+        );
+
+        let mut authority_only = Request::builder()
+            .uri("https://example.test/")
+            .body(Body::empty())?;
+        authority_only
+            .extensions_mut()
+            .insert(ConnectInfo(connection.clone()));
+        assert_eq!(
+            app.clone().oneshot(authority_only).await?.status(),
+            StatusCode::OK
+        );
+
+        let mut mismatched = test_request("other.example.test", "/");
+        mismatched.extensions_mut().insert(ConnectInfo(connection));
+        assert_eq!(
+            app.oneshot(mismatched).await?.status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_listeners_share_one_bounded_shutdown() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("shutdown.sqlite3")).await?;
+        let state = RuntimeState::new(database, "example.test")?;
+        let http = TcpListener::bind("127.0.0.1:0").await?;
+        let https = TcpListener::bind("127.0.0.1:0").await?;
+        let crypto_provider = default_crypto_provider();
+        let resolver = Arc::new(DynamicTlsCertificateResolver::new(
+            Arc::new(FakeCertificateStorage::default()),
+            Arc::new(AuthorizedHostnames::default()),
+            crypto_provider.clone(),
+        ));
+        let tls = TlsListener::new(https, build_tls_server_config(resolver, crypto_provider)?);
+        let (shutdown, requested) = oneshot::channel();
+        let serving_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve_http_and_https(
+                http,
+                tls,
+                serving_state,
+                async move {
+                    let _ = requested.await;
+                },
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        shutdown.send(()).map_err(|_| "server stopped early")?;
+        tokio::time::timeout(Duration::from_secs(2), server).await???;
+        assert!(state.is_shutting_down());
         Ok(())
     }
 

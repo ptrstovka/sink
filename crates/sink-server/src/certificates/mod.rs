@@ -36,8 +36,8 @@ pub use provider::{
     UnsupportedCertificateProvider,
 };
 pub use resolver::{
-    AuthorizedHostnames, IndexError, ResolveError, ResolvedCertificate, SniAuthorization,
-    SniCertificateIndex,
+    AuthorizedHostnames, CertificateIndexReloader, CertificateReloadError, IndexError,
+    ResolveError, ResolvedCertificate, SniAuthorization, SniCertificateIndex,
 };
 pub use state::{
     AccountRecord, CertificateMaterial, CertificateRecord, CertificateState, IssuanceReason,

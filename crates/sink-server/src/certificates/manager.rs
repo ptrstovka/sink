@@ -27,8 +27,20 @@ pub struct CertificateManager<P, S> {
     provider: Arc<P>,
     storage: Arc<S>,
     policy: IssuancePolicy,
-    admission_lock: Mutex<()>,
+    admission_lock: Arc<Mutex<()>>,
     provider_slots: Arc<Semaphore>,
+}
+
+impl<P, S> Clone for CertificateManager<P, S> {
+    fn clone(&self) -> Self {
+        Self {
+            provider: Arc::clone(&self.provider),
+            storage: Arc::clone(&self.storage),
+            policy: self.policy.clone(),
+            admission_lock: Arc::clone(&self.admission_lock),
+            provider_slots: Arc::clone(&self.provider_slots),
+        }
+    }
 }
 
 impl<P, S> CertificateManager<P, S>
@@ -42,7 +54,7 @@ where
             provider,
             storage,
             policy,
-            admission_lock: Mutex::new(()),
+            admission_lock: Arc::new(Mutex::new(())),
             provider_slots,
         }
     }
@@ -264,10 +276,13 @@ pub enum ManagerError {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::NamedTempFile;
+
     use super::*;
     use crate::certificates::{
         CertificateMaterial, CertificateProviderKind, CertificateTarget, FakeCertificateProvider,
         FakeCertificateStorage, Hostname, IssuanceReason, OrderOwner, SecretBytes,
+        SqliteCertificateStorage,
     };
 
     fn request() -> IssuanceRequest {
@@ -288,6 +303,23 @@ mod tests {
             not_before: Timestamp::from_unix_seconds(900),
             not_after: Timestamp::from_unix_seconds(10_000),
         }
+    }
+
+    fn material_until(not_after: u64) -> CertificateMaterial {
+        CertificateMaterial {
+            not_after: Timestamp::from_unix_seconds(not_after),
+            ..material()
+        }
+    }
+
+    async fn sqlite_storage() -> (NamedTempFile, Arc<SqliteCertificateStorage>) {
+        let file = NamedTempFile::new().expect("temporary database");
+        let storage = Arc::new(
+            SqliteCertificateStorage::connect(file.path())
+                .await
+                .expect("open certificate storage"),
+        );
+        (file, storage)
     }
 
     #[tokio::test]
@@ -458,5 +490,185 @@ mod tests {
             ProvisionOutcome::Issued(_)
         ));
         assert_eq!(provider.issue_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_terminal_cycle_allows_initial_issuance_then_renewal() {
+        let (_file, storage) = sqlite_storage().await;
+        let provider = Arc::new(FakeCertificateProvider::succeeding(material_until(2_000)));
+        let manager =
+            CertificateManager::new(provider.clone(), storage.clone(), IssuancePolicy::default());
+        let target = CertificateTarget::base_domain(
+            Hostname::parse("example.test").expect("valid hostname"),
+        );
+        let initial = IssuanceRequest {
+            target: target.clone(),
+            provider: CertificateProviderKind::Cloudflare,
+            owner: OrderOwner::Platform,
+            reason: IssuanceReason::BaseProvisioning,
+        };
+        assert!(matches!(
+            manager
+                .provision(
+                    initial,
+                    QuotaSnapshot::default(),
+                    Timestamp::from_unix_seconds(1_000),
+                )
+                .await
+                .expect("initial SQLite issuance"),
+            ProvisionOutcome::Issued(_)
+        ));
+
+        provider.set_issue_result(Ok(material_until(20_000)));
+        let renewal = IssuanceRequest {
+            target: target.clone(),
+            provider: CertificateProviderKind::Cloudflare,
+            owner: OrderOwner::Platform,
+            reason: IssuanceReason::Renewal,
+        };
+        assert!(matches!(
+            manager
+                .provision(
+                    renewal,
+                    QuotaSnapshot::default(),
+                    Timestamp::from_unix_seconds(1_500),
+                )
+                .await
+                .expect("SQLite renewal cycle"),
+            ProvisionOutcome::Issued(_)
+        ));
+
+        let order = storage
+            .load_order(&target)
+            .await
+            .expect("load renewal order")
+            .expect("renewal order exists");
+        assert_eq!(order.request.reason, IssuanceReason::Renewal);
+        assert_eq!(order.state, OrderState::Succeeded);
+        assert_eq!(order.attempts, 1);
+        assert_eq!(provider.issue_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_failed_cycle_can_be_restarted_by_explicit_claim() {
+        let (_file, storage) = sqlite_storage().await;
+        let provider = Arc::new(FakeCertificateProvider::failing(ProviderError::permanent(
+            "operator remediation required",
+        )));
+        let manager =
+            CertificateManager::new(provider.clone(), storage.clone(), IssuancePolicy::default());
+        assert_eq!(
+            manager
+                .provision(
+                    request(),
+                    QuotaSnapshot::default(),
+                    Timestamp::from_unix_seconds(1_000),
+                )
+                .await
+                .expect("persist permanent failure"),
+            ProvisionOutcome::PermanentlyFailed
+        );
+
+        provider.set_issue_result(Ok(material_until(20_000)));
+        assert!(matches!(
+            manager
+                .provision(
+                    request(),
+                    QuotaSnapshot::default(),
+                    Timestamp::from_unix_seconds(2_000),
+                )
+                .await
+                .expect("explicit claim restarts failed cycle"),
+            ProvisionOutcome::Issued(_)
+        ));
+        let order = storage
+            .load_order(&request().target)
+            .await
+            .expect("load restarted order")
+            .expect("restarted order exists");
+        assert_eq!(order.request.reason, IssuanceReason::NamespaceClaim);
+        assert_eq!(order.state, OrderState::Succeeded);
+        assert_eq!(order.attempts, 1);
+        assert_eq!(provider.issue_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_terminal_cycle_can_replace_the_owner() {
+        let (_file, storage) = sqlite_storage().await;
+        let provider = Arc::new(FakeCertificateProvider::succeeding(material_until(1_500)));
+        let manager =
+            CertificateManager::new(provider.clone(), storage.clone(), IssuancePolicy::default());
+        manager
+            .provision(
+                request(),
+                QuotaSnapshot::default(),
+                Timestamp::from_unix_seconds(1_000),
+            )
+            .await
+            .expect("initial owner issuance");
+
+        provider.set_issue_result(Ok(material_until(20_000)));
+        let mut replacement = request();
+        replacement.owner = OrderOwner::User("user-2".to_owned());
+        assert!(matches!(
+            manager
+                .provision(
+                    replacement,
+                    QuotaSnapshot::default(),
+                    Timestamp::from_unix_seconds(2_000),
+                )
+                .await
+                .expect("terminal owner replacement"),
+            ProvisionOutcome::Issued(_)
+        ));
+        let order = storage
+            .load_order(&request().target)
+            .await
+            .expect("load replacement order")
+            .expect("replacement order exists");
+        assert_eq!(order.request.owner, OrderOwner::User("user-2".to_owned()));
+        assert_eq!(order.attempts, 1);
+        assert_eq!(provider.issue_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_failed_renewal_is_not_reissued_automatically() {
+        let (_file, storage) = sqlite_storage().await;
+        let provider = Arc::new(FakeCertificateProvider::succeeding(material_until(20_000)));
+        let manager = CertificateManager::new(provider.clone(), storage, IssuancePolicy::default());
+        manager
+            .provision(
+                request(),
+                QuotaSnapshot::default(),
+                Timestamp::from_unix_seconds(1_000),
+            )
+            .await
+            .expect("initial issuance");
+        provider.set_issue_result(Err(ProviderError::permanent("manual repair required")));
+        let mut renewal = request();
+        renewal.reason = IssuanceReason::Renewal;
+        assert_eq!(
+            manager
+                .provision(
+                    renewal.clone(),
+                    QuotaSnapshot::default(),
+                    Timestamp::from_unix_seconds(2_000),
+                )
+                .await
+                .expect("persist failed renewal"),
+            ProvisionOutcome::PermanentlyFailed
+        );
+        assert_eq!(
+            manager
+                .provision(
+                    renewal,
+                    QuotaSnapshot::default(),
+                    Timestamp::from_unix_seconds(2_030),
+                )
+                .await
+                .expect("failed renewal remains terminal"),
+            ProvisionOutcome::PermanentlyFailed
+        );
+        assert_eq!(provider.issue_count(), 2);
     }
 }

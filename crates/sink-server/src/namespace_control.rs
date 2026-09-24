@@ -6,10 +6,10 @@ use futures::future::BoxFuture;
 use thiserror::Error;
 
 use crate::certificates::{
-    CertificateManager, CertificateProvider, CertificateProviderKind, CertificateRecord,
-    CertificateState, CertificateStorage, CertificateTarget, Hostname, IssuancePolicy,
-    IssuanceReason, IssuanceRequest, OrderOwner, OrderState, ProvisionOutcome, QuotaSnapshot,
-    StorageError, Timestamp,
+    CertificateIndexReloader, CertificateManager, CertificateProvider, CertificateProviderKind,
+    CertificateRecord, CertificateState, CertificateStorage, CertificateTarget, Hostname,
+    IssuancePolicy, IssuanceReason, IssuanceRequest, OrderOwner, OrderState, ProvisionOutcome,
+    QuotaSnapshot, StorageError, Timestamp,
 };
 
 #[derive(Clone, Debug)]
@@ -83,6 +83,7 @@ impl NamespaceCertificateProvisioner for DeferredNamespaceCertificates {
 pub struct ManagedNamespaceCertificates<P, S> {
     manager: CertificateManager<P, S>,
     storage: Arc<S>,
+    reloader: Option<Arc<dyn CertificateIndexReloader>>,
 }
 
 impl<P, S> ManagedNamespaceCertificates<P, S>
@@ -94,6 +95,19 @@ where
         Self {
             manager: CertificateManager::new(provider, Arc::clone(&storage), policy),
             storage,
+            reloader: None,
+        }
+    }
+
+    pub fn from_manager(
+        manager: CertificateManager<P, S>,
+        storage: Arc<S>,
+        reloader: Arc<dyn CertificateIndexReloader>,
+    ) -> Self {
+        Self {
+            manager,
+            storage,
+            reloader: Some(reloader),
         }
     }
 }
@@ -155,6 +169,14 @@ where
                 ProvisionOutcome::Deduplicated(OrderState::Failed)
                 | ProvisionOutcome::PermanentlyFailed => NamespaceCertificateStatus::Failed,
             };
+            if status == NamespaceCertificateStatus::Ready
+                && let Some(reloader) = &self.reloader
+            {
+                reloader
+                    .refresh(request.now)
+                    .await
+                    .map_err(|_| NamespaceCertificateError)?;
+            }
             Ok(status)
         })
     }
@@ -167,23 +189,38 @@ where
     ) -> BoxFuture<'_, Result<(), NamespaceCertificateError>> {
         Box::pin(async move {
             let target = CertificateTarget::namespace(hostname);
-            let Some(certificate) = self
+            let certificate = self
                 .storage
                 .load_certificate(&target)
                 .await
-                .map_err(map_storage_error)?
-            else {
-                return Ok(());
-            };
-
-            if certificate.provider != provider {
+                .map_err(map_storage_error)?;
+            if certificate
+                .as_ref()
+                .is_some_and(|certificate| certificate.provider != provider)
+            {
                 return Err(NamespaceCertificateError);
             }
-            if let CertificateState::Ready(material) = certificate.state {
-                self.storage
-                    .store_certificate(CertificateRecord::retained(target, provider, material, now))
+            let retained = certificate.and_then(|certificate| match certificate.state {
+                CertificateState::Ready(material) => Some(CertificateRecord::retained(
+                    target.clone(),
+                    provider,
+                    material,
+                    now,
+                )),
+                CertificateState::Pending
+                | CertificateState::RetryScheduled { .. }
+                | CertificateState::Failed
+                | CertificateState::Retained(_) => None,
+            });
+            self.storage
+                .retire_order_cycle(target, provider, retained)
+                .await
+                .map_err(map_storage_error)?;
+            if let Some(reloader) = &self.reloader {
+                reloader
+                    .refresh(now)
                     .await
-                    .map_err(map_storage_error)?;
+                    .map_err(|_| NamespaceCertificateError)?;
             }
             Ok(())
         })
@@ -196,20 +233,36 @@ fn map_storage_error(_error: StorageError) -> NamespaceCertificateError {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::NamedTempFile;
+
     use super::*;
     use crate::certificates::{
-        CertificateMaterial, FakeCertificateProvider, FakeCertificateStorage, SecretBytes,
+        AuthorizedHostnames, CertificateMaterial, FakeCertificateProvider, FakeCertificateStorage,
+        ProviderError, SecretBytes, SniCertificateIndex, SqliteCertificateStorage,
     };
 
-    #[tokio::test]
-    async fn manager_adapter_only_reports_ready_after_persistence() {
-        let material = CertificateMaterial {
+    fn material(not_after: u64) -> CertificateMaterial {
+        CertificateMaterial {
             certificate_chain_pem: b"certificate".to_vec(),
             private_key_pem: SecretBytes::new(b"private key".to_vec()),
             not_before: Timestamp::from_unix_seconds(10),
-            not_after: Timestamp::from_unix_seconds(1_000),
-        };
-        let provider = Arc::new(FakeCertificateProvider::succeeding(material));
+            not_after: Timestamp::from_unix_seconds(not_after),
+        }
+    }
+
+    async fn sqlite_storage() -> (NamedTempFile, Arc<SqliteCertificateStorage>) {
+        let file = NamedTempFile::new().expect("temporary database");
+        let storage = Arc::new(
+            SqliteCertificateStorage::connect(file.path())
+                .await
+                .expect("open certificate storage"),
+        );
+        (file, storage)
+    }
+
+    #[tokio::test]
+    async fn manager_adapter_only_reports_ready_after_persistence() {
+        let provider = Arc::new(FakeCertificateProvider::succeeding(material(1_000)));
         let storage = Arc::new(FakeCertificateStorage::default());
         let certificates = ManagedNamespaceCertificates::new(
             provider,
@@ -236,5 +289,213 @@ mod tests {
                 .map(|record| record.state),
             Some(CertificateState::Ready(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_release_preserves_retained_reuse_then_allows_fresh_owner_cycle() {
+        let (_file, storage) = sqlite_storage().await;
+        let provider = Arc::new(FakeCertificateProvider::succeeding(material(1_500)));
+        let certificates = ManagedNamespaceCertificates::new(
+            provider.clone(),
+            storage.clone(),
+            IssuancePolicy::default(),
+        );
+        let hostname = Hostname::parse("cloud.example.test").expect("valid hostname");
+        let request = |user_id, now| NamespaceCertificateRequest {
+            hostname: hostname.clone(),
+            user_id,
+            provider: CertificateProviderKind::Cloudflare,
+            quota: QuotaSnapshot::default(),
+            now: Timestamp::from_unix_seconds(now),
+        };
+
+        assert_eq!(
+            certificates
+                .provision(request(7, 100))
+                .await
+                .expect("initial issuance"),
+            NamespaceCertificateStatus::Ready
+        );
+        certificates
+            .release(
+                hostname.clone(),
+                CertificateProviderKind::Cloudflare,
+                Timestamp::from_unix_seconds(200),
+            )
+            .await
+            .expect("release namespace cycle");
+        let target = CertificateTarget::namespace(hostname.clone());
+        assert!(
+            storage
+                .load_order(&target)
+                .await
+                .expect("load retired order")
+                .is_none()
+        );
+        assert!(matches!(
+            storage
+                .load_certificate(&target)
+                .await
+                .expect("load retained material")
+                .map(|certificate| certificate.state),
+            Some(CertificateState::Retained(_))
+        ));
+        certificates
+            .release(
+                hostname.clone(),
+                CertificateProviderKind::Cloudflare,
+                Timestamp::from_unix_seconds(201),
+            )
+            .await
+            .expect("idempotent release retry");
+        assert!(matches!(
+            storage
+                .load_certificate(&target)
+                .await
+                .expect("load retained material after retry")
+                .map(|certificate| certificate.state),
+            Some(CertificateState::Retained(_))
+        ));
+
+        assert_eq!(
+            certificates
+                .provision(request(8, 300))
+                .await
+                .expect("new owner reuses retained material"),
+            NamespaceCertificateStatus::Ready
+        );
+        assert_eq!(provider.issue_count(), 1);
+        assert!(
+            storage
+                .load_order(&target)
+                .await
+                .expect("load reused cycle")
+                .is_none()
+        );
+        certificates
+            .release(
+                hostname.clone(),
+                CertificateProviderKind::Cloudflare,
+                Timestamp::from_unix_seconds(400),
+            )
+            .await
+            .expect("release reused material");
+
+        provider.set_issue_result(Ok(material(10_000)));
+        assert_eq!(
+            certificates
+                .provision(request(9, 2_000))
+                .await
+                .expect("fresh owner issues after retained material expires"),
+            NamespaceCertificateStatus::Ready
+        );
+        let order = storage
+            .load_order(&target)
+            .await
+            .expect("load fresh owner order")
+            .expect("fresh owner order exists");
+        assert_eq!(order.request.owner, OrderOwner::User("9".to_owned()));
+        assert_eq!(order.request.reason, IssuanceReason::NamespaceClaim);
+        assert_eq!(provider.issue_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_release_retires_retry_cycle_before_new_owner_reclaims() {
+        let (_file, storage) = sqlite_storage().await;
+        let provider = Arc::new(FakeCertificateProvider::failing(ProviderError::retryable(
+            "local retryable failure",
+        )));
+        let base_target = CertificateTarget::base_domain(
+            Hostname::parse("example.test").expect("valid hostname"),
+        );
+        storage
+            .store_certificate(CertificateRecord::ready(
+                base_target.clone(),
+                CertificateProviderKind::Cloudflare,
+                material(10_000),
+                Timestamp::from_unix_seconds(10),
+            ))
+            .await
+            .expect("store base certificate");
+        let certificates = ManagedNamespaceCertificates::new(
+            provider.clone(),
+            storage.clone(),
+            IssuancePolicy::default(),
+        );
+        let hostname = Hostname::parse("cloud.example.test").expect("valid hostname");
+        let request = |user_id, now| NamespaceCertificateRequest {
+            hostname: hostname.clone(),
+            user_id,
+            provider: CertificateProviderKind::Cloudflare,
+            quota: QuotaSnapshot::default(),
+            now: Timestamp::from_unix_seconds(now),
+        };
+
+        assert_eq!(
+            certificates
+                .provision(request(7, 100))
+                .await
+                .expect("persist scheduled retry"),
+            NamespaceCertificateStatus::Retrying
+        );
+        certificates
+            .release(
+                hostname.clone(),
+                CertificateProviderKind::Cloudflare,
+                Timestamp::from_unix_seconds(101),
+            )
+            .await
+            .expect("release retrying namespace");
+        let target = CertificateTarget::namespace(hostname.clone());
+        assert!(
+            storage
+                .load_order(&target)
+                .await
+                .expect("load retired retry order")
+                .is_none()
+        );
+        assert!(
+            storage
+                .load_certificate(&target)
+                .await
+                .expect("load retired retry certificate")
+                .is_none()
+        );
+        let index = SniCertificateIndex::new(
+            storage
+                .load_certificates()
+                .await
+                .expect("load released certificate snapshot"),
+        )
+        .expect("valid released certificate snapshot");
+        let authorized = AuthorizedHostnames::new([hostname.clone()]);
+        assert_eq!(
+            index
+                .resolve(
+                    hostname.as_str(),
+                    Timestamp::from_unix_seconds(102),
+                    &authorized,
+                )
+                .expect("released child falls back to base certificate")
+                .target,
+            &base_target
+        );
+
+        provider.set_issue_result(Ok(material(10_000)));
+        assert_eq!(
+            certificates
+                .provision(request(8, 102))
+                .await
+                .expect("new owner starts without stale backoff"),
+            NamespaceCertificateStatus::Ready
+        );
+        let order = storage
+            .load_order(&target)
+            .await
+            .expect("load replacement order")
+            .expect("replacement order exists");
+        assert_eq!(order.request.owner, OrderOwner::User("8".to_owned()));
+        assert_eq!(order.state, OrderState::Succeeded);
+        assert_eq!(provider.issue_count(), 2);
     }
 }

@@ -90,6 +90,17 @@ pub trait CertificateStorage: Send + Sync {
         certificate: Option<CertificateRecord>,
     ) -> BoxFuture<'_, Result<(), StorageError>>;
 
+    /// End the current issuance cycle for a released target. Ready material is
+    /// supplied as Retained; existing Retained material survives idempotent
+    /// retries, while non-material certificate state is removed so it cannot
+    /// shadow a parent certificate. All changes commit in one transaction.
+    fn retire_order_cycle(
+        &self,
+        target: CertificateTarget,
+        provider: CertificateProviderKind,
+        certificate: Option<CertificateRecord>,
+    ) -> BoxFuture<'_, Result<(), StorageError>>;
+
     /// Convert every order left `InProgress` by a stopped process into a
     /// scheduled retry. Implementations must reconcile all matching orders in
     /// one transaction so startup cannot leave a partially recovered set.
@@ -266,6 +277,103 @@ impl CertificateStorage for SqliteCertificateStorage {
                 upsert_certificate(&mut transaction, certificate, encoded).await?;
             }
             upsert_order(&mut transaction, &order, &encoded_order).await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn retire_order_cycle(
+        &self,
+        target: CertificateTarget,
+        provider: CertificateProviderKind,
+        certificate: Option<CertificateRecord>,
+    ) -> BoxFuture<'_, Result<(), StorageError>> {
+        Box::pin(async move {
+            if certificate.as_ref().is_some_and(|certificate| {
+                certificate.target != target || certificate.provider != provider
+            }) {
+                return Err(StorageError::malformed("retired order cycle"));
+            }
+            let encoded_certificate = certificate
+                .as_ref()
+                .map(EncodedCertificate::try_from)
+                .transpose()?;
+            let mut transaction = self.pool.begin().await?;
+            let existing =
+                sqlx::query_as::<_, OrderRow>(&format!("{} WHERE target = ?", OrderRow::SELECT))
+                    .bind(target.apex().as_str())
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .map(OrderRecord::try_from)
+                    .transpose()?;
+            if existing.as_ref().is_some_and(|order| {
+                order.request.target != target || order.request.provider != provider
+            }) {
+                return Err(StorageError::malformed("retired order identity"));
+            }
+            let existing_certificate = sqlx::query_as::<_, CertificateRow>(&format!(
+                "{} WHERE target = ?",
+                CertificateRow::SELECT
+            ))
+            .bind(target.apex().as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(CertificateRecord::try_from)
+            .transpose()?;
+            if existing_certificate.as_ref().is_some_and(|certificate| {
+                certificate.target != target || certificate.provider != provider
+            }) {
+                return Err(StorageError::malformed("retired certificate identity"));
+            }
+            let delete_non_material = match (
+                existing_certificate.as_ref().map(|record| &record.state),
+                certificate.as_ref().map(|record| &record.state),
+            ) {
+                (None, None) => false,
+                (Some(CertificateState::Retained(_)), None) => false,
+                (
+                    Some(
+                        CertificateState::Pending
+                        | CertificateState::RetryScheduled { .. }
+                        | CertificateState::Failed,
+                    ),
+                    None,
+                ) => true,
+                (Some(CertificateState::Ready(_)), Some(CertificateState::Retained(_)))
+                | (Some(CertificateState::Retained(_)), Some(CertificateState::Retained(_))) => {
+                    false
+                }
+                _ => return Err(StorageError::malformed("retired certificate transition")),
+            };
+            if let (Some(certificate), Some(encoded)) =
+                (certificate.as_ref(), encoded_certificate.as_ref())
+            {
+                upsert_certificate(&mut transaction, certificate, encoded).await?;
+            }
+            sqlx::query(
+                r#"
+                DELETE FROM certificate_orders
+                WHERE target = ? AND target_kind = ? AND provider = ?
+                "#,
+            )
+            .bind(target.apex().as_str())
+            .bind(target_kind(&target))
+            .bind(provider.as_str())
+            .execute(&mut *transaction)
+            .await?;
+            if delete_non_material {
+                sqlx::query(
+                    r#"
+                    DELETE FROM managed_certificates
+                    WHERE target = ? AND target_kind = ? AND provider = ?
+                    "#,
+                )
+                .bind(target.apex().as_str())
+                .bind(target_kind(&target))
+                .bind(provider.as_str())
+                .execute(&mut *transaction)
+                .await?;
+            }
             transaction.commit().await?;
             Ok(())
         })
@@ -715,6 +823,9 @@ async fn upsert_order(
             cooldown_until, last_error, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(target) DO UPDATE SET
+            owner_kind = excluded.owner_kind,
+            owner_id = excluded.owner_id,
+            reason = excluded.reason,
             order_state = excluded.order_state,
             attempts = excluded.attempts,
             consecutive_failures = excluded.consecutive_failures,
@@ -724,9 +835,17 @@ async fn upsert_order(
             updated_at = excluded.updated_at
         WHERE certificate_orders.target_kind = excluded.target_kind
           AND certificate_orders.provider = excluded.provider
-          AND certificate_orders.owner_kind = excluded.owner_kind
-          AND certificate_orders.owner_id IS excluded.owner_id
-          AND certificate_orders.reason = excluded.reason
+          AND (
+              (
+                  certificate_orders.owner_kind = excluded.owner_kind
+                  AND certificate_orders.owner_id IS excluded.owner_id
+                  AND certificate_orders.reason = excluded.reason
+              )
+              OR (
+                  certificate_orders.order_state IN ('succeeded', 'failed')
+                  AND excluded.order_state IN ('queued', 'in_progress')
+              )
+          )
         "#,
     )
     .bind(order.request.target.apex().as_str())

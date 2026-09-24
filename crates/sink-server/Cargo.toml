@@ -24,6 +24,7 @@ hyper-util.workspace = true
 instant-acme.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -32,6 +33,7 @@ sink-protocol = { path = "../sink-protocol" }
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tower.workspace = true

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use futures::future::BoxFuture;
 use thiserror::Error;
 
 use super::{
@@ -12,7 +13,25 @@ use super::{
 /// wildcard into authorization for an otherwise unknown hostname.
 pub trait SniAuthorization {
     fn is_authorized(&self, hostname: &Hostname) -> bool;
+
+    /// Return the most-specific currently owned namespace boundary that must
+    /// supply this hostname's certificate. This prevents a pending child
+    /// claim from falling back to a parent wildcard. Implementations that do
+    /// not model namespace ownership may leave this unset.
+    fn required_certificate_apex(&self, _hostname: &Hostname) -> Option<Hostname> {
+        None
+    }
 }
+
+/// Async boundary used after a durable certificate transition to replace the
+/// complete in-memory TLS snapshot before callers observe a ready result.
+pub trait CertificateIndexReloader: Send + Sync {
+    fn refresh(&self, now: Timestamp) -> BoxFuture<'_, Result<(), CertificateReloadError>>;
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("managed TLS certificate index refresh failed")]
+pub struct CertificateReloadError;
 
 impl<F> SniAuthorization for F
 where
@@ -74,7 +93,7 @@ impl SniCertificateIndex {
         &self,
         server_name: &str,
         now: Timestamp,
-        authorization: &impl SniAuthorization,
+        authorization: &(impl SniAuthorization + ?Sized),
     ) -> Result<ResolvedCertificate<'_>, ResolveError> {
         let hostname = Hostname::parse(server_name).map_err(|_| ResolveError::InvalidServerName)?;
         if !authorization.is_authorized(&hostname) {
@@ -84,13 +103,20 @@ impl SniCertificateIndex {
         // Select by specificity before checking readiness. A pending child
         // namespace therefore cannot silently fall back to its parent's
         // wildcard certificate.
-        let record = self
-            .records
-            .iter()
-            .filter(|record| !matches!(record.state, CertificateState::Retained(_)))
-            .filter(|record| record.target.identifiers().covers(&hostname))
-            .max_by_key(|record| record.target.apex().label_count())
-            .ok_or(ResolveError::Uncovered)?;
+        let required_apex = authorization.required_certificate_apex(&hostname);
+        let record = if let Some(required_apex) = required_apex {
+            self.records
+                .iter()
+                .find(|record| record.target.apex() == &required_apex)
+                .filter(|record| record.target.identifiers().covers(&hostname))
+        } else {
+            self.records
+                .iter()
+                .filter(|record| !matches!(record.state, CertificateState::Retained(_)))
+                .filter(|record| record.target.identifiers().covers(&hostname))
+                .max_by_key(|record| record.target.apex().label_count())
+        }
+        .ok_or(ResolveError::Uncovered)?;
 
         let material = record.active_material(now).ok_or(ResolveError::NotReady)?;
         Ok(ResolvedCertificate {

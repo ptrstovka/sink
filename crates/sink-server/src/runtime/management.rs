@@ -36,7 +36,7 @@ pub(crate) struct NamespaceOperationLocks {
 }
 
 impl NamespaceOperationLocks {
-    async fn lock(&self, hostname: &Hostname) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(crate) async fn lock(&self, hostname: &Hostname) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.inner.lock().await;
             locks.retain(|_, lock| lock.strong_count() > 0);
@@ -115,7 +115,7 @@ pub(crate) async fn namespace_item_ingress(
 
 fn is_management_request(state: &RuntimeState, request: &Request) -> bool {
     matches!(
-        super::route_for_request(request.headers(), &state.public_base_domain),
+        super::route_for_request(request, &state.public_base_domain),
         HostRoute::Control
     ) || super::has_loopback_host(request.headers())
 }
@@ -193,9 +193,17 @@ async fn claim_namespace(
     let _mutation = state.namespace_mutations.lock(&hostname).await;
     let (claim, created) = {
         let _admission = state.admission_gate.lock().await;
+        // Publish the child certificate boundary before a durable claim can
+        // become observable. Rustls does not take the admission gate, so the
+        // boundary itself closes the parent-wildcard fallback window while
+        // ownership and issuance state are being established.
+        state.tls_boundaries.insert(hostname.clone());
         match prepare_claim(state, user.id, &hostname, &domain).await {
             Ok(prepared) => prepared,
-            Err(response) => return response,
+            Err(response) => {
+                rollback_provisional_tls_boundary(state, &hostname).await;
+                return response;
+            }
         }
     };
 
@@ -241,6 +249,20 @@ async fn claim_namespace(
         StatusCode::ACCEPTED
     };
     claim_response(status, claim)
+}
+
+async fn rollback_provisional_tls_boundary(state: &RuntimeState, hostname: &Hostname) {
+    match state.database.namespace_claim(hostname.as_str()).await {
+        Ok(None) => state.tls_boundaries.remove(hostname),
+        Ok(Some(_)) => {
+            // Durable ownership exists, even if this request cannot use it.
+            // Keep the boundary so TLS remains fail-closed for the child.
+        }
+        Err(error) => {
+            // Database uncertainty must not re-enable a parent wildcard.
+            tracing::error!(hostname = %hostname, %error, "could not reconcile provisional TLS boundary; retaining it fail-closed");
+        }
+    }
 }
 
 async fn prepare_claim(
@@ -406,7 +428,10 @@ async fn release_namespace(
         .delete_releasing_namespace_claim(user.id, hostname.as_str())
         .await
     {
-        Ok(_) => empty_response(StatusCode::NO_CONTENT),
+        Ok(_) => {
+            state.tls_boundaries.remove(&hostname);
+            empty_response(StatusCode::NO_CONTENT)
+        }
         Err(DbError::NamespaceHasChildren { .. }) => management_error(
             StatusCode::CONFLICT,
             ManagementErrorCode::NamespaceHasChildren,
@@ -1188,6 +1213,30 @@ mod tests {
             ))
             .await?;
         assert_eq!(owner.status(), StatusCode::CREATED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisional_tls_boundary_rolls_back_only_when_no_durable_claim_exists()
+    -> Result<(), Box<dyn Error>> {
+        let certificates = Arc::new(FakeCertificates::new(NamespaceCertificateStatus::Ready));
+        let (_directory, state, alice, _bob) = fixture(certificates).await?;
+        let absent = Hostname::parse("absent.example.test")?;
+        state.tls_boundaries.insert(absent.clone());
+        rollback_provisional_tls_boundary(&state, &absent).await;
+        assert_eq!(state.tls_boundaries.most_specific_for(&absent), None);
+
+        let durable = Hostname::parse("durable.example.test")?;
+        state
+            .database
+            .create_namespace_claim(alice.user.id, durable.as_str(), "example.test", 2)
+            .await?;
+        state.tls_boundaries.insert(durable.clone());
+        rollback_provisional_tls_boundary(&state, &durable).await;
+        assert_eq!(
+            state.tls_boundaries.most_specific_for(&durable),
+            Some(durable)
+        );
         Ok(())
     }
 

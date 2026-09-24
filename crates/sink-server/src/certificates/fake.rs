@@ -199,6 +199,61 @@ impl CertificateStorage for FakeCertificateStorage {
         })
     }
 
+    fn retire_order_cycle(
+        &self,
+        target: CertificateTarget,
+        provider: CertificateProviderKind,
+        certificate: Option<CertificateRecord>,
+    ) -> BoxFuture<'_, Result<(), StorageError>> {
+        Box::pin(async move {
+            if certificate.as_ref().is_some_and(|certificate| {
+                certificate.target != target || certificate.provider != provider
+            }) {
+                return Err(StorageError::new("retired order cycle mismatch"));
+            }
+            let mut state = lock(&self.state);
+            if state.orders.get(&target).is_some_and(|order| {
+                order.request.target != target || order.request.provider != provider
+            }) {
+                return Err(StorageError::new("retired order identity mismatch"));
+            }
+            if state.certificates.get(&target).is_some_and(|certificate| {
+                certificate.target != target || certificate.provider != provider
+            }) {
+                return Err(StorageError::new("retired certificate identity mismatch"));
+            }
+            let delete_non_material = match (
+                state.certificates.get(&target).map(|record| &record.state),
+                certificate.as_ref().map(|record| &record.state),
+            ) {
+                (None, None) | (Some(CertificateState::Retained(_)), None) => false,
+                (
+                    Some(
+                        CertificateState::Pending
+                        | CertificateState::RetryScheduled { .. }
+                        | CertificateState::Failed,
+                    ),
+                    None,
+                ) => true,
+                (Some(CertificateState::Ready(_)), Some(CertificateState::Retained(_)))
+                | (Some(CertificateState::Retained(_)), Some(CertificateState::Retained(_))) => {
+                    false
+                }
+                _ => {
+                    return Err(StorageError::new("retired certificate transition mismatch"));
+                }
+            };
+            if let Some(certificate) = certificate {
+                state.certificates.insert(target.clone(), certificate);
+            }
+            state.orders.remove(&target);
+            if delete_non_material {
+                state.certificates.remove(&target);
+            }
+            Ok(())
+        })
+    }
+
     fn reconcile_in_progress<'a>(
         &'a self,
         retry: &'a RetryPolicy,
