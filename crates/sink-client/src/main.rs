@@ -54,6 +54,9 @@ async fn run() -> Result<(), BoxError> {
             );
             run_tunnel(*arguments, check_for_update).await
         }
+        SinkCommand::Connect(arguments) => sink_client::multi_connect::run(*arguments)
+            .await
+            .map_err(Into::into),
         SinkCommand::Update => {
             match install_latest().await? {
                 UpdateResult::UpToDate { version } => {

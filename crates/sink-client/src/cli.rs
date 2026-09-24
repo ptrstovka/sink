@@ -1,4 +1,7 @@
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::{
+    num::{NonZeroU16, NonZeroUsize},
+    path::PathBuf,
+};
 
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
@@ -27,12 +30,48 @@ pub struct Cli {
 pub enum SinkCommand {
     /// Expose a local HTTP or HTTPS service.
     Http(Box<HttpArgs>),
+    /// Expose multiple independently supervised HTTP or HTTPS services.
+    Connect(Box<ConnectArgs>),
     /// Save client configuration.
     Config(ConfigArgs),
     /// Update the Sink client to the latest stable release.
     Update,
     /// Print the Sink client version.
     Version,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ConnectArgs {
+    /// TOML file containing the named routes to expose.
+    #[arg(long, value_name = "FILE")]
+    pub config: PathBuf,
+
+    /// Use an authentication token for this run without saving it.
+    #[arg(long, value_name = "TOKEN")]
+    pub authtoken: Option<AuthToken>,
+
+    /// Use a control-server origin for this run without saving it.
+    #[arg(long, value_name = "SERVER")]
+    pub server_addr: Option<ControlServerAddr>,
+
+    /// Permit an http:// control server for this run (local development only).
+    #[arg(long)]
+    pub allow_plaintext_control: bool,
+}
+
+impl ConnectArgs {
+    #[must_use]
+    pub fn run_overrides(&self) -> RunOverrides {
+        RunOverrides {
+            authtoken: self.authtoken.clone(),
+            server_addr: self.server_addr.clone(),
+            allow_plaintext_control: self.allow_plaintext_control,
+        }
+    }
+
+    pub fn resolve_config(&self, saved: &SavedConfig) -> Result<ResolvedConfig, ConfigError> {
+        saved.resolve(self.run_overrides())
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -273,6 +312,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_connect_command_and_global_run_overrides() -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from([
+            "sink",
+            "connect",
+            "--config",
+            "routes.toml",
+            "--authtoken",
+            "one-run-secret",
+            "--server-addr",
+            "http://127.0.0.1:8080",
+            "--allow-plaintext-control",
+        ])?;
+        let SinkCommand::Connect(args) = cli.command else {
+            return Err("expected connect command".into());
+        };
+        assert_eq!(args.config, PathBuf::from("routes.toml"));
+        assert_eq!(
+            args.authtoken.as_ref().map(AuthToken::expose_secret),
+            Some("one-run-secret")
+        );
+        assert_eq!(
+            args.server_addr.map(|server| server.to_string()),
+            Some("http://127.0.0.1:8080/".to_owned())
+        );
+        assert!(args.allow_plaintext_control);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_requires_a_configuration_file() {
+        assert!(Cli::try_parse_from(["sink", "connect"]).is_err());
+    }
+
+    #[test]
     fn inspection_settings_use_approved_defaults() -> Result<(), Box<dyn std::error::Error>> {
         let cli = Cli::try_parse_from(["sink", "http", "3000"])?;
         let SinkCommand::Http(args) = cli.command else {
@@ -342,6 +415,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         for arguments in [
             vec!["sink", "http", "3000", "--authtoken", "debug-secret"],
+            vec![
+                "sink",
+                "connect",
+                "--config",
+                "routes.toml",
+                "--authtoken",
+                "debug-secret",
+            ],
             vec!["sink", "config", "add-authtoken", "debug-secret"],
         ] {
             let cli = Cli::try_parse_from(arguments)?;
