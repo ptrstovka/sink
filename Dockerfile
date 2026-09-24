@@ -28,7 +28,7 @@ ENV SINK_SERVER_LISTEN_ADDRESS=0.0.0.0:8080 \
     SINK_SERVER_SQLITE_PATH=/data/sink.sqlite3
 
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 8080 8443
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=3s --retries=3 \
     CMD wget -q -O - --header "Host: ${SINK_SERVER_PUBLIC_BASE_DOMAIN}" \
