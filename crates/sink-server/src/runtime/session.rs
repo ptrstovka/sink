@@ -11,9 +11,10 @@ use crate::db::AuthenticatedUser;
 
 use super::{
     AUTHENTICATION_CHECK_INTERVAL, RuntimeState,
+    admission::{RouteAdmissionError, authorize_hostname_locked},
     broker::{DriverExit, StreamBroker, drive_yamux},
     claims::{ClaimError, ClaimLease, ClaimOwner, RECONNECT_GRACE},
-    host::requested_subdomain,
+    host::requested_hostname,
     websocket::AxumMessageAdapter,
 };
 
@@ -41,8 +42,8 @@ pub(crate) async fn run_control_socket(
     }
 
     let requested = match hello.requested_hostname.as_deref() {
-        Some(hostname) => match requested_subdomain(hostname, &state.public_base_domain) {
-            Some(subdomain) => Some(subdomain),
+        Some(hostname) => match requested_hostname(hostname, &state.public_base_domain) {
+            Some(hostname) => Some(hostname),
             None => {
                 send_rejection(
                     &mut socket,
@@ -65,10 +66,109 @@ pub(crate) async fn run_control_socket(
         user_id: user.id,
         session_id: hello.session_id,
     };
-    let lease = match state
-        .claims
-        .acquire(owner, requested.clone(), broker.clone(), Instant::now())
-    {
+    let lease = {
+        let _admission = state.admission_gate.lock().await;
+        let hostname = match requested.clone() {
+            Some(hostname) => match authorize_hostname_locked(&state, user.id, &hostname).await {
+                Ok(()) => hostname,
+                Err(RouteAdmissionError::NotReady) => {
+                    send_rejection(
+                        &mut socket,
+                        SessionRejected::transient(
+                            RejectCode::ServerUnavailable,
+                            "requested namespace is not active",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(RouteAdmissionError::Unauthorized) => {
+                    send_rejection(
+                        &mut socket,
+                        SessionRejected::permanent(
+                            RejectCode::InvalidSubdomain,
+                            "requested hostname is not authorized",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(RouteAdmissionError::Unavailable) => {
+                    send_rejection(
+                        &mut socket,
+                        SessionRejected::transient(
+                            RejectCode::ServerUnavailable,
+                            "server could not authorize the requested hostname",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            None => {
+                let base_domain =
+                    match crate::certificates::Hostname::parse(&state.public_base_domain) {
+                        Ok(base_domain) => base_domain,
+                        Err(_) => {
+                            send_rejection(
+                                &mut socket,
+                                SessionRejected::transient(
+                                    RejectCode::ServerUnavailable,
+                                    "server could not allocate a tunnel hostname",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                let mut selected = None;
+                for _ in 0..64 {
+                    let candidate = match state
+                        .claims
+                        .generated_candidate(&base_domain, Instant::now())
+                    {
+                        Ok(candidate) => candidate,
+                        Err(ClaimError::GenerationExhausted) => break,
+                        Err(ClaimError::Conflict(_)) => continue,
+                    };
+                    match authorize_hostname_locked(&state, user.id, &candidate).await {
+                        Ok(()) => {
+                            selected = Some(candidate);
+                            break;
+                        }
+                        Err(RouteAdmissionError::Unauthorized | RouteAdmissionError::NotReady) => {}
+                        Err(RouteAdmissionError::Unavailable) => {
+                            send_rejection(
+                                &mut socket,
+                                SessionRejected::transient(
+                                    RejectCode::ServerUnavailable,
+                                    "server could not allocate a tunnel hostname",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                let Some(selected) = selected else {
+                    send_rejection(
+                        &mut socket,
+                        SessionRejected::transient(
+                            RejectCode::ServerUnavailable,
+                            "server could not allocate a tunnel hostname",
+                        ),
+                    )
+                    .await;
+                    return;
+                };
+                selected
+            }
+        };
+        state
+            .claims
+            .acquire(owner, hostname, broker.clone(), Instant::now())
+    };
+    let lease = match lease {
         Ok(lease) => lease,
         Err(ClaimError::Conflict(conflict)) => {
             let incumbent_client_version = conflict
@@ -96,8 +196,8 @@ pub(crate) async fn run_control_socket(
                 user_id = user.id,
                 session_id = %hello.session_id,
                 client_version = hello.client_version,
-                requested_subdomain = requested.as_ref().map_or("<generated>", |value| value.as_str()),
-                incumbent_subdomain = %conflict.subdomain,
+                requested_hostname = requested.as_ref().map_or("<generated>", |value| value.as_str()),
+                incumbent_hostname = %conflict.hostname,
                 incumbent_user_id = conflict.owner.user_id,
                 incumbent_session_id = %conflict.owner.session_id,
                 incumbent_status = conflict.status.as_str(),
@@ -141,10 +241,21 @@ pub(crate) async fn run_control_socket(
         }
     };
 
-    let hostname = format!("{}.{}", lease.subdomain, state.public_base_domain);
+    let hostname = lease.hostname.to_string();
+    let Some(label) = hostname.split('.').next() else {
+        state.claims.release(&lease);
+        return;
+    };
+    let subdomain = match sink_protocol::Subdomain::parse(label) {
+        Ok(subdomain) => subdomain,
+        Err(_) => {
+            state.claims.release(&lease);
+            return;
+        }
+    };
     let accepted = ServerHello::Accepted(SessionAccepted::new(
         hello.session_id,
-        lease.subdomain.clone(),
+        subdomain,
         format!("http://{hostname}"),
         format!("https://{hostname}"),
         RECONNECT_GRACE.as_secs(),
@@ -154,7 +265,7 @@ pub(crate) async fn run_control_socket(
             user_id = user.id,
             session_id = %hello.session_id,
             client_version = hello.client_version,
-            subdomain = %lease.subdomain,
+            hostname = %lease.hostname,
             "control link was lost while accepting the tunnel"
         );
         disconnect_and_watch_grace(&state, &lease, &user);
@@ -165,7 +276,7 @@ pub(crate) async fn run_control_socket(
         user_id = user.id,
         session_id = %hello.session_id,
         client_version = hello.client_version,
-        subdomain = %lease.subdomain,
+        hostname = %lease.hostname,
         "tunnel connected"
     );
 
@@ -197,7 +308,7 @@ pub(crate) async fn run_control_socket(
                 user_id = user.id,
                 session_id = %hello.session_id,
                 client_version = hello.client_version,
-                subdomain = %lease.subdomain,
+                hostname = %lease.hostname,
                 driver_exit = ?DriverExit::TransportError,
                 control_liveness = ?final_liveness,
                 "tunnel disconnected unexpectedly; claim retained for reconnect grace"
@@ -209,7 +320,7 @@ pub(crate) async fn run_control_socket(
                 user_id = user.id,
                 session_id = %hello.session_id,
                 client_version = hello.client_version,
-                subdomain = %lease.subdomain,
+                hostname = %lease.hostname,
                 driver_exit = ?DriverExit::Replaced,
                 control_liveness = ?final_liveness,
                 "tunnel control link replaced by reconnect"
@@ -222,7 +333,7 @@ pub(crate) async fn run_control_socket(
                 user_id = user.id,
                 session_id = %hello.session_id,
                 client_version = hello.client_version,
-                subdomain = %lease.subdomain,
+                hostname = %lease.hostname,
                 control_liveness = ?final_liveness,
                 "tunnel authorization was revoked"
             );
@@ -234,7 +345,7 @@ pub(crate) async fn run_control_socket(
                 user_id = user.id,
                 session_id = %hello.session_id,
                 client_version = hello.client_version,
-                subdomain = %lease.subdomain,
+                hostname = %lease.hostname,
                 server_close_reason = ?exit,
                 control_liveness = ?final_liveness,
                 "tunnel closed by server"
@@ -246,7 +357,7 @@ pub(crate) async fn run_control_socket(
                 user_id = user.id,
                 session_id = %hello.session_id,
                 client_version = hello.client_version,
-                subdomain = %lease.subdomain,
+                hostname = %lease.hostname,
                 ?driver_exit,
                 control_liveness = ?final_liveness,
                 "tunnel closed"

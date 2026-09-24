@@ -7,11 +7,17 @@
 //! replayed by the control protocol.
 
 mod handshake;
+mod management;
 mod message_io;
 mod subdomain;
 
 pub use handshake::{
     ClientHello, HandshakeError, RejectCode, ServerHello, SessionAccepted, SessionRejected,
+};
+pub use management::{
+    ManagementError, ManagementErrorCode, ManagementErrorResponse, NAMESPACE_COLLECTION_PATH,
+    NAMESPACE_ITEM_PATH, Namespace, NamespaceClaimRequest, NamespaceListResponse,
+    NamespaceResponse, NamespaceState,
 };
 pub use message_io::MessageIo;
 pub use subdomain::{Subdomain, SubdomainError};

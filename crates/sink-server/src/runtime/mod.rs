@@ -1,9 +1,11 @@
 //! Public ingress and authenticated reverse-tunnel runtime.
 
+mod admission;
 mod broker;
 mod claims;
 mod forwarding;
 mod host;
+mod management;
 mod session;
 mod websocket;
 
@@ -32,16 +34,23 @@ use sink_protocol::{CONTROL_PATH, MAX_TRANSPORT_MESSAGE_BYTES};
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
-    sync::{Notify, oneshot, watch},
+    sync::{Mutex, Notify, oneshot, watch},
     time::timeout,
 };
 
-use crate::db::Database;
+use crate::{
+    certificates::{CertificateProviderKind, Hostname},
+    config::{ConfiguredDomain, ConfiguredDomains},
+    db::Database,
+    namespace_control::{DeferredNamespaceCertificates, NamespaceCertificateProvisioner},
+};
 
 use self::{
+    admission::{RouteAdmissionError, authorize_hostname_locked},
     claims::{ClaimLookup, ClaimRegistry},
     forwarding::{ForwardingContext, forward_request},
     host::{HostRoute, classify_host},
+    management::{NamespaceOperationLocks, namespace_collection_ingress, namespace_item_ingress},
     session::run_control_socket,
 };
 
@@ -58,7 +67,11 @@ const INVALID_CONTROL_REQUEST_BODY: &str = "invalid control request\n";
 pub struct RuntimeState {
     pub(crate) database: Database,
     pub(crate) public_base_domain: Arc<str>,
+    pub(crate) domains: Arc<ConfiguredDomains>,
     pub(crate) claims: ClaimRegistry,
+    pub(crate) certificates: Arc<dyn NamespaceCertificateProvisioner>,
+    pub(crate) admission_gate: Arc<Mutex<()>>,
+    pub(crate) namespace_mutations: NamespaceOperationLocks,
     shutdown: watch::Sender<bool>,
     sessions: Arc<SessionTracker>,
 }
@@ -70,11 +83,45 @@ impl RuntimeState {
     ) -> Result<Self, RuntimeBuildError> {
         let public_base_domain = normalize_base_domain(public_base_domain.as_ref())
             .ok_or(RuntimeBuildError::InvalidPublicBaseDomain)?;
+        let hostname = Hostname::parse(&public_base_domain)
+            .map_err(|_| RuntimeBuildError::InvalidPublicBaseDomain)?;
+        let domain = ConfiguredDomain::new(hostname, 2, CertificateProviderKind::Cloudflare)
+            .map_err(|_| RuntimeBuildError::InvalidNamespaceConfiguration)?;
+        let domains = ConfiguredDomains::new(vec![domain])
+            .map_err(|_| RuntimeBuildError::InvalidNamespaceConfiguration)?;
+        Self::with_namespace_control(
+            database,
+            public_base_domain,
+            domains,
+            Arc::new(DeferredNamespaceCertificates),
+        )
+    }
+
+    pub fn with_namespace_control(
+        database: Database,
+        public_base_domain: impl AsRef<str>,
+        domains: ConfiguredDomains,
+        certificates: Arc<dyn NamespaceCertificateProvisioner>,
+    ) -> Result<Self, RuntimeBuildError> {
+        let public_base_domain = normalize_base_domain(public_base_domain.as_ref())
+            .ok_or(RuntimeBuildError::InvalidPublicBaseDomain)?;
+        let hostname = Hostname::parse(&public_base_domain)
+            .map_err(|_| RuntimeBuildError::InvalidPublicBaseDomain)?;
+        if domains
+            .most_specific_match(&hostname)
+            .is_none_or(|domain| domain.hostname != hostname)
+        {
+            return Err(RuntimeBuildError::InvalidNamespaceConfiguration);
+        }
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
             database,
             public_base_domain: Arc::from(public_base_domain),
+            domains: Arc::new(domains),
             claims: ClaimRegistry::default(),
+            certificates,
+            admission_gate: Arc::new(Mutex::new(())),
+            namespace_mutations: NamespaceOperationLocks::default(),
             shutdown,
             sessions: Arc::new(SessionTracker::default()),
         })
@@ -125,6 +172,8 @@ impl RuntimeState {
 pub enum RuntimeBuildError {
     #[error("public base domain must be a valid DNS name without a scheme, port, or wildcard")]
     InvalidPublicBaseDomain,
+    #[error("namespace configuration must contain the public base domain")]
+    InvalidNamespaceConfiguration,
 }
 
 /// Build the complete ingress router. The exact control host/path and public
@@ -132,6 +181,14 @@ pub enum RuntimeBuildError {
 pub fn router(state: RuntimeState) -> Router {
     Router::new()
         .route(CONTROL_PATH, any(control_path_ingress))
+        .route(
+            sink_protocol::NAMESPACE_COLLECTION_PATH,
+            any(namespace_collection_ingress),
+        )
+        .route(
+            sink_protocol::NAMESPACE_ITEM_PATH,
+            any(namespace_item_ingress),
+        )
         .fallback(any(public_ingress))
         .with_state(state)
 }
@@ -246,17 +303,28 @@ async fn public_request(state: RuntimeState, request: Request) -> Response<Body>
     match route {
         HostRoute::Base => fixed_response(StatusCode::OK, ROOT_BODY),
         HostRoute::Control | HostRoute::Invalid => not_found_response(),
-        HostRoute::Tunnel(subdomain) => {
-            let broker = match state.claims.lookup(&subdomain, Instant::now()) {
-                ClaimLookup::Active(broker) => broker,
+        HostRoute::Tunnel(hostname) => {
+            let (broker, owner) = match state.claims.lookup(&hostname, Instant::now()) {
+                ClaimLookup::Active { broker, owner } => (broker, owner),
                 ClaimLookup::Disconnected => return unavailable_response(),
                 ClaimLookup::Unknown => return not_found_response(),
             };
+            let authorized = {
+                let _admission = state.admission_gate.lock().await;
+                authorize_hostname_locked(&state, owner.user_id, &hostname).await
+            };
+            match authorized {
+                Ok(()) => {}
+                Err(RouteAdmissionError::NotReady | RouteAdmissionError::Unavailable) => {
+                    return unavailable_response();
+                }
+                Err(RouteAdmissionError::Unauthorized) => return not_found_response(),
+            }
             let peer_ip = request
                 .extensions()
                 .get::<ConnectInfo<SocketAddr>>()
                 .map(|peer| peer.0.ip());
-            let public_host = format!("{subdomain}.{}", state.public_base_domain);
+            let public_host = hostname.to_string();
             match forward_request(
                 broker,
                 request,
@@ -269,7 +337,7 @@ async fn public_request(state: RuntimeState, request: Request) -> Response<Body>
             {
                 Ok(response) => response,
                 Err(error) => {
-                    tracing::warn!(subdomain = %subdomain, %error, "public request forwarding failed");
+                    tracing::warn!(hostname = %hostname, %error, "public request forwarding failed");
                     unavailable_response()
                 }
             }
@@ -413,7 +481,6 @@ mod tests {
     use std::error::Error;
 
     use http_body_util::BodyExt as _;
-    use sink_protocol::Subdomain;
     use tower::ServiceExt as _;
     use uuid::Uuid;
 
@@ -539,7 +606,7 @@ mod tests {
             "Bearer"
         );
 
-        let subdomain = Subdomain::parse("offline")?;
+        let hostname = Hostname::parse("offline.example.test")?;
         let (broker, _requests) = StreamBroker::channel();
         let lease = state
             .claims
@@ -548,7 +615,7 @@ mod tests {
                     user_id: 1,
                     session_id: Uuid::from_u128(1),
                 },
-                Some(subdomain),
+                hostname,
                 broker,
                 Instant::now(),
             )

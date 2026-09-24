@@ -5,8 +5,9 @@ use std::{
 };
 
 use rand::RngCore as _;
-use sink_protocol::Subdomain;
 use uuid::Uuid;
+
+use crate::certificates::Hostname;
 
 use super::broker::{ControlLinkLiveness, ControlLinkSnapshot, StreamBroker};
 
@@ -22,14 +23,17 @@ pub(crate) struct ClaimOwner {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClaimLease {
-    pub(crate) subdomain: Subdomain,
+    pub(crate) hostname: Hostname,
     pub(crate) owner: ClaimOwner,
     pub(crate) lease_id: u64,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ClaimLookup {
-    Active(StreamBroker),
+    Active {
+        broker: StreamBroker,
+        owner: ClaimOwner,
+    },
     Disconnected,
     Unknown,
 }
@@ -42,11 +46,16 @@ pub(crate) enum ClaimError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClaimConflict {
-    pub(crate) subdomain: Subdomain,
+    pub(crate) hostname: Hostname,
     pub(crate) owner: ClaimOwner,
     pub(crate) status: ClaimStatusKind,
     pub(crate) broker_available: bool,
     pub(crate) liveness: ControlLinkSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RouteClaim {
+    pub(crate) owner: ClaimOwner,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,7 +88,7 @@ struct Claim {
 
 #[derive(Debug, Default)]
 struct ClaimsInner {
-    by_subdomain: HashMap<Subdomain, Claim>,
+    by_hostname: HashMap<Hostname, Claim>,
     next_lease_id: u64,
 }
 
@@ -92,62 +101,77 @@ impl ClaimRegistry {
     pub(crate) fn acquire(
         &self,
         owner: ClaimOwner,
-        requested: Option<Subdomain>,
+        requested: Hostname,
         broker: StreamBroker,
         now: Instant,
     ) -> Result<ClaimLease, ClaimError> {
         let mut inner = self.lock();
         expire_locked(&mut inner, now);
 
-        if let Some((subdomain, claim)) = inner
-            .by_subdomain
+        if let Some((hostname, claim)) = inner
+            .by_hostname
             .iter()
             .find(|(_, claim)| claim.owner == owner)
         {
-            let requested_matches = requested
-                .as_ref()
-                .is_none_or(|requested| requested == subdomain);
-            if !requested_matches {
+            if requested != *hostname {
                 return Err(ClaimError::Conflict(Box::new(conflict(
-                    subdomain, claim, now,
+                    hostname, claim, now,
                 ))));
             }
 
-            let subdomain = subdomain.clone();
+            let hostname = hostname.clone();
             let replaced = match &claim.status {
                 ClaimStatus::Active { broker, .. } => Some(broker.clone()),
                 ClaimStatus::Disconnected { .. } => None,
             };
-            let lease = activate_locked(&mut inner, subdomain, owner, broker);
+            let lease = activate_locked(&mut inner, hostname, owner, broker);
             if let Some(replaced) = replaced {
                 replaced.replace();
             }
             return Ok(lease);
         }
 
-        let subdomain = match requested {
-            Some(subdomain) => {
-                if let Some(claim) = inner.by_subdomain.get(&subdomain) {
-                    return Err(ClaimError::Conflict(Box::new(conflict(
-                        &subdomain, claim, now,
-                    ))));
-                }
-                subdomain
-            }
-            None => generate_available_subdomain(&inner)?,
-        };
+        if let Some(claim) = inner.by_hostname.get(&requested) {
+            return Err(ClaimError::Conflict(Box::new(conflict(
+                &requested, claim, now,
+            ))));
+        }
 
-        Ok(activate_locked(&mut inner, subdomain, owner, broker))
+        Ok(activate_locked(&mut inner, requested, owner, broker))
     }
 
-    pub(crate) fn lookup(&self, subdomain: &Subdomain, now: Instant) -> ClaimLookup {
+    pub(crate) fn generated_candidate(
+        &self,
+        base_domain: &Hostname,
+        now: Instant,
+    ) -> Result<Hostname, ClaimError> {
         let mut inner = self.lock();
         expire_locked(&mut inner, now);
-        match inner.by_subdomain.get(subdomain) {
+        for _ in 0..GENERATED_CLAIM_ATTEMPTS {
+            let random = rand::rng().next_u64();
+            let value = format!("t{random:016x}.{base_domain}");
+            let Ok(hostname) = Hostname::parse(&value) else {
+                continue;
+            };
+            if !inner.by_hostname.contains_key(&hostname) {
+                return Ok(hostname);
+            }
+        }
+        Err(ClaimError::GenerationExhausted)
+    }
+
+    pub(crate) fn lookup(&self, hostname: &Hostname, now: Instant) -> ClaimLookup {
+        let mut inner = self.lock();
+        expire_locked(&mut inner, now);
+        match inner.by_hostname.get(hostname) {
             Some(Claim {
+                owner,
                 status: ClaimStatus::Active { broker, .. },
                 ..
-            }) if broker.is_available() => ClaimLookup::Active(broker.clone()),
+            }) if broker.is_available() => ClaimLookup::Active {
+                broker: broker.clone(),
+                owner: *owner,
+            },
             Some(Claim {
                 status: ClaimStatus::Active { .. } | ClaimStatus::Disconnected { .. },
                 ..
@@ -156,11 +180,27 @@ impl ClaimRegistry {
         }
     }
 
+    pub(crate) fn route_claim(&self, hostname: &Hostname, now: Instant) -> Option<RouteClaim> {
+        let mut inner = self.lock();
+        expire_locked(&mut inner, now);
+        let claim = inner.by_hostname.get(hostname)?;
+        Some(RouteClaim { owner: claim.owner })
+    }
+
+    pub(crate) fn has_routes_covered_by(&self, namespace: &Hostname, now: Instant) -> bool {
+        let mut inner = self.lock();
+        expire_locked(&mut inner, now);
+        inner
+            .by_hostname
+            .keys()
+            .any(|hostname| matches!(hostname.depth_below(namespace), Some(0 | 1)))
+    }
+
     /// Mark an unexpectedly lost control link as temporarily reclaimable.
     /// Returns the exact expiry deadline when this lease was still current.
     pub(crate) fn disconnect(&self, lease: &ClaimLease, now: Instant) -> Option<Instant> {
         let mut inner = self.lock();
-        let claim = inner.by_subdomain.get_mut(&lease.subdomain)?;
+        let claim = inner.by_hostname.get_mut(&lease.hostname)?;
         let current_lease = matches!(
             claim.status,
             ClaimStatus::Active { lease_id, .. } if lease_id == lease.lease_id
@@ -180,18 +220,15 @@ impl ClaimRegistry {
     /// Immediately release a cleanly closed, revoked, or shutting-down lease.
     pub(crate) fn release(&self, lease: &ClaimLease) -> bool {
         let mut inner = self.lock();
-        let current = inner
-            .by_subdomain
-            .get(&lease.subdomain)
-            .is_some_and(|claim| {
-                claim.owner == lease.owner
-                    && match claim.status {
-                        ClaimStatus::Active { lease_id, .. }
-                        | ClaimStatus::Disconnected { lease_id, .. } => lease_id == lease.lease_id,
-                    }
-            });
+        let current = inner.by_hostname.get(&lease.hostname).is_some_and(|claim| {
+            claim.owner == lease.owner
+                && match claim.status {
+                    ClaimStatus::Active { lease_id, .. }
+                    | ClaimStatus::Disconnected { lease_id, .. } => lease_id == lease.lease_id,
+                }
+        });
         if current {
-            inner.by_subdomain.remove(&lease.subdomain);
+            inner.by_hostname.remove(&lease.hostname);
         }
         current
     }
@@ -202,12 +239,12 @@ impl ClaimRegistry {
 
     pub(crate) fn shutdown_all(&self) {
         let mut inner = self.lock();
-        for claim in inner.by_subdomain.values() {
+        for claim in inner.by_hostname.values() {
             if let ClaimStatus::Active { broker, .. } = &claim.status {
                 broker.shutdown();
             }
         }
-        inner.by_subdomain.clear();
+        inner.by_hostname.clear();
     }
 
     fn lock(&self) -> MutexGuard<'_, ClaimsInner> {
@@ -218,13 +255,13 @@ impl ClaimRegistry {
     }
 }
 
-fn conflict(subdomain: &Subdomain, claim: &Claim, now: Instant) -> ClaimConflict {
+fn conflict(hostname: &Hostname, claim: &Claim, now: Instant) -> ClaimConflict {
     let (status, broker_available) = match &claim.status {
         ClaimStatus::Active { broker, .. } => (ClaimStatusKind::Active, broker.is_available()),
         ClaimStatus::Disconnected { .. } => (ClaimStatusKind::Disconnected, false),
     };
     ClaimConflict {
-        subdomain: subdomain.clone(),
+        hostname: hostname.clone(),
         owner: claim.owner,
         status,
         broker_available,
@@ -234,15 +271,15 @@ fn conflict(subdomain: &Subdomain, claim: &Claim, now: Instant) -> ClaimConflict
 
 fn activate_locked(
     inner: &mut ClaimsInner,
-    subdomain: Subdomain,
+    hostname: Hostname,
     owner: ClaimOwner,
     broker: StreamBroker,
 ) -> ClaimLease {
     inner.next_lease_id = inner.next_lease_id.wrapping_add(1).max(1);
     let lease_id = inner.next_lease_id;
     let liveness = broker.liveness();
-    inner.by_subdomain.insert(
-        subdomain.clone(),
+    inner.by_hostname.insert(
+        hostname.clone(),
         Claim {
             owner,
             liveness,
@@ -250,34 +287,19 @@ fn activate_locked(
         },
     );
     ClaimLease {
-        subdomain,
+        hostname,
         owner,
         lease_id,
     }
 }
 
 fn expire_locked(inner: &mut ClaimsInner, now: Instant) {
-    inner.by_subdomain.retain(|_, claim| {
+    inner.by_hostname.retain(|_, claim| {
         !matches!(
             claim.status,
             ClaimStatus::Disconnected { expires_at, .. } if expires_at <= now
         )
     });
-}
-
-fn generate_available_subdomain(inner: &ClaimsInner) -> Result<Subdomain, ClaimError> {
-    for _ in 0..GENERATED_CLAIM_ATTEMPTS {
-        let random = rand::rng().next_u64();
-        let value = format!("t{random:016x}");
-        let subdomain = match Subdomain::parse(&value) {
-            Ok(subdomain) => subdomain,
-            Err(_) => continue,
-        };
-        if !inner.by_subdomain.contains_key(&subdomain) {
-            return Ok(subdomain);
-        }
-    }
-    Err(ClaimError::GenerationExhausted)
 }
 
 #[cfg(test)]
@@ -293,6 +315,10 @@ mod tests {
         }
     }
 
+    fn hostname(value: &str) -> Hostname {
+        Hostname::parse(value).expect("valid test hostname")
+    }
+
     fn broker() -> StreamBroker {
         StreamBroker::channel().0
     }
@@ -301,23 +327,23 @@ mod tests {
     fn active_claim_conflicts_never_displace() {
         let registry = ClaimRegistry::default();
         let now = Instant::now();
-        let subdomain = Subdomain::parse("demo").expect("valid test subdomain");
+        let hostname = hostname("demo.example.test");
         let (active_broker, _active_requests) = StreamBroker::channel();
         let active_liveness = active_broker.liveness();
         active_liveness.set_client_version("0.0.3");
         active_liveness.record_heartbeat_ping();
         active_liveness.record_inbound(ControlInboundKind::Pong);
         let first = registry
-            .acquire(owner(1, 1), Some(subdomain.clone()), active_broker, now)
+            .acquire(owner(1, 1), hostname.clone(), active_broker, now)
             .expect("first claim");
 
         let conflict = registry
-            .acquire(owner(2, 2), Some(subdomain.clone()), broker(), now)
+            .acquire(owner(2, 2), hostname.clone(), broker(), now)
             .expect_err("different owner must conflict");
         let ClaimError::Conflict(conflict) = conflict else {
             panic!("expected a claim conflict");
         };
-        assert_eq!(conflict.subdomain, subdomain);
+        assert_eq!(conflict.hostname, hostname);
         assert_eq!(conflict.owner, owner(1, 1));
         assert_eq!(conflict.status, ClaimStatusKind::Active);
         assert!(conflict.broker_available);
@@ -329,8 +355,8 @@ mod tests {
             Some(ControlInboundKind::Pong)
         );
         assert!(matches!(
-            registry.lookup(&subdomain, now),
-            ClaimLookup::Active(_)
+            registry.lookup(&hostname, now),
+            ClaimLookup::Active { .. }
         ));
         assert_eq!(first.owner, owner(1, 1));
     }
@@ -339,27 +365,22 @@ mod tests {
     fn same_active_owner_atomically_replaces_its_old_lease() {
         let registry = ClaimRegistry::default();
         let now = Instant::now();
-        let subdomain = Subdomain::parse("demo").expect("valid test subdomain");
+        let hostname = hostname("demo.example.test");
         let claim_owner = owner(1, 1);
         let first = registry
-            .acquire(claim_owner, Some(subdomain.clone()), broker(), now)
+            .acquire(claim_owner, hostname.clone(), broker(), now)
             .expect("first claim");
 
         let (replacement_broker, _replacement_requests) = StreamBroker::channel();
         let replacement = registry
-            .acquire(
-                claim_owner,
-                Some(subdomain.clone()),
-                replacement_broker,
-                now,
-            )
+            .acquire(claim_owner, hostname.clone(), replacement_broker, now)
             .expect("same run reconnect replaces its active socket");
 
         assert_ne!(replacement.lease_id, first.lease_id);
         assert!(!registry.release(&first));
         assert!(matches!(
-            registry.lookup(&subdomain, now),
-            ClaimLookup::Active(_)
+            registry.lookup(&hostname, now),
+            ClaimLookup::Active { .. }
         ));
         assert!(registry.release(&replacement));
     }
@@ -368,10 +389,10 @@ mod tests {
     fn only_the_same_user_and_session_can_reclaim_during_grace() {
         let registry = ClaimRegistry::default();
         let now = Instant::now();
-        let subdomain = Subdomain::parse("demo").expect("valid test subdomain");
+        let hostname = hostname("demo.example.test");
         let claim_owner = owner(1, 1);
         let lease = registry
-            .acquire(claim_owner, Some(subdomain.clone()), broker(), now)
+            .acquire(claim_owner, hostname.clone(), broker(), now)
             .expect("initial claim");
         let deadline = registry
             .disconnect(&lease, now)
@@ -379,22 +400,27 @@ mod tests {
 
         assert_eq!(deadline, now + RECONNECT_GRACE);
         assert!(matches!(
-            registry.lookup(&subdomain, now + Duration::from_secs(29)),
+            registry.lookup(&hostname, now + Duration::from_secs(29)),
             ClaimLookup::Disconnected
         ));
         assert!(matches!(
             registry.acquire(
                 owner(1, 2),
-                Some(subdomain.clone()),
+                hostname.clone(),
                 broker(),
                 now + Duration::from_secs(29)
             ),
             Err(ClaimError::Conflict(_))
         ));
         let reclaimed = registry
-            .acquire(claim_owner, None, broker(), now + Duration::from_secs(29))
-            .expect("same run reclaims generated or chosen name");
-        assert_eq!(reclaimed.subdomain, subdomain);
+            .acquire(
+                claim_owner,
+                hostname.clone(),
+                broker(),
+                now + Duration::from_secs(29),
+            )
+            .expect("same run reclaims its chosen name");
+        assert_eq!(reclaimed.hostname, hostname);
         assert_ne!(reclaimed.lease_id, lease.lease_id);
     }
 
@@ -402,39 +428,52 @@ mod tests {
     fn grace_expires_at_exactly_thirty_seconds() {
         let registry = ClaimRegistry::default();
         let now = Instant::now();
-        let subdomain = Subdomain::parse("demo").expect("valid test subdomain");
+        let hostname = hostname("demo.example.test");
         let lease = registry
-            .acquire(owner(1, 1), Some(subdomain.clone()), broker(), now)
+            .acquire(owner(1, 1), hostname.clone(), broker(), now)
             .expect("initial claim");
         registry.disconnect(&lease, now).expect("disconnect");
 
         let replacement = registry
             .acquire(
                 owner(2, 2),
-                Some(subdomain.clone()),
+                hostname.clone(),
                 broker(),
                 now + RECONNECT_GRACE,
             )
             .expect("claim is free at the exact deadline");
-        assert_eq!(replacement.subdomain, subdomain);
+        assert_eq!(replacement.hostname, hostname);
+    }
+
+    #[test]
+    fn covered_route_checks_include_only_apex_and_direct_children() {
+        let registry = ClaimRegistry::default();
+        let now = Instant::now();
+        let deep = hostname("foo.edge.cloud.example.test");
+        registry
+            .acquire(owner(1, 1), deep, broker(), now)
+            .expect("route claim");
+
+        assert!(registry.has_routes_covered_by(&hostname("edge.cloud.example.test"), now));
+        assert!(!registry.has_routes_covered_by(&hostname("cloud.example.test"), now));
     }
 
     #[test]
     fn clean_release_is_immediate_and_stale_leases_are_harmless() {
         let registry = ClaimRegistry::default();
         let now = Instant::now();
-        let subdomain = Subdomain::parse("demo").expect("valid test subdomain");
+        let hostname = hostname("demo.example.test");
         let lease = registry
-            .acquire(owner(1, 1), Some(subdomain.clone()), broker(), now)
+            .acquire(owner(1, 1), hostname.clone(), broker(), now)
             .expect("initial claim");
         assert!(registry.release(&lease));
         assert!(matches!(
-            registry.lookup(&subdomain, now),
+            registry.lookup(&hostname, now),
             ClaimLookup::Unknown
         ));
 
         let replacement = registry
-            .acquire(owner(2, 2), Some(subdomain), broker(), now)
+            .acquire(owner(2, 2), hostname, broker(), now)
             .expect("immediate replacement");
         assert!(!registry.release(&lease));
         assert_eq!(replacement.owner, owner(2, 2));

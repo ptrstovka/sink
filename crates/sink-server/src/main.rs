@@ -1,10 +1,11 @@
-use std::{error::Error, future::pending, io, process::ExitCode, time::Duration};
+use std::{error::Error, future::pending, io, process::ExitCode, sync::Arc, time::Duration};
 
 use clap::Parser as _;
 use sink_server::{
     admin::{self, Cli, ServerCommand},
     config::ServeConfig,
     db::Database,
+    namespace_control::DeferredNamespaceCertificates,
     runtime::{self, RuntimeState},
 };
 use tokio::net::TcpListener;
@@ -43,7 +44,12 @@ async fn serve(arguments: sink_server::config::ServeArgs) -> Result<(), BoxError
     initialize_tracing(&config.log_level)?;
     let database = Database::open(&config.sqlite_path).await?;
     let listener = TcpListener::bind(config.listen_address).await?;
-    let state = RuntimeState::new(database.clone(), &config.public_base_domain)?;
+    let state = RuntimeState::with_namespace_control(
+        database.clone(),
+        &config.public_base_domain,
+        config.domains.clone(),
+        Arc::new(DeferredNamespaceCertificates),
+    )?;
 
     tracing::info!(
         listen_address = %config.listen_address,
