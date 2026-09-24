@@ -1,6 +1,10 @@
-# Merge these fields into the existing Traefik v3 install configuration.
+# Merge these fields into the existing Traefik v3 install configuration. The
+# dynamic Sink example uses v3 HostRegexp/HostSNIRegexp rule syntax.
 # Zero request/connection deadlines are intentional for unbounded uploads,
 # downloads, SSE, and WebSockets; enforce resource controls elsewhere.
+# The websecure entry point may also retain unrelated HTTP routers: Traefik
+# evaluates a matching Sink TCP/SNI router first and falls through to HTTP
+# routing for other domains.
 entryPoints:
   web:
     address: ":80"

@@ -1,12 +1,24 @@
 services:
   sink-server:
-    image: ghcr.io/ptrstovka/sink-server:${SINK_VERSION:-0.2.0}
+    image: ghcr.io/ptrstovka/sink-server:${SINK_VERSION:?set SINK_VERSION}
     restart: unless-stopped
     environment:
       SINK_SERVER_PUBLIC_BASE_DOMAIN: ${SINK_PUBLIC_BASE_DOMAIN:?set SINK_PUBLIC_BASE_DOMAIN}
+      SINK_SERVER_HTTP_LISTEN_ADDRESS: 0.0.0.0:8080
+      SINK_SERVER_HTTPS_LISTEN_ADDRESS: 0.0.0.0:8443
+      SINK_SERVER_MAX_NAMESPACE_DEPTH: ${SINK_MAX_NAMESPACE_DEPTH:-2}
+      SINK_SERVER_CERTIFICATE_PROVIDER: cloudflare
+      SINK_SERVER_CERTIFICATE_BACKEND_ENABLED: "true"
+      # Production is explicit because the sink-server default is Let's Encrypt staging.
+      SINK_SERVER_ACME_DIRECTORY_URL: https://acme-v02.api.letsencrypt.org/directory
+      SINK_SERVER_ACME_CONTACT: ${SINK_ACME_CONTACT:?set SINK_ACME_CONTACT to a mailto URI}
+      SINK_SERVER_ACME_TERMS_AGREED: "true"
+      SINK_SERVER_CLOUDFLARE_ZONE_ID: ${SINK_CLOUDFLARE_ZONE_ID:?set SINK_CLOUDFLARE_ZONE_ID}
+      SINK_SERVER_CLOUDFLARE_API_TOKEN: ${SINK_CLOUDFLARE_API_TOKEN:?set SINK_CLOUDFLARE_API_TOKEN}
       SINK_SERVER_LOG_LEVEL: ${SINK_LOG_LEVEL:-info}
     ports:
-      - "127.0.0.1:${SINK_HOST_PORT:-42424}:8080"
+      - "127.0.0.1:${SINK_HTTP_HOST_PORT:-42424}:8080"
+      - "127.0.0.1:${SINK_HTTPS_HOST_PORT:-42425}:8443"
     volumes:
       - sink-data:/data
     read_only: true

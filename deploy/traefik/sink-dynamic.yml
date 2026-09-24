@@ -1,56 +1,16 @@
 # Traefik v3 dynamic configuration. Replace every example.com occurrence.
-# The websecure entry point must already have a certificate covering
-# *.example.com; add example.com too if the apex HTTPS router is retained.
+# The regular expressions intentionally match every descendant depth. Sink's
+# namespace and certificate policy remains the authorization boundary.
 http:
   routers:
-    sink-connect-http:
+    sink-http:
       entryPoints: [web]
-      rule: 'Host(`connect.example.com`)'
-      priority: 200
-      middlewares: [sink-control-https]
-      service: sink-server
-
-    sink-connect-https:
-      entryPoints: [websecure]
-      rule: 'Host(`connect.example.com`)'
-      priority: 200
-      service: sink-server
-      tls: {}
-
-    sink-apex-http:
-      entryPoints: [web]
-      rule: 'Host(`example.com`)'
-      priority: 150
-      service: sink-server
-
-    sink-apex-https:
-      entryPoints: [websecure]
-      rule: 'Host(`example.com`)'
-      priority: 150
-      service: sink-server
-      tls: {}
-
-    sink-public-http:
-      entryPoints: [web]
-      rule: 'HostRegexp(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.example\.com$`)'
+      rule: 'Host(`example.com`) || HostRegexp(`^[a-z0-9-]+(\.[a-z0-9-]+)*\.example\.com$`)'
       priority: 100
-      service: sink-server
-
-    sink-public-https:
-      entryPoints: [websecure]
-      rule: 'HostRegexp(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.example\.com$`)'
-      priority: 100
-      service: sink-server
-      tls: {}
-
-  middlewares:
-    sink-control-https:
-      redirectScheme:
-        scheme: https
-        permanent: true
+      service: sink-http
 
   services:
-    sink-server:
+    sink-http:
       loadBalancer:
         passHostHeader: true
         serversTransport: sink-streaming
@@ -64,3 +24,19 @@ http:
         dialTimeout: 5s
         responseHeaderTimeout: 0s
         idleConnTimeout: 90s
+
+tcp:
+  routers:
+    sink-https:
+      entryPoints: [websecure]
+      rule: 'HostSNI(`example.com`) || HostSNIRegexp(`^[a-z0-9-]+(\.[a-z0-9-]+)*\.example\.com$`)'
+      priority: 100
+      service: sink-https
+      tls:
+        passthrough: true
+
+  services:
+    sink-https:
+      loadBalancer:
+        servers:
+          - address: 127.0.0.1:8443

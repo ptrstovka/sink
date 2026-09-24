@@ -4,6 +4,11 @@
 
 ```text
 sink http <target> [OPTIONS]
+sink connect --config <file>
+sink namespace claim <hostname> [OPTIONS]
+sink namespace list [OPTIONS]
+sink namespace status <hostname> [OPTIONS]
+sink namespace release <hostname> [OPTIONS]
 sink config add-authtoken TOKEN
 sink config add-server-addr SERVER
 sink update
@@ -50,6 +55,27 @@ available version on every interactive start. Service and noninteractive runs
 do not check. `SINK_NO_UPDATE_CHECK=1` disables only the startup check and
 notice; it does not disable `sink update`.
 
+### Persistent namespaces
+
+`sink namespace` uses the saved server address and token unless the command's
+`--server-addr` or `--authtoken` override is supplied. The subcommands are:
+
+- `claim HOSTNAME` creates a persistent namespace claim and waits for active
+  certificate-backed state for up to 300 seconds by default. `--no-wait`
+  returns after server acceptance; `--timeout SECONDS` accepts 1 through 3600
+  and conflicts with `--no-wait`.
+- `list` shows every namespace owned by the authenticated user.
+- `status HOSTNAME` shows one owned namespace and its current state.
+- `release HOSTNAME` begins release and is rejected while child claims or
+  active tunnel routes remain.
+
+A namespace certificate covers the claim apex plus one wildcard. Only the
+adjacent parent owner may create a nested claim, system names are reserved, and
+the configured server maximum bounds persistent namespace depth. Starting
+`sink http` or `sink connect` never triggers certificate issuance. Once a
+namespace is active, tunnel hosts directly below it are available over both
+plain HTTP and HTTPS without an automatic redirect.
+
 ## Server and release executables
 
 Release archives contain `sink` and `sink-server`. Server commands are
@@ -59,10 +85,40 @@ positional for every command except `list`.
 
 Server runtime settings use flags over environment values:
 
-- `--listen-address` / `SINK_SERVER_LISTEN_ADDRESS`
+- `--http-listen-address` / `SINK_SERVER_HTTP_LISTEN_ADDRESS`
+- `--https-listen-address` / `SINK_SERVER_HTTPS_LISTEN_ADDRESS`
 - `--public-base-domain` / `SINK_SERVER_PUBLIC_BASE_DOMAIN`
+- `--max-namespace-depth` / `SINK_SERVER_MAX_NAMESPACE_DEPTH`
+- `--certificate-provider` / `SINK_SERVER_CERTIFICATE_PROVIDER`
+- `--certificate-backend-enabled` /
+  `SINK_SERVER_CERTIFICATE_BACKEND_ENABLED`
+- `--acme-directory-url` / `SINK_SERVER_ACME_DIRECTORY_URL`
+- `--acme-contact` / `SINK_SERVER_ACME_CONTACT`
+- `--acme-terms-agreed` / `SINK_SERVER_ACME_TERMS_AGREED`
+- `--cloudflare-zone-id` / `SINK_SERVER_CLOUDFLARE_ZONE_ID`
 - `--sqlite-path` / `SINK_SERVER_SQLITE_PATH`
 - `--log-level` / `SINK_SERVER_LOG_LEVEL`
 
+`--listen-address` / `SINK_SERVER_LISTEN_ADDRESS` remains a compatibility alias
+for the HTTP listener. If both legacy and explicit HTTP values are supplied,
+they must agree. New deployments should configure the explicit HTTP and HTTPS
+settings.
+
+The HTTP listener defaults to `127.0.0.1:8080`. An HTTPS listener has no
+default: it is required when the certificate backend is enabled, rejected when
+the backend is disabled, and must differ from the HTTP address. The certificate
+backend is disabled by default. Its current provider default is `cloudflare`,
+the maximum namespace depth defaults to 2, and the safe ACME directory default
+is Let's Encrypt staging. Production must explicitly set
+`https://acme-v02.api.letsencrypt.org/directory`.
+
+`SINK_SERVER_CLOUDFLARE_API_TOKEN` is required in the environment when managed
+TLS is enabled and intentionally has no CLI flag, preventing exposure in the
+process list. Enabled managed TLS also requires a valid zone ID, a
+`mailto:` ACME contact, and explicit terms agreement.
+
 The public base domain and client server address have no defaults; configure
-both explicitly.
+both explicitly. With managed TLS enabled, `sink server ready` is emitted only
+after durable certificate reconciliation, a valid base certificate, dynamic
+SNI resolver loading, and namespace-boundary refresh. Neither listener accepts
+traffic before that readiness point, and no HTTP-to-HTTPS redirect is applied.
