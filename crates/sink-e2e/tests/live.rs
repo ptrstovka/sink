@@ -1,17 +1,21 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     error::Error,
     future::Future,
     io,
     net::SocketAddr,
     num::NonZeroUsize,
+    path::{Path as FsPath, PathBuf},
+    pin::Pin,
+    process::Stdio,
     str::FromStr as _,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -20,12 +24,12 @@ use axum::{
     extract::{Path, State, WebSocketUpgrade, ws::Message as AxumMessage},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
-        header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, FORWARDED, HOST},
+        header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, FORWARDED, HOST, LOCATION},
     },
     routing::{any, get, post},
 };
 use bytes::Bytes;
-use futures::{SinkExt as _, StreamExt as _, stream};
+use futures::{SinkExt as _, StreamExt as _, future::BoxFuture, stream};
 use http_body_util::BodyExt as _;
 use hyper::{body::Incoming, client::conn::http1};
 use hyper_util::rt::TokioIo;
@@ -39,11 +43,28 @@ use sink_client::{
     },
     target::{LocalTarget, PublicUrl},
 };
-use sink_server::{db::Database, runtime::RuntimeState};
+use sink_server::{
+    certificates::{
+        CertificateIndexReloader, CertificateMaterial, CertificateProviderKind, CertificateRecord,
+        CertificateState, CertificateStorage, CertificateTarget, Hostname, SecretBytes,
+        SqliteCertificateStorage, Timestamp,
+    },
+    config::{ConfiguredDomain, ConfiguredDomains},
+    db::Database,
+    namespace_control::{
+        NamespaceCertificateError, NamespaceCertificateProvisioner, NamespaceCertificateRequest,
+        NamespaceCertificateStatus,
+    },
+    runtime::{
+        DynamicTlsCertificateResolver, RuntimeSniAuthorization, RuntimeState, TlsListener,
+        build_tls_server_config, default_crypto_provider,
+    },
+};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf},
     net::{TcpListener, TcpStream},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Notify, oneshot, watch},
     task::JoinHandle,
     time::{sleep, timeout},
@@ -785,6 +806,391 @@ impl LiveStack {
     }
 }
 
+type TestTlsResolver =
+    DynamicTlsCertificateResolver<SqliteCertificateStorage, RuntimeSniAuthorization>;
+
+#[derive(Clone)]
+struct LocalCertificateProvisioner {
+    storage: Arc<SqliteCertificateStorage>,
+    certificate_directory: Arc<PathBuf>,
+    reloader: Arc<RwLock<Option<Arc<dyn CertificateIndexReloader>>>>,
+    pending: Arc<Mutex<HashSet<String>>>,
+    certificate_paths: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+impl LocalCertificateProvisioner {
+    fn new(
+        storage: Arc<SqliteCertificateStorage>,
+        certificate_directory: PathBuf,
+        base_hostname: &str,
+        base_certificate_path: PathBuf,
+    ) -> Self {
+        Self {
+            storage,
+            certificate_directory: Arc::new(certificate_directory),
+            reloader: Arc::new(RwLock::new(None)),
+            pending: Arc::new(Mutex::new(HashSet::new())),
+            certificate_paths: Arc::new(Mutex::new(HashMap::from([(
+                base_hostname.to_owned(),
+                base_certificate_path,
+            )]))),
+        }
+    }
+
+    fn attach_reloader(&self, reloader: Arc<dyn CertificateIndexReloader>) {
+        *self
+            .reloader
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reloader);
+    }
+
+    fn set_pending(&self, hostname: &str) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(hostname.to_owned());
+    }
+
+    fn certificate_for(&self, hostname: &str) -> TestResult<PathBuf> {
+        self.certificate_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(hostname)
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("no local certificate for {hostname}")).into())
+    }
+
+    fn reloader(&self) -> Result<Arc<dyn CertificateIndexReloader>, NamespaceCertificateError> {
+        self.reloader
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(NamespaceCertificateError)
+    }
+}
+
+impl NamespaceCertificateProvisioner for LocalCertificateProvisioner {
+    fn provision(
+        &self,
+        request: NamespaceCertificateRequest,
+    ) -> BoxFuture<'_, Result<NamespaceCertificateStatus, NamespaceCertificateError>> {
+        Box::pin(async move {
+            let target = CertificateTarget::namespace(request.hostname.clone());
+            let is_pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(request.hostname.as_str());
+            if is_pending {
+                self.storage
+                    .store_certificate(CertificateRecord::pending(
+                        target,
+                        request.provider,
+                        request.now,
+                    ))
+                    .await
+                    .map_err(|_| NamespaceCertificateError)?;
+                self.reloader()?
+                    .refresh(request.now)
+                    .await
+                    .map_err(|_| NamespaceCertificateError)?;
+                return Ok(NamespaceCertificateStatus::Pending);
+            }
+
+            let (material, certificate_path) = local_certificate(
+                self.certificate_directory.as_ref(),
+                request.hostname.as_str(),
+            )
+            .await
+            .map_err(|_| NamespaceCertificateError)?;
+            self.storage
+                .store_certificate(CertificateRecord::ready(
+                    target,
+                    request.provider,
+                    material,
+                    request.now,
+                ))
+                .await
+                .map_err(|_| NamespaceCertificateError)?;
+            self.certificate_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(request.hostname.to_string(), certificate_path);
+            self.reloader()?
+                .refresh(request.now)
+                .await
+                .map_err(|_| NamespaceCertificateError)?;
+            Ok(NamespaceCertificateStatus::Ready)
+        })
+    }
+
+    fn release(
+        &self,
+        hostname: Hostname,
+        provider: CertificateProviderKind,
+        now: Timestamp,
+    ) -> BoxFuture<'_, Result<(), NamespaceCertificateError>> {
+        Box::pin(async move {
+            let target = CertificateTarget::namespace(hostname.clone());
+            let retained = self
+                .storage
+                .load_certificate(&target)
+                .await
+                .map_err(|_| NamespaceCertificateError)?
+                .and_then(|certificate| match certificate.state {
+                    CertificateState::Ready(material) => Some(CertificateRecord::retained(
+                        target.clone(),
+                        provider,
+                        material,
+                        now,
+                    )),
+                    CertificateState::Pending
+                    | CertificateState::RetryScheduled { .. }
+                    | CertificateState::Failed
+                    | CertificateState::Retained(_) => None,
+                });
+            self.storage
+                .retire_order_cycle(target, provider, retained)
+                .await
+                .map_err(|_| NamespaceCertificateError)?;
+            self.reloader()?
+                .refresh(now)
+                .await
+                .map_err(|_| NamespaceCertificateError)?;
+            Ok(())
+        })
+    }
+}
+
+struct ManagedTlsServerHarness {
+    http_addr: SocketAddr,
+    https_addr: SocketAddr,
+    state: RuntimeState,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl ManagedTlsServerHarness {
+    async fn start(
+        database: Database,
+        storage: Arc<SqliteCertificateStorage>,
+        certificates: Arc<LocalCertificateProvisioner>,
+    ) -> TestResult<Self> {
+        let base_hostname = Hostname::parse(PUBLIC_BASE_DOMAIN)?;
+        let crypto_provider = default_crypto_provider();
+        let authorization = Arc::new(RuntimeSniAuthorization::new(base_hostname.clone()));
+        let resolver = Arc::new(TestTlsResolver::new(
+            storage,
+            authorization.clone(),
+            crypto_provider.clone(),
+        ));
+        certificates.attach_reloader(resolver.clone());
+        resolver.refresh(test_timestamp()).await?;
+
+        let domains = ConfiguredDomains::new(vec![ConfiguredDomain::new(
+            base_hostname,
+            2,
+            CertificateProviderKind::Cloudflare,
+        )?])?;
+        let state = RuntimeState::with_namespace_control(
+            database,
+            PUBLIC_BASE_DOMAIN,
+            domains,
+            certificates,
+        )?;
+        state.attach_sni_authorization(&authorization)?;
+        state.refresh_sni_namespace_boundaries().await?;
+
+        let tls_config = build_tls_server_config(resolver, crypto_provider)?;
+        let http_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let http_addr = http_listener.local_addr()?;
+        let https_socket = TcpListener::bind("127.0.0.1:0").await?;
+        let https_addr = https_socket.local_addr()?;
+        let https_listener = TlsListener::new(https_socket, tls_config);
+        let runtime_state = state.clone();
+        let (shutdown, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            sink_server::runtime::serve_http_and_https(
+                http_listener,
+                https_listener,
+                runtime_state,
+                async move {
+                    let _ = stopped.await;
+                },
+                Duration::from_secs(3),
+            )
+            .await
+        });
+        Ok(Self {
+            http_addr,
+            https_addr,
+            state,
+            shutdown: Some(shutdown),
+            task: Some(task),
+        })
+    }
+
+    async fn stop(mut self) -> TestResult<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let task = self
+            .task
+            .take()
+            .ok_or_else(|| io::Error::other("managed server task already consumed"))?;
+        bounded("managed server shutdown", task).await???;
+        Ok(())
+    }
+}
+
+impl Drop for ManagedTlsServerHarness {
+    fn drop(&mut self) {
+        self.state.initiate_shutdown();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+    }
+}
+
+struct ManagedTlsStack {
+    _temp: TempDir,
+    database: Database,
+    storage: Arc<SqliteCertificateStorage>,
+    certificates: Arc<LocalCertificateProvisioner>,
+    server: Option<ManagedTlsServerHarness>,
+}
+
+impl ManagedTlsStack {
+    async fn start() -> TestResult<Self> {
+        let temp = tempfile::tempdir()?;
+        let database_path = temp.path().join("sink.sqlite3");
+        let database = Database::open(&database_path).await?;
+        let storage = Arc::new(SqliteCertificateStorage::connect(&database_path).await?);
+        let certificate_directory = temp.path().join("certificates");
+        tokio::fs::create_dir(&certificate_directory).await?;
+        let base_hostname = Hostname::parse(PUBLIC_BASE_DOMAIN)?;
+        let (base_material, base_certificate_path) =
+            local_certificate(&certificate_directory, PUBLIC_BASE_DOMAIN).await?;
+        storage
+            .store_certificate(CertificateRecord::ready(
+                CertificateTarget::base_domain(base_hostname),
+                CertificateProviderKind::Cloudflare,
+                base_material,
+                test_timestamp(),
+            ))
+            .await?;
+        let certificates = Arc::new(LocalCertificateProvisioner::new(
+            storage.clone(),
+            certificate_directory,
+            PUBLIC_BASE_DOMAIN,
+            base_certificate_path,
+        ));
+        let server =
+            ManagedTlsServerHarness::start(database.clone(), storage.clone(), certificates.clone())
+                .await?;
+        Ok(Self {
+            _temp: temp,
+            database,
+            storage,
+            certificates,
+            server: Some(server),
+        })
+    }
+
+    fn server(&self) -> TestResult<&ManagedTlsServerHarness> {
+        self.server
+            .as_ref()
+            .ok_or_else(|| io::Error::other("managed server is not running").into())
+    }
+
+    async fn restart_server(&mut self) -> TestResult<()> {
+        let old = self
+            .server
+            .take()
+            .ok_or_else(|| io::Error::other("managed server is not running"))?;
+        old.stop().await?;
+        self.server = Some(
+            ManagedTlsServerHarness::start(
+                self.database.clone(),
+                self.storage.clone(),
+                self.certificates.clone(),
+            )
+            .await?,
+        );
+        Ok(())
+    }
+
+    async fn stop(mut self) -> TestResult<()> {
+        if let Some(server) = self.server.take() {
+            server.stop().await?;
+        }
+        self.storage.close().await;
+        self.database.close().await;
+        Ok(())
+    }
+}
+
+async fn local_certificate(
+    directory: &FsPath,
+    hostname: &str,
+) -> TestResult<(CertificateMaterial, PathBuf)> {
+    let stem = hostname.replace('.', "-");
+    let certificate_path = directory.join(format!("{stem}-certificate.pem"));
+    let private_key_path = directory.join(format!("{stem}-private-key.pem"));
+    let subject = format!("/CN={hostname}");
+    let alternative_names = format!("subjectAltName=DNS:{hostname},DNS:*.{hostname}");
+    let output = bounded(
+        "local certificate generation",
+        Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-nodes",
+                "-days",
+                "2",
+                "-subj",
+                &subject,
+                "-addext",
+                &alternative_names,
+                "-keyout",
+            ])
+            .arg(&private_key_path)
+            .arg("-out")
+            .arg(&certificate_path)
+            .output(),
+    )
+    .await??;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "openssl certificate generation failed with {}",
+            output.status
+        ))
+        .into());
+    }
+    let certificate_chain_pem = tokio::fs::read(&certificate_path).await?;
+    let private_key_pem = tokio::fs::read(&private_key_path).await?;
+    let material = CertificateMaterial {
+        certificate_chain_pem,
+        private_key_pem: SecretBytes::new(private_key_pem),
+        not_before: Timestamp::from_unix_seconds(0),
+        not_after: test_timestamp().saturating_add(Duration::from_secs(48 * 60 * 60)),
+    };
+    Ok((material, certificate_path))
+}
+
+fn test_timestamp() -> Timestamp {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    Timestamp::from_unix_seconds(seconds)
+}
+
 struct ClientHarness {
     handle: RuntimeHandle,
     task: Option<JoinHandle<Result<(), RuntimeError>>>,
@@ -831,6 +1237,51 @@ impl Drop for ClientHarness {
         if let Some(task) = self.task.as_ref() {
             task.abort();
         }
+    }
+}
+
+struct MultiConnectProcess {
+    child: Child,
+}
+
+impl MultiConnectProcess {
+    fn start(
+        config: &std::path::Path,
+        config_home: &std::path::Path,
+        token: &str,
+        server_addr: SocketAddr,
+    ) -> TestResult<Self> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_multi-connect-fixture"));
+        command
+            .env("SINK_E2E_CONNECT_CONFIG", config)
+            .env("SINK_E2E_AUTHTOKEN", token)
+            .env("SINK_E2E_SERVER_ADDR", format!("http://{server_addr}"))
+            .env("XDG_CONFIG_HOME", config_home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        Ok(Self {
+            child: command.spawn()?,
+        })
+    }
+
+    fn assert_running(&mut self) -> TestResult<()> {
+        if let Some(status) = self.child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "multi-connect process exited unexpectedly with {status}"
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn stop(mut self) -> TestResult<()> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill().await?;
+        }
+        let _ = bounded("multi-connect process exit", self.child.wait()).await??;
+        Ok(())
     }
 }
 
@@ -961,6 +1412,184 @@ async fn public_call(
     Ok((status, headers, body.to_bytes()))
 }
 
+struct OpenSslDuplex {
+    _child: Child,
+    reader: ChildStdout,
+    writer: ChildStdin,
+}
+
+impl AsyncRead for OpenSslDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.reader).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for OpenSslDuplex {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.writer).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.writer).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.writer).poll_shutdown(context)
+    }
+}
+
+fn public_tls_stream(
+    addr: SocketAddr,
+    sni: &str,
+    certificate_authority: &FsPath,
+) -> TestResult<OpenSslDuplex> {
+    let address = addr.to_string();
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-quiet",
+            "-verify_return_error",
+            "-verify_hostname",
+            sni,
+            "-servername",
+            sni,
+            "-connect",
+            &address,
+            "-CAfile",
+        ])
+        .arg(certificate_authority)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let reader = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("openssl stdout was not piped"))?;
+    let writer = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("openssl stdin was not piped"))?;
+    Ok(OpenSslDuplex {
+        _child: child,
+        reader,
+        writer,
+    })
+}
+
+async fn public_tls_send(
+    addr: SocketAddr,
+    sni: &str,
+    host: &str,
+    certificate_authority: &FsPath,
+    mut request: Request<Body>,
+) -> TestResult<Response<Incoming>> {
+    request
+        .headers_mut()
+        .insert(HOST, HeaderValue::from_str(host)?);
+    let stream = public_tls_stream(addr, sni, certificate_authority)?;
+    let (mut sender, connection) = bounded(
+        "public HTTPS handshake",
+        http1::handshake(TokioIo::new(stream)),
+    )
+    .await??;
+    tokio::spawn(async move {
+        let _ = connection.with_upgrades().await;
+    });
+    let response = bounded("public HTTPS response", sender.send_request(request)).await??;
+    Ok(response)
+}
+
+async fn public_tls_call(
+    addr: SocketAddr,
+    sni: &str,
+    host: &str,
+    certificate_authority: &FsPath,
+    method: Method,
+    path: &str,
+    body: Body,
+) -> TestResult<(StatusCode, HeaderMap, Bytes)> {
+    let request = Request::builder().method(method).uri(path).body(body)?;
+    let response = public_tls_send(addr, sni, host, certificate_authority, request).await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = bounded("public HTTPS response body", response.into_body().collect()).await??;
+    Ok((status, headers, body.to_bytes()))
+}
+
+async fn assert_tls_handshake_rejected(
+    addr: SocketAddr,
+    sni: &str,
+    certificate_authority: &FsPath,
+) -> TestResult<()> {
+    let mut stream = public_tls_stream(addr, sni, certificate_authority)?;
+    let request = format!("GET / HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n");
+    let result = timeout(Duration::from_secs(3), async {
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = [0_u8; 1];
+        stream.read(&mut response).await
+    })
+    .await;
+    match result {
+        Ok(Ok(0) | Err(_)) => Ok(()),
+        Ok(Ok(_)) => {
+            Err(io::Error::other(format!("TLS handshake unexpectedly succeeded for {sni}")).into())
+        }
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TLS rejection timed out for {sni}"),
+        )
+        .into()),
+    }
+}
+
+async fn claim_namespace(
+    addr: SocketAddr,
+    token: &str,
+    hostname: &str,
+) -> TestResult<(StatusCode, Bytes)> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let body = format!(r#"{{"hostname":"{hostname}"}}"#);
+    let (status, _, body) = public_call(
+        addr,
+        "127.0.0.1",
+        Method::POST,
+        sink_protocol::NAMESPACE_COLLECTION_PATH,
+        headers,
+        Body::from(body),
+    )
+    .await?;
+    Ok((status, body))
+}
+
+fn active_namespace(body: &[u8], hostname: &str, depth: u32) -> TestResult<()> {
+    let response = std::str::from_utf8(body)?;
+    assert!(response.contains(&format!(r#""hostname":"{hostname}""#)));
+    assert!(response.contains(&format!(r#""depth":{depth}"#)));
+    assert!(response.contains(r#""state":"active""#));
+    Ok(())
+}
+
 async fn wait_for_public_status(
     stage: &'static str,
     addr: SocketAddr,
@@ -991,6 +1620,42 @@ async fn wait_for_public_status_within(
             if result
                 .as_ref()
                 .is_ok_and(|(status, _, _)| *status == expected)
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .map_err(|_| -> TestError {
+        Box::new(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("timed out: {stage}"),
+        ))
+    })?
+}
+
+async fn wait_for_public_body(
+    stage: &'static str,
+    addr: SocketAddr,
+    hostname: &str,
+    path: &str,
+    expected: &Bytes,
+) -> TestResult<()> {
+    timeout(TEST_BOUND, async move {
+        loop {
+            let result = public_call(
+                addr,
+                hostname,
+                Method::GET,
+                path,
+                HeaderMap::new(),
+                Body::empty(),
+            )
+            .await;
+            if result
+                .as_ref()
+                .is_ok_and(|(status, _, body)| *status == StatusCode::OK && body == expected)
             {
                 return Ok(());
             }
@@ -1377,10 +2042,38 @@ async fn public_websocket(
     Ok(websocket)
 }
 
-async fn websocket_echo_progress(
-    websocket: &mut WebSocketStream<TcpStream>,
+async fn public_tls_websocket(
+    addr: SocketAddr,
+    hostname: &str,
+    certificate_authority: &FsPath,
+) -> TestResult<WebSocketStream<OpenSslDuplex>> {
+    let mut request = format!("wss://{hostname}/ws").into_client_request()?;
+    request
+        .headers_mut()
+        .insert(HOST, HeaderValue::from_str(hostname)?);
+    let stream = public_tls_stream(addr, hostname, certificate_authority)?;
+    let (websocket, response) = bounded(
+        "public HTTPS WebSocket upgrade",
+        client_async(request, stream),
+    )
+    .await??;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return Err(io::Error::other(format!(
+            "HTTPS WebSocket upgrade returned {}",
+            response.status()
+        ))
+        .into());
+    }
+    Ok(websocket)
+}
+
+async fn websocket_echo_progress<S>(
+    websocket: &mut WebSocketStream<S>,
     payload: Bytes,
-) -> TestResult<()> {
+) -> TestResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     timeout(HEALTH_LATENCY_BOUND, async {
         websocket.send(Message::Binary(payload.clone())).await?;
         let echoed = websocket
@@ -1554,12 +2247,12 @@ async fn generated_tunnel_preserves_and_streams_mixed_traffic() -> TestResult<()
     assert!(observed.contains(&format!("host={}", fixture.addr)));
     assert!(observed.contains("authorization=Visitor public-credential"));
     assert!(observed.contains(&format!(
-        "forwarded=for=203.0.113.9;host={};proto=https",
+        "forwarded=for=203.0.113.9;host={};proto=http",
         info.hostname
     )));
     assert!(observed.contains("x-forwarded-for=203.0.113.9"));
     assert!(observed.contains(&format!("x-forwarded-host={}", info.hostname)));
-    assert!(observed.contains("x-forwarded-proto=https"));
+    assert!(observed.contains("x-forwarded-proto=http"));
     assert!(observed.contains("x-e2e-request=preserved"));
     assert!(observed.ends_with("body=request-body"));
 
@@ -2438,6 +3131,365 @@ async fn clean_shutdown_releases_custom_claim_immediately() -> TestResult<()> {
 
     stack.stop().await?;
     fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_route_http_compatibility_serves_root_pool_http_and_https() -> TestResult<()> {
+    let payload = deterministic_payload(256 * 1024);
+    let fixture = FixtureHarness::start(FixtureState::new(&payload)).await?;
+    let stack = ManagedTlsStack::start().await?;
+    let issued = stack.database.create_user("managed-root-e2e").await?;
+    let token = issued.token.expose_secret().to_owned();
+    let server = stack.server()?;
+    let client = ClientHarness::start(client_runtime(
+        &token,
+        server.http_addr,
+        fixture.addr,
+        None,
+    )?);
+    let info = client.connected().await?;
+    assert_eq!(
+        Hostname::parse(&info.hostname)?.depth_below(&Hostname::parse(PUBLIC_BASE_DOMAIN)?),
+        Some(1),
+        "generated sink http route must stay in the root pool"
+    );
+
+    let (http_status, http_headers, http_body) = public_call(
+        server.http_addr,
+        &info.hostname,
+        Method::GET,
+        "/inspect/root-pool?transport=http",
+        HeaderMap::new(),
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(http_status, StatusCode::CREATED);
+    assert!(!http_status.is_redirection());
+    assert!(!http_headers.contains_key(LOCATION));
+    assert!(String::from_utf8(http_body.to_vec())?.contains("x-forwarded-proto=http"));
+
+    let base_certificate = stack.certificates.certificate_for(PUBLIC_BASE_DOMAIN)?;
+    let (https_status, https_headers, https_body) = public_tls_call(
+        server.https_addr,
+        &info.hostname,
+        &info.hostname,
+        &base_certificate,
+        Method::GET,
+        "/inspect/root-pool?transport=https",
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(https_status, StatusCode::CREATED);
+    assert!(!https_status.is_redirection());
+    assert!(!https_headers.contains_key(LOCATION));
+    assert!(String::from_utf8(https_body.to_vec())?.contains("x-forwarded-proto=https"));
+
+    let upload_chunks: Vec<Bytes> = payload
+        .chunks(8 * 1024)
+        .map(Bytes::copy_from_slice)
+        .collect();
+    let (upload_status, _, upload_body) = public_tls_call(
+        server.https_addr,
+        &info.hostname,
+        &info.hostname,
+        &base_certificate,
+        Method::PUT,
+        "/upload",
+        Body::from_stream(tokio_stream::iter(
+            upload_chunks.into_iter().map(Ok::<Bytes, Infallible>),
+        )),
+    )
+    .await?;
+    assert_eq!(upload_status, StatusCode::OK);
+    let upload_body = String::from_utf8(upload_body.to_vec())?;
+    assert!(upload_body.contains("bytes=262144"));
+    assert!(upload_body.contains(&format!("sha256={}", digest_hex(&Sha256::digest(&payload)))));
+
+    let (download_status, _, download) = public_tls_call(
+        server.https_addr,
+        &info.hostname,
+        &info.hostname,
+        &base_certificate,
+        Method::GET,
+        "/download",
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(download, payload);
+
+    let mut websocket =
+        public_tls_websocket(server.https_addr, &info.hostname, &base_certificate).await?;
+    websocket_echo_progress(&mut websocket, Bytes::from_static(b"https-full-duplex-one")).await?;
+    websocket_echo_progress(&mut websocket, Bytes::from_static(b"https-full-duplex-two")).await?;
+    bounded("HTTPS WebSocket close", websocket.close(None)).await??;
+
+    client.stop().await?;
+    stack.stop().await?;
+    fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_nested_namespace_owns_routing_and_most_specific_tls() -> TestResult<()> {
+    let payload = Bytes::from_static(b"nested-namespace-response");
+    let fixture = FixtureHarness::start(FixtureState::new(&payload)).await?;
+    let mut stack = ManagedTlsStack::start().await?;
+    let owner = stack.database.create_user("namespace-owner-e2e").await?;
+    let intruder = stack.database.create_user("namespace-intruder-e2e").await?;
+    let owner_token = owner.token.expose_secret().to_owned();
+    let intruder_token = intruder.token.expose_secret().to_owned();
+    let parent = "team.e2e.test";
+    let child = "edge.team.e2e.test";
+
+    let (status, body) = claim_namespace(stack.server()?.http_addr, &owner_token, parent).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    active_namespace(&body, parent, 1)?;
+
+    let (status, body) = claim_namespace(stack.server()?.http_addr, &intruder_token, child).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        std::str::from_utf8(&body)?.contains("parent_namespace_unavailable"),
+        "unexpected adjacent-parent rejection: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, body) = claim_namespace(stack.server()?.http_addr, &owner_token, child).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    active_namespace(&body, child, 2)?;
+
+    stack.restart_server().await?;
+    let server = stack.server()?;
+    let route = "api.edge.team.e2e.test";
+    let client = ClientHarness::start(client_runtime(
+        &owner_token,
+        server.http_addr,
+        fixture.addr,
+        Some(route),
+    )?);
+    assert_eq!(client.connected().await?.hostname, route);
+
+    let (http_status, _, http_body) = public_call(
+        server.http_addr,
+        route,
+        Method::GET,
+        "/download",
+        HeaderMap::new(),
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(http_status, StatusCode::OK);
+    assert_eq!(http_body, payload);
+
+    let child_certificate = stack.certificates.certificate_for(child)?;
+    let (https_status, _, https_body) = public_tls_call(
+        server.https_addr,
+        route,
+        route,
+        &child_certificate,
+        Method::GET,
+        "/download",
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(https_status, StatusCode::OK);
+    assert_eq!(https_body, payload);
+
+    let (mismatch_status, _, mismatch_body) = public_tls_call(
+        server.https_addr,
+        route,
+        "other.edge.team.e2e.test",
+        &child_certificate,
+        Method::GET,
+        "/download",
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(mismatch_status, StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(mismatch_body, "TLS SNI and HTTP Host do not match\n");
+
+    assert_tls_handshake_rejected(
+        server.https_addr,
+        "unused.edge.team.e2e.test",
+        &child_certificate,
+    )
+    .await?;
+
+    let mut unauthorized =
+        client_runtime(&intruder_token, server.http_addr, fixture.addr, Some(route))?;
+    let error = bounded(
+        "nested namespace route ownership rejection",
+        unauthorized.run_one_connection(),
+    )
+    .await?
+    .expect_err("an adjacent-parent outsider must not route inside the namespace");
+    assert!(matches!(
+        error,
+        RuntimeError::Rejected {
+            code: sink_protocol::RejectCode::InvalidSubdomain
+        }
+    ));
+    assert_eq!(error.disposition(), FailureDisposition::Permanent);
+
+    client.stop().await?;
+    stack.stop().await?;
+    fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_child_boundary_blocks_parent_wildcard_fallback() -> TestResult<()> {
+    let payload = Bytes::from_static(b"pending-boundary-route");
+    let fixture = FixtureHarness::start(FixtureState::new(&payload)).await?;
+    let stack = ManagedTlsStack::start().await?;
+    let issued = stack.database.create_user("pending-boundary-e2e").await?;
+    let token = issued.token.expose_secret().to_owned();
+    let parent = "pending.e2e.test";
+    let child = "api.pending.e2e.test";
+
+    let (status, body) = claim_namespace(stack.server()?.http_addr, &token, parent).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    active_namespace(&body, parent, 1)?;
+
+    let server = stack.server()?;
+    let client = ClientHarness::start(client_runtime(
+        &token,
+        server.http_addr,
+        fixture.addr,
+        Some(child),
+    )?);
+    assert_eq!(client.connected().await?.hostname, child);
+    let parent_certificate = stack.certificates.certificate_for(parent)?;
+    let (status, _, body) = public_tls_call(
+        server.https_addr,
+        child,
+        child,
+        &parent_certificate,
+        Method::GET,
+        "/download",
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
+
+    stack.certificates.set_pending(child);
+    let (status, body) = claim_namespace(server.http_addr, &token, child).await?;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(std::str::from_utf8(&body)?.contains(r#""state":"pending""#));
+
+    let (http_status, _, http_body) = public_call(
+        server.http_addr,
+        child,
+        Method::GET,
+        "/download",
+        HeaderMap::new(),
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(http_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(http_body, "tunnel unavailable\n");
+    assert_tls_handshake_rejected(server.https_addr, child, &parent_certificate).await?;
+
+    client.stop().await?;
+    stack.stop().await?;
+    fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_connect_route_failure_and_reconnect_preserve_healthy_sibling() -> TestResult<()> {
+    let healthy_payload = Bytes::from_static(b"healthy-route");
+    let incumbent_payload = Bytes::from_static(b"incumbent-route");
+    let recovered_payload = Bytes::from_static(b"recovered-route");
+    let healthy_fixture = FixtureHarness::start(FixtureState::new(&healthy_payload)).await?;
+    let incumbent_fixture = FixtureHarness::start(FixtureState::new(&incumbent_payload)).await?;
+    let recovered_fixture = FixtureHarness::start(FixtureState::new(&recovered_payload)).await?;
+    let stack = LiveStack::start().await?;
+    let issued = stack.database.create_user("multi-connect-live-e2e").await?;
+    let token = issued.token.expose_secret().to_owned();
+    let healthy_hostname = "healthy-multi.e2e.test";
+    let flaky_hostname = "flaky-multi.e2e.test";
+
+    let incumbent = ClientHarness::start(client_runtime(
+        &token,
+        stack.server.addr,
+        incumbent_fixture.addr,
+        Some(flaky_hostname),
+    )?);
+    assert_eq!(incumbent.connected().await?.hostname, flaky_hostname);
+
+    let process_files = tempfile::tempdir()?;
+    let config_path = process_files.path().join("routes.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[[routes]]
+name = "healthy"
+url = "https://{healthy_hostname}"
+target = "http://{}"
+inspect = false
+
+[[routes]]
+name = "flaky"
+url = "https://{flaky_hostname}"
+target = "http://{}"
+inspect = false
+"#,
+            healthy_fixture.addr, recovered_fixture.addr
+        ),
+    )?;
+    let mut process = MultiConnectProcess::start(
+        &config_path,
+        &process_files.path().join("config-home"),
+        &token,
+        stack.server.addr,
+    )?;
+
+    wait_for_public_body(
+        "healthy multi-connect sibling",
+        stack.server.addr,
+        healthy_hostname,
+        "/download",
+        &healthy_payload,
+    )
+    .await?;
+    wait_for_public_body(
+        "incumbent conflicting route",
+        stack.server.addr,
+        flaky_hostname,
+        "/download",
+        &incumbent_payload,
+    )
+    .await?;
+    process.assert_running()?;
+
+    incumbent.stop().await?;
+    wait_for_public_body(
+        "failed route independent retry",
+        stack.server.addr,
+        flaky_hostname,
+        "/download",
+        &recovered_payload,
+    )
+    .await?;
+    wait_for_public_body(
+        "healthy sibling after route recovery",
+        stack.server.addr,
+        healthy_hostname,
+        "/download",
+        &healthy_payload,
+    )
+    .await?;
+    process.assert_running()?;
+
+    process.stop().await?;
+    stack.stop().await?;
+    healthy_fixture.stop().await?;
+    incumbent_fixture.stop().await?;
+    recovered_fixture.stop().await?;
     Ok(())
 }
 
