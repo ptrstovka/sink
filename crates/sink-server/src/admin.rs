@@ -7,7 +7,10 @@ use thiserror::Error;
 
 use crate::{
     config::{ConfigError, DatabaseArgs, ServeArgs},
-    db::{Database, DbError, IssuedUser, UserStateChange, UserSummary},
+    db::{
+        Database, DbError, IssuedUser, IssuedUserToken, RevokedUserToken, UserStateChange,
+        UserSummary, UserTokenSummary,
+    },
 };
 
 #[derive(Parser, Debug)]
@@ -25,7 +28,7 @@ pub struct Cli {
 pub enum ServerCommand {
     /// Run the tunnel server.
     Serve(ServeArgs),
-    /// Manage users and one-time bearer tokens.
+    /// Manage users and server-issued bearer tokens.
     User(UserArgs),
     /// Print the Sink server version.
     Version,
@@ -46,8 +49,10 @@ pub enum UserCommand {
     Create(UsernameArgs),
     /// List users without token secrets or digests.
     List,
-    /// Issue a replacement token and revoke the previous token.
+    /// Rotate the compatibility `default` token.
     RotateToken(UsernameArgs),
+    /// Manage a user's named bearer tokens.
+    Token(UserTokenArgs),
     /// Revoke a user's ability to authenticate.
     Disable(UsernameArgs),
     /// Allow a disabled user to authenticate again.
@@ -57,6 +62,30 @@ pub enum UserCommand {
 #[derive(Args, Debug)]
 pub struct UsernameArgs {
     pub username: String,
+}
+
+#[derive(Args, Debug)]
+pub struct UserTokenArgs {
+    #[command(subcommand)]
+    pub command: UserTokenCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UserTokenCommand {
+    /// Create a named token and print its secret once.
+    Create(UserTokenNameArgs),
+    /// List safe metadata for a user's active tokens.
+    List(UsernameArgs),
+    /// Rotate a named token and print its replacement secret once.
+    Rotate(UserTokenNameArgs),
+    /// Permanently revoke a named token.
+    Revoke(UserTokenNameArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct UserTokenNameArgs {
+    pub username: String,
+    pub token_name: String,
 }
 
 /// Execute a parsed user command, including opening and migrating its selected
@@ -84,6 +113,29 @@ pub async fn execute_with_database(
             .rotate_token(&args.username)
             .await
             .map(AdminOutput::TokenRotated),
+        UserCommand::Token(args) => {
+            match args.command {
+                UserTokenCommand::Create(args) => database
+                    .create_user_token(&args.username, &args.token_name)
+                    .await
+                    .map(AdminOutput::NamedTokenCreated),
+                UserTokenCommand::List(args) => database
+                    .list_user_tokens(&args.username)
+                    .await
+                    .map(|tokens| AdminOutput::NamedTokens {
+                        username: args.username,
+                        tokens,
+                    }),
+                UserTokenCommand::Rotate(args) => database
+                    .rotate_user_token(&args.username, &args.token_name)
+                    .await
+                    .map(AdminOutput::NamedTokenRotated),
+                UserTokenCommand::Revoke(args) => database
+                    .revoke_user_token(&args.username, &args.token_name)
+                    .await
+                    .map(AdminOutput::NamedTokenRevoked),
+            }
+        }
         UserCommand::Disable(args) => database
             .disable_user(&args.username)
             .await
@@ -103,6 +155,13 @@ pub enum AdminOutput {
     Created(IssuedUser),
     Users(Vec<UserSummary>),
     TokenRotated(IssuedUser),
+    NamedTokenCreated(IssuedUserToken),
+    NamedTokens {
+        username: String,
+        tokens: Vec<UserTokenSummary>,
+    },
+    NamedTokenRotated(IssuedUserToken),
+    NamedTokenRevoked(RevokedUserToken),
     Disabled(UserStateChange),
     Enabled(UserStateChange),
 }
@@ -126,6 +185,41 @@ impl AdminOutput {
                 writeln!(writer, "token: {}", issued.token.expose_secret())?;
                 writeln!(writer, "save this token now; it cannot be retrieved later")
             }
+            Self::NamedTokenCreated(issued) => {
+                writeln!(
+                    writer,
+                    "created token `{}` for user `{}` (generation {})",
+                    issued.details.name, issued.user.username, issued.details.generation
+                )?;
+                writeln!(writer, "token: {}", issued.token.expose_secret())?;
+                writeln!(writer, "save this token now; it cannot be retrieved later")
+            }
+            Self::NamedTokenRotated(issued) => {
+                writeln!(
+                    writer,
+                    "rotated token `{}` for user `{}` (generation {})",
+                    issued.details.name, issued.user.username, issued.details.generation
+                )?;
+                writeln!(writer, "token: {}", issued.token.expose_secret())?;
+                writeln!(writer, "save this token now; it cannot be retrieved later")
+            }
+            Self::NamedTokens { username, tokens } => {
+                writeln!(writer, "tokens for user `{username}`")?;
+                writeln!(writer, "NAME\tGENERATION\tCREATED\tUPDATED")?;
+                for token in tokens {
+                    writeln!(
+                        writer,
+                        "{}\t{}\t{}\t{}",
+                        token.name, token.generation, token.created_at, token.updated_at
+                    )?;
+                }
+                Ok(())
+            }
+            Self::NamedTokenRevoked(revoked) => writeln!(
+                writer,
+                "revoked token `{}` for user `{}`",
+                revoked.token.name, revoked.user.username
+            ),
             Self::Users(users) => {
                 writeln!(writer, "USERNAME\tSTATE\tTOKEN GENERATION")?;
                 for user in users {
@@ -217,6 +311,36 @@ mod tests {
             })
         ));
 
+        for command in ["create", "rotate", "revoke"] {
+            let parsed = Cli::try_parse_from([
+                "sink-server",
+                "user",
+                "token",
+                command,
+                "alice",
+                "cloud",
+                "--sqlite-path",
+                "admin.sqlite3",
+            ])?;
+            let ServerCommand::User(user) = parsed.command else {
+                return Err("expected user token command".into());
+            };
+            assert_eq!(
+                user.database.sqlite_path,
+                Some(PathBuf::from("admin.sqlite3"))
+            );
+        }
+        let token_list = Cli::try_parse_from(["sink-server", "user", "token", "list", "alice"])?;
+        assert!(matches!(
+            token_list.command,
+            ServerCommand::User(UserArgs {
+                command: UserCommand::Token(UserTokenArgs {
+                    command: UserTokenCommand::List(_),
+                }),
+                ..
+            })
+        ));
+
         let version = Cli::try_parse_from(["sink-server", "version"])?;
         assert!(matches!(version.command, ServerCommand::Version));
         Ok(())
@@ -236,6 +360,61 @@ mod tests {
 
         assert!(rendered.contains("alice\tdisabled\t1"));
         assert!(!rendered.contains(created.token.expose_secret()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_token_admin_lifecycle_reveals_only_new_secrets() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("admin.sqlite3")).await?;
+        database.create_user("alice").await?;
+
+        let created = execute_with_database(
+            &database,
+            UserCommand::Token(UserTokenArgs {
+                command: UserTokenCommand::Create(UserTokenNameArgs {
+                    username: "alice".to_owned(),
+                    token_name: "cloud".to_owned(),
+                }),
+            }),
+        )
+        .await?;
+        let AdminOutput::NamedTokenCreated(created_token) = &created else {
+            return Err("expected named token creation output".into());
+        };
+        let secret = created_token.token.expose_secret().to_owned();
+        let mut rendered = Vec::new();
+        created.write_terminal(&mut rendered)?;
+        assert!(String::from_utf8(rendered)?.contains(&secret));
+
+        let listing = execute_with_database(
+            &database,
+            UserCommand::Token(UserTokenArgs {
+                command: UserTokenCommand::List(UsernameArgs {
+                    username: "alice".to_owned(),
+                }),
+            }),
+        )
+        .await?;
+        let mut rendered = Vec::new();
+        listing.write_terminal(&mut rendered)?;
+        let rendered = String::from_utf8(rendered)?;
+        assert!(rendered.contains("cloud\t1"));
+        assert!(!rendered.contains(&secret));
+
+        let revoked = execute_with_database(
+            &database,
+            UserCommand::Token(UserTokenArgs {
+                command: UserTokenCommand::Revoke(UserTokenNameArgs {
+                    username: "alice".to_owned(),
+                    token_name: "cloud".to_owned(),
+                }),
+            }),
+        )
+        .await?;
+        let mut rendered = Vec::new();
+        revoked.write_terminal(&mut rendered)?;
+        assert!(!String::from_utf8(rendered)?.contains(&secret));
         Ok(())
     }
 }
