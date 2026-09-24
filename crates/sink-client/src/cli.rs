@@ -32,12 +32,124 @@ pub enum SinkCommand {
     Http(Box<HttpArgs>),
     /// Expose multiple independently supervised HTTP or HTTPS services.
     Connect(Box<ConnectArgs>),
+    /// Manage persistent hostname namespaces.
+    Namespace(NamespaceArgs),
     /// Save client configuration.
     Config(ConfigArgs),
     /// Update the Sink client to the latest stable release.
     Update,
     /// Print the Sink client version.
     Version,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct NamespaceArgs {
+    #[command(subcommand)]
+    pub command: NamespaceCommand,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum NamespaceCommand {
+    /// Claim a persistent hostname namespace.
+    Claim(NamespaceClaimArgs),
+    /// List all namespaces owned by the authenticated user.
+    List(NamespaceListArgs),
+    /// Show the current state of one owned namespace.
+    Status(NamespaceStatusArgs),
+    /// Release a namespace that has no child claims or active routes.
+    Release(NamespaceReleaseArgs),
+}
+
+impl NamespaceCommand {
+    #[must_use]
+    pub fn control(&self) -> &NamespaceControlArgs {
+        match self {
+            Self::Claim(arguments) => &arguments.control,
+            Self::List(arguments) => &arguments.control,
+            Self::Status(arguments) => &arguments.control,
+            Self::Release(arguments) => &arguments.control,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct NamespaceClaimArgs {
+    /// Fully qualified hostname to claim.
+    #[arg(value_name = "HOSTNAME")]
+    pub hostname: String,
+
+    /// Return after the server accepts the claim instead of waiting for it to become active.
+    #[arg(long)]
+    pub no_wait: bool,
+
+    /// Maximum number of seconds to wait for the namespace to become active.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..=3600),
+        conflicts_with = "no_wait"
+    )]
+    pub timeout: u64,
+
+    #[command(flatten)]
+    pub control: NamespaceControlArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct NamespaceListArgs {
+    #[command(flatten)]
+    pub control: NamespaceControlArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct NamespaceStatusArgs {
+    /// Fully qualified hostname to inspect.
+    #[arg(value_name = "HOSTNAME")]
+    pub hostname: String,
+
+    #[command(flatten)]
+    pub control: NamespaceControlArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct NamespaceReleaseArgs {
+    /// Fully qualified hostname to release.
+    #[arg(value_name = "HOSTNAME")]
+    pub hostname: String,
+
+    #[command(flatten)]
+    pub control: NamespaceControlArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct NamespaceControlArgs {
+    /// Use an authentication token for this run without saving it.
+    #[arg(long, value_name = "TOKEN")]
+    pub authtoken: Option<AuthToken>,
+
+    /// Use a control-server origin for this run without saving it.
+    #[arg(long, value_name = "SERVER")]
+    pub server_addr: Option<ControlServerAddr>,
+
+    /// Permit an http:// control server for this run (local development only).
+    #[arg(long)]
+    pub allow_plaintext_control: bool,
+}
+
+impl NamespaceControlArgs {
+    #[must_use]
+    pub fn run_overrides(&self) -> RunOverrides {
+        RunOverrides {
+            authtoken: self.authtoken.clone(),
+            server_addr: self.server_addr.clone(),
+            allow_plaintext_control: self.allow_plaintext_control,
+        }
+    }
+
+    pub fn resolve_config(&self, saved: &SavedConfig) -> Result<ResolvedConfig, ConfigError> {
+        saved.resolve(self.run_overrides())
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -346,6 +458,95 @@ mod tests {
     }
 
     #[test]
+    fn parses_namespace_commands_and_run_overrides() -> Result<(), Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from([
+            "sink",
+            "namespace",
+            "claim",
+            "cloud.example.test",
+            "--no-wait",
+            "--authtoken",
+            "one-run-secret",
+            "--server-addr",
+            "http://127.0.0.1:8080",
+            "--allow-plaintext-control",
+        ])?;
+        let SinkCommand::Namespace(NamespaceArgs {
+            command: NamespaceCommand::Claim(arguments),
+        }) = cli.command
+        else {
+            return Err("expected namespace claim command".into());
+        };
+        assert_eq!(arguments.hostname, "cloud.example.test");
+        assert!(arguments.no_wait);
+        assert_eq!(arguments.timeout, 300);
+        assert_eq!(
+            arguments
+                .control
+                .authtoken
+                .as_ref()
+                .map(AuthToken::expose_secret),
+            Some("one-run-secret")
+        );
+        assert_eq!(
+            arguments
+                .control
+                .server_addr
+                .map(|server| server.to_string()),
+            Some("http://127.0.0.1:8080/".to_owned())
+        );
+        assert!(arguments.control.allow_plaintext_control);
+
+        for arguments in [
+            vec!["sink", "namespace", "list"],
+            vec!["sink", "namespace", "status", "cloud.example.test"],
+            vec!["sink", "namespace", "release", "cloud.example.test"],
+        ] {
+            let cli = Cli::try_parse_from(arguments)?;
+            assert!(matches!(cli.command, SinkCommand::Namespace(_)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_claim_timeout_is_positive_and_conflicts_with_no_wait() {
+        assert!(
+            Cli::try_parse_from([
+                "sink",
+                "namespace",
+                "claim",
+                "cloud.example.test",
+                "--timeout",
+                "0",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sink",
+                "namespace",
+                "claim",
+                "cloud.example.test",
+                "--timeout",
+                "3601",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sink",
+                "namespace",
+                "claim",
+                "cloud.example.test",
+                "--timeout",
+                "5",
+                "--no-wait",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn inspection_settings_use_approved_defaults() -> Result<(), Box<dyn std::error::Error>> {
         let cli = Cli::try_parse_from(["sink", "http", "3000"])?;
         let SinkCommand::Http(args) = cli.command else {
@@ -420,6 +621,14 @@ mod tests {
                 "connect",
                 "--config",
                 "routes.toml",
+                "--authtoken",
+                "debug-secret",
+            ],
+            vec![
+                "sink",
+                "namespace",
+                "claim",
+                "cloud.example.test",
                 "--authtoken",
                 "debug-secret",
             ],

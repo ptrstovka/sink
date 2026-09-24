@@ -7,6 +7,7 @@ pub mod curl;
 pub mod dashboard;
 pub mod inspection;
 pub mod multi_connect;
+pub mod namespace;
 pub mod replay;
 pub mod runtime;
 pub mod target;

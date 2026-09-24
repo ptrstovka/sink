@@ -8,7 +8,7 @@ use std::{
 
 use clap::Parser as _;
 use sink_client::{
-    cli::{Cli, ConfigField, SinkCommand},
+    cli::{Cli, ConfigField, NamespaceArgs, SinkCommand},
     config::ConfigStore,
     dashboard::{DashboardPort, DashboardService, production_assets},
     runtime::{RequestSummary, TunnelPhase, TunnelRuntime},
@@ -57,6 +57,7 @@ async fn run() -> Result<(), BoxError> {
         SinkCommand::Connect(arguments) => sink_client::multi_connect::run(*arguments)
             .await
             .map_err(Into::into),
+        SinkCommand::Namespace(arguments) => run_namespace(arguments).await,
         SinkCommand::Update => {
             match install_latest().await? {
                 UpdateResult::UpToDate { version } => {
@@ -76,6 +77,21 @@ async fn run() -> Result<(), BoxError> {
             Ok(())
         }
     }
+}
+
+async fn run_namespace(arguments: NamespaceArgs) -> Result<(), BoxError> {
+    let cancellation = CancellationToken::new();
+    let operation = sink_client::namespace::run(arguments, cancellation.clone());
+    tokio::pin!(operation);
+    let output = tokio::select! {
+        result = &mut operation => result,
+        () = termination_signal() => {
+            cancellation.cancel();
+            operation.await
+        }
+    }?;
+    output.write_to(&mut io::stdout())?;
+    Ok(())
 }
 
 async fn run_tunnel(
