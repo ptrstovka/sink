@@ -22,8 +22,12 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-rustls = { version = "0.27", features = ["http1", "native-tokio"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "tokio"] }
+instant-acme = { version = "=0.8.5", features = ["rcgen"] }
 rand = "0.9"
+rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rustls = "0.23"
+rustls-pemfile = "2"
 secrecy = "0.10"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
@@ -46,6 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 yamux = "0.13"
+x509-parser = "0.18"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [workspace.lints.rust]

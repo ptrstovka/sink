@@ -79,6 +79,10 @@ impl ProviderError {
 pub trait CertificateProvider: Send + Sync {
     fn kind(&self) -> CertificateProviderKind;
 
+    /// Non-secret durable account realm, normally the validated ACME directory
+    /// URL. Accounts from different realms must never be interchanged.
+    fn account_scope(&self) -> &str;
+
     fn provision_account<'a>(
         &'a self,
         persisted: Option<&'a AccountRecord>,

@@ -47,6 +47,16 @@ where
         }
     }
 
+    /// Reconcile orders that were executing when the previous process stopped.
+    /// Call this once during backend startup before accepting provisioning
+    /// work; the storage operation is transactional and idempotent.
+    pub async fn reconcile_after_restart(&self, now: Timestamp) -> Result<u64, ManagerError> {
+        self.storage
+            .reconcile_in_progress(self.policy.limits().retry(), now)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn provision(
         &self,
         request: IssuanceRequest,
@@ -102,17 +112,18 @@ where
             _ => OrderRecord::queued(request.clone(), now),
         };
         order.start(now);
-        self.storage.store_order(order.clone()).await?;
-
-        if certificate
+        let pending = if certificate
             .as_ref()
             .and_then(|record| record.active_material(now))
             .is_none()
         {
             let pending = CertificateRecord::pending(request.target.clone(), request.provider, now);
-            self.storage.store_certificate(pending.clone()).await?;
-            certificate = Some(pending);
-        }
+            certificate = Some(pending.clone());
+            Some(pending)
+        } else {
+            None
+        };
+        self.storage.store_lifecycle(order.clone(), pending).await?;
         drop(admission_guard);
 
         let result = self.issue(&request).await;
@@ -135,9 +146,10 @@ where
 
                 let ready =
                     CertificateRecord::ready(request.target, request.provider, material, now);
-                self.storage.store_certificate(ready.clone()).await?;
                 order.succeed(now);
-                self.storage.store_order(order).await?;
+                self.storage
+                    .store_lifecycle(order, Some(ready.clone()))
+                    .await?;
                 Ok(ProvisionOutcome::Issued(ready))
             }
             Err(error) => {
@@ -155,7 +167,7 @@ where
     ) -> Result<super::CertificateMaterial, ProviderError> {
         let persisted = self
             .storage
-            .load_account(request.provider)
+            .load_account(request.provider, self.provider.account_scope())
             .await
             .map_err(|error| {
                 ProviderError::retryable(format!("account storage unavailable: {error}"))
@@ -191,14 +203,12 @@ where
                         .limits()
                         .retry()
                         .schedule_retry(order, error.message, now);
-                self.storage.store_order(order.clone()).await?;
-
-                if existing_certificate
+                let certificate = if existing_certificate
                     .as_ref()
                     .and_then(|record| record.active_material(now))
                     .is_none()
                 {
-                    let retrying = CertificateRecord {
+                    Some(CertificateRecord {
                         target: order.request.target.clone(),
                         provider: order.request.provider,
                         state: CertificateState::RetryScheduled {
@@ -206,28 +216,34 @@ where
                             cooldown_until: order.cooldown_until,
                         },
                         updated_at: now,
-                    };
-                    self.storage.store_certificate(retrying).await?;
-                }
+                    })
+                } else {
+                    None
+                };
+                self.storage
+                    .store_lifecycle(order.clone(), certificate)
+                    .await?;
                 Ok(ProvisionOutcome::RetryScheduled { retry_at })
             }
             ProviderErrorKind::Permanent => {
                 order.fail_permanently(error.message, now);
-                self.storage.store_order(order.clone()).await?;
-                if existing_certificate
+                let certificate = if existing_certificate
                     .as_ref()
                     .and_then(|record| record.active_material(now))
                     .is_none()
                 {
-                    self.storage
-                        .store_certificate(CertificateRecord {
-                            target: order.request.target.clone(),
-                            provider: order.request.provider,
-                            state: CertificateState::Failed,
-                            updated_at: now,
-                        })
-                        .await?;
-                }
+                    Some(CertificateRecord {
+                        target: order.request.target.clone(),
+                        provider: order.request.provider,
+                        state: CertificateState::Failed,
+                        updated_at: now,
+                    })
+                } else {
+                    None
+                };
+                self.storage
+                    .store_lifecycle(order.clone(), certificate)
+                    .await?;
                 Ok(ProvisionOutcome::PermanentlyFailed)
             }
         }
@@ -396,5 +412,51 @@ mod tests {
                 .map(|record| record.state),
             Some(CertificateState::Ready(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_releases_deduplication_after_backoff() {
+        let provider = Arc::new(FakeCertificateProvider::succeeding(material()));
+        let storage = Arc::new(FakeCertificateStorage::default());
+        let now = Timestamp::from_unix_seconds(1_000);
+        let mut interrupted = OrderRecord::queued(request(), now);
+        interrupted.start(now);
+        storage.insert_order(interrupted);
+        storage.insert_certificate(CertificateRecord::pending(
+            request().target,
+            CertificateProviderKind::Cloudflare,
+            now,
+        ));
+        let manager =
+            CertificateManager::new(provider.clone(), storage.clone(), IssuancePolicy::default());
+
+        assert_eq!(
+            manager
+                .reconcile_after_restart(now)
+                .await
+                .expect("reconcile interrupted order"),
+            1
+        );
+        assert_eq!(
+            manager
+                .provision(request(), QuotaSnapshot::default(), now)
+                .await
+                .expect("retry is delayed"),
+            ProvisionOutcome::RetryNotDue {
+                retry_at: Timestamp::from_unix_seconds(1_060)
+            }
+        );
+        assert!(matches!(
+            manager
+                .provision(
+                    request(),
+                    QuotaSnapshot::default(),
+                    Timestamp::from_unix_seconds(1_060),
+                )
+                .await
+                .expect("retry starts when due"),
+            ProvisionOutcome::Issued(_)
+        ));
+        assert_eq!(provider.issue_count(), 1);
     }
 }

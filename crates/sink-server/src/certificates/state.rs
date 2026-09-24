@@ -23,8 +23,8 @@ impl Timestamp {
     }
 }
 
-/// Secret account or key material. Debug output is always redacted and the
-/// allocation is zeroed when dropped.
+/// Secret account, challenge, credential, or key material. Debug output is
+/// always redacted and the allocation is zeroed when dropped.
 #[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct SecretBytes(Vec<u8>);
 
@@ -49,6 +49,8 @@ impl fmt::Debug for SecretBytes {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountRecord {
     pub provider: CertificateProviderKind,
+    /// Stable non-secret discriminator for the ACME directory/account realm.
+    pub account_scope: String,
     pub external_account_id: String,
     pub private_state: SecretBytes,
 }
@@ -286,5 +288,26 @@ mod tests {
 
         assert_eq!(rendered, "SecretBytes([REDACTED])");
         assert!(!rendered.contains("never-print-this"));
+    }
+
+    #[test]
+    fn nested_secret_bearing_records_keep_debug_output_redacted() {
+        let account = AccountRecord {
+            provider: CertificateProviderKind::Cloudflare,
+            account_scope: "https://acme.example/directory".to_owned(),
+            external_account_id: "account-1".to_owned(),
+            private_state: SecretBytes::new(b"acme-account-private-key".to_vec()),
+        };
+        let material = CertificateMaterial {
+            certificate_chain_pem: b"public-chain".to_vec(),
+            private_key_pem: SecretBytes::new(b"certificate-private-key".to_vec()),
+            not_before: Timestamp::from_unix_seconds(1),
+            not_after: Timestamp::from_unix_seconds(2),
+        };
+
+        let rendered = format!("{account:?} {material:?}");
+        assert!(!rendered.contains("acme-account-private-key"));
+        assert!(!rendered.contains("certificate-private-key"));
+        assert!(rendered.contains("[REDACTED]"));
     }
 }
