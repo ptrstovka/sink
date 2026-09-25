@@ -11,9 +11,11 @@ use crate::db::AuthenticatedUser;
 
 use super::{
     AUTHENTICATION_CHECK_INTERVAL, RuntimeState,
-    admission::{RouteAdmissionError, authorize_hostname_locked},
+    admission::{
+        RouteAdmissionError, authorize_hostname_locked, authorize_passthrough_namespace_locked,
+    },
     broker::{DriverExit, StreamBroker, drive_yamux},
-    claims::{ClaimError, ClaimLease, ClaimOwner, RECONNECT_GRACE},
+    claims::{ClaimError, ClaimLease, ClaimOwner, RECONNECT_GRACE, RouteTarget},
     host::requested_hostname,
     websocket::AxumMessageAdapter,
 };
@@ -68,43 +70,45 @@ pub(crate) async fn run_control_socket(
     };
     let lease = {
         let _admission = state.admission_gate.lock().await;
-        let hostname = match requested.clone() {
-            Some(hostname) => match authorize_hostname_locked(&state, user.id, &hostname).await {
-                Ok(()) => hostname,
-                Err(RouteAdmissionError::NotReady) => {
-                    send_rejection(
-                        &mut socket,
-                        SessionRejected::transient(
-                            RejectCode::ServerUnavailable,
-                            "requested namespace is not active",
-                        ),
-                    )
-                    .await;
-                    return;
+        let target = match requested.clone() {
+            Some(hostname) => {
+                match authorize_requested_target_locked(&state, user.id, hostname).await {
+                    Ok(target) => target,
+                    Err(RouteAdmissionError::NotReady) => {
+                        send_rejection(
+                            &mut socket,
+                            SessionRejected::transient(
+                                RejectCode::ServerUnavailable,
+                                "requested namespace is not active",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(RouteAdmissionError::Unauthorized) => {
+                        send_rejection(
+                            &mut socket,
+                            SessionRejected::permanent(
+                                RejectCode::InvalidSubdomain,
+                                "requested hostname is not authorized",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(RouteAdmissionError::Unavailable) => {
+                        send_rejection(
+                            &mut socket,
+                            SessionRejected::transient(
+                                RejectCode::ServerUnavailable,
+                                "server could not authorize the requested hostname",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
                 }
-                Err(RouteAdmissionError::Unauthorized) => {
-                    send_rejection(
-                        &mut socket,
-                        SessionRejected::permanent(
-                            RejectCode::InvalidSubdomain,
-                            "requested hostname is not authorized",
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-                Err(RouteAdmissionError::Unavailable) => {
-                    send_rejection(
-                        &mut socket,
-                        SessionRejected::transient(
-                            RejectCode::ServerUnavailable,
-                            "server could not authorize the requested hostname",
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            },
+            }
             None => {
                 let base_domain =
                     match crate::certificates::Hostname::parse(&state.public_base_domain) {
@@ -161,12 +165,21 @@ pub(crate) async fn run_control_socket(
                     .await;
                     return;
                 };
-                selected
+                RouteTarget::exact(selected)
             }
         };
-        state
-            .claims
-            .acquire(owner, hostname, broker.clone(), Instant::now())
+        match target {
+            RouteTarget::Exact(hostname) => {
+                state
+                    .claims
+                    .acquire(owner, hostname, broker.clone(), Instant::now())
+            }
+            target @ RouteTarget::PassthroughWildcard(_) => {
+                state
+                    .claims
+                    .acquire_route(owner, target, broker.clone(), Instant::now())
+            }
+        }
     };
     let lease = match lease {
         Ok(lease) => lease,
@@ -366,6 +379,22 @@ pub(crate) async fn run_control_socket(
     }
 }
 
+async fn authorize_requested_target_locked(
+    state: &RuntimeState,
+    user_id: i64,
+    hostname: crate::certificates::Hostname,
+) -> Result<RouteTarget, RouteAdmissionError> {
+    match authorize_passthrough_namespace_locked(state, user_id, &hostname).await {
+        Ok(target) => Ok(target),
+        Err(RouteAdmissionError::Unauthorized) => {
+            authorize_hostname_locked(state, user_id, &hostname)
+                .await
+                .map(|()| RouteTarget::exact(hostname))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum SessionExit {
     Driver(DriverExit),
@@ -487,7 +516,58 @@ mod tests {
     use std::{error::Error, time::Duration};
 
     use super::*;
-    use crate::db::Database;
+    use crate::db::{Database, NamespaceTlsMode};
+
+    #[tokio::test]
+    async fn requested_passthrough_namespace_selects_its_canonical_wildcard()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("admission.sqlite3")).await?;
+        let issued = database.create_user("passthrough-owner").await?;
+        database
+            .create_namespace_claim_with_tls_mode(
+                issued.user.id,
+                "cloud.example.test",
+                "example.test",
+                2,
+                NamespaceTlsMode::Passthrough,
+            )
+            .await?;
+        let state = RuntimeState::new(database, "example.test")?;
+
+        assert_eq!(
+            authorize_requested_target_locked(
+                &state,
+                issued.user.id,
+                crate::certificates::Hostname::parse("cloud.example.test")?,
+            )
+            .await,
+            Ok(RouteTarget::passthrough(
+                crate::certificates::Hostname::parse("cloud.example.test")?
+            ))
+        );
+        assert_eq!(
+            authorize_requested_target_locked(
+                &state,
+                issued.user.id,
+                crate::certificates::Hostname::parse("plain.example.test")?,
+            )
+            .await,
+            Ok(RouteTarget::exact(crate::certificates::Hostname::parse(
+                "plain.example.test"
+            )?))
+        );
+        assert_eq!(
+            authorize_requested_target_locked(
+                &state,
+                issued.user.id + 1,
+                crate::certificates::Hostname::parse("cloud.example.test")?,
+            )
+            .await,
+            Err(RouteAdmissionError::Unauthorized)
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn authentication_snapshot_detects_rotation_and_disablement() -> Result<(), Box<dyn Error>>

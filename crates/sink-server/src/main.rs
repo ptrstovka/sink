@@ -177,7 +177,12 @@ async fn serve_http_and_https(
     state.attach_sni_authorization(&authorization)?;
 
     let tls_config = runtime::build_tls_server_config(resolver, crypto_provider)?;
-    let tls_listener = TlsListener::new(https_listener, tls_config);
+    let tls_listener = TlsListener::with_passthrough(
+        https_listener,
+        tls_config,
+        state.clone(),
+        config.https_proxy.clone(),
+    );
     let lifecycle = CertificateLifecycle::new(manager, storage.clone(), reloader, state.clone());
     let mut lifecycle_task = tokio::spawn(lifecycle.run());
 
@@ -187,6 +192,8 @@ async fn serve_http_and_https(
         public_base_domain = %config.public_base_domain,
         sqlite_path = %config.sqlite_path.display(),
         certificate_backend = "cloudflare-acme",
+        https_proxy_protocol = config.https_proxy.mode_name(),
+        https_proxy_trusted_peer_cidrs = ?config.https_proxy.trusted_peer_cidrs(),
         "sink server ready"
     );
     let serve_result = runtime::serve_http_and_https(

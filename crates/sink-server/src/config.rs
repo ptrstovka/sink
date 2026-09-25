@@ -1,6 +1,13 @@
 //! Command-line and environment-backed server configuration.
 
-use std::{env, ffi::OsString, fmt, net::SocketAddr, path::PathBuf};
+use std::{
+    env,
+    ffi::OsString,
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
+    str::FromStr,
+};
 
 use clap::Args;
 use thiserror::Error;
@@ -12,6 +19,8 @@ use crate::certificates::{
 pub const LISTEN_ADDRESS_ENV: &str = "SINK_SERVER_LISTEN_ADDRESS";
 pub const HTTP_LISTEN_ADDRESS_ENV: &str = "SINK_SERVER_HTTP_LISTEN_ADDRESS";
 pub const HTTPS_LISTEN_ADDRESS_ENV: &str = "SINK_SERVER_HTTPS_LISTEN_ADDRESS";
+pub const HTTPS_PROXY_PROTOCOL_ENV: &str = "SINK_SERVER_HTTPS_PROXY_PROTOCOL";
+pub const HTTPS_PROXY_TRUSTED_PEER_CIDRS_ENV: &str = "SINK_SERVER_HTTPS_PROXY_TRUSTED_PEER_CIDRS";
 pub const PUBLIC_BASE_DOMAIN_ENV: &str = "SINK_SERVER_PUBLIC_BASE_DOMAIN";
 pub const MAX_NAMESPACE_DEPTH_ENV: &str = "SINK_SERVER_MAX_NAMESPACE_DEPTH";
 pub const CERTIFICATE_PROVIDER_ENV: &str = "SINK_SERVER_CERTIFICATE_PROVIDER";
@@ -29,6 +38,7 @@ pub const DEFAULT_SQLITE_PATH: &str = "sink.sqlite3";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_MAX_NAMESPACE_DEPTH: u8 = 2;
 pub const DEFAULT_CERTIFICATE_PROVIDER: &str = "cloudflare";
+pub const DEFAULT_HTTPS_PROXY_PROTOCOL: &str = "disabled";
 pub const DEFAULT_ACME_DIRECTORY_URL: &str =
     "https://acme-staging-v02.api.letsencrypt.org/directory";
 
@@ -49,6 +59,9 @@ pub struct ServeArgs {
     /// certificate backend is enabled and rejected when it is disabled.
     #[arg(long, value_name = "ADDRESS", env = "SINK_SERVER_HTTPS_LISTEN_ADDRESS")]
     pub https_listen_address: Option<SocketAddr>,
+
+    #[command(flatten)]
+    pub https_proxy: Box<HttpsProxyArgs>,
 
     /// Public DNS suffix used for tunnel and control hostnames.
     #[arg(
@@ -101,6 +114,23 @@ pub struct ServeArgs {
     pub log_level: Option<String>,
 }
 
+#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
+pub struct HttpsProxyArgs {
+    /// HTTPS ingress PROXY protocol policy: `disabled` (the compatibility
+    /// default) or `required-v2`.
+    #[arg(long, value_name = "MODE", env = "SINK_SERVER_HTTPS_PROXY_PROTOCOL")]
+    pub protocol: Option<String>,
+
+    /// Comma-separated IPv4/IPv6 CIDRs allowed to supply required PROXY v2
+    /// metadata. Valid only with `--https-proxy-protocol required-v2`.
+    #[arg(
+        long,
+        value_name = "CIDR,...",
+        env = "SINK_SERVER_HTTPS_PROXY_TRUSTED_PEER_CIDRS"
+    )]
+    pub trusted_peer_cidrs: Option<String>,
+}
+
 /// SQLite location shared by `serve` and all administration commands.
 #[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
 pub struct DatabaseArgs {
@@ -119,12 +149,113 @@ pub struct DatabaseArgs {
 pub struct ServeConfig {
     pub http_listen_address: SocketAddr,
     pub https_listen_address: Option<SocketAddr>,
+    pub https_proxy: HttpsProxyConfig,
     /// Kept for the existing runtime until multi-domain listener wiring lands.
     pub public_base_domain: String,
     pub domains: ConfiguredDomains,
     pub certificate_backend: CertificateBackendConfig,
     pub sqlite_path: PathBuf,
     pub log_level: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HttpsProxyConfig {
+    Disabled,
+    RequiredV2 {
+        trusted_peer_cidrs: Vec<TrustedPeerCidr>,
+    },
+}
+
+impl HttpsProxyConfig {
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::RequiredV2 { .. } => "required-v2",
+        }
+    }
+
+    pub fn trusted_peer_cidrs(&self) -> &[TrustedPeerCidr] {
+        match self {
+            Self::Disabled => &[],
+            Self::RequiredV2 { trusted_peer_cidrs } => trusted_peer_cidrs,
+        }
+    }
+}
+
+/// A validated, canonical IPv4 or IPv6 network used only for ingress trust.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TrustedPeerCidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl TrustedPeerCidr {
+    pub fn contains(self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                let mask = ipv4_mask(self.prefix);
+                u32::from(network) & mask == u32::from(address) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                let mask = ipv6_mask(self.prefix);
+                u128::from(network) & mask == u128::from(address) & mask
+            }
+            (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
+        }
+    }
+}
+
+impl FromStr for TrustedPeerCidr {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix) = value
+            .split_once('/')
+            .ok_or(ConfigError::InvalidHttpsProxyTrustedPeerCidr)?;
+        if address.is_empty() || prefix.is_empty() || prefix.contains('/') {
+            return Err(ConfigError::InvalidHttpsProxyTrustedPeerCidr);
+        }
+        let address = address
+            .parse::<IpAddr>()
+            .map_err(|_| ConfigError::InvalidHttpsProxyTrustedPeerCidr)?;
+        let prefix = prefix
+            .parse::<u8>()
+            .map_err(|_| ConfigError::InvalidHttpsProxyTrustedPeerCidr)?;
+        let network = match address {
+            IpAddr::V4(address) if prefix <= 32 => {
+                IpAddr::V4(Ipv4Addr::from(u32::from(address) & ipv4_mask(prefix)))
+            }
+            IpAddr::V6(address) if prefix <= 128 => {
+                IpAddr::V6(Ipv6Addr::from(u128::from(address) & ipv6_mask(prefix)))
+            }
+            IpAddr::V4(_) | IpAddr::V6(_) => {
+                return Err(ConfigError::InvalidHttpsProxyTrustedPeerCidr);
+            }
+        };
+        Ok(Self { network, prefix })
+    }
+}
+
+impl fmt::Display for TrustedPeerCidr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.network, self.prefix)
+    }
+}
+
+const fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+const fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -275,6 +406,7 @@ impl ServeConfig {
             &certificate_backend,
             http_listen_address,
         )?;
+        let https_proxy = resolve_https_proxy(args, environment, &certificate_backend)?;
 
         let sqlite_path = args.database.resolve_with(environment)?;
 
@@ -290,6 +422,7 @@ impl ServeConfig {
         Ok(Self {
             http_listen_address,
             https_listen_address,
+            https_proxy,
             public_base_domain,
             domains,
             certificate_backend,
@@ -367,6 +500,21 @@ pub enum ConfigError {
 
     #[error("HTTP and HTTPS listeners must use different addresses")]
     DuplicateListenAddresses,
+
+    #[error("HTTPS PROXY protocol mode must be `disabled` or `required-v2`")]
+    InvalidHttpsProxyProtocol,
+
+    #[error("required PROXY v2 mode needs at least one trusted peer CIDR")]
+    MissingHttpsProxyTrustedPeerCidrs,
+
+    #[error("trusted PROXY peer CIDRs are valid only in `required-v2` mode")]
+    HttpsProxyTrustedPeerCidrsWithoutRequiredV2,
+
+    #[error("HTTPS PROXY protocol configuration requires the certificate backend")]
+    HttpsProxyWithoutCertificateBackend,
+
+    #[error("invalid HTTPS PROXY trusted peer CIDR")]
+    InvalidHttpsProxyTrustedPeerCidr,
 
     #[error("public base domain must be a valid DNS name without a scheme, port, or wildcard")]
     InvalidPublicBaseDomain,
@@ -465,6 +613,66 @@ fn resolve_https_listen_address(
         }
         (CertificateBackendConfig::Enabled(_), Some(address)) => Ok(Some(address)),
     }
+}
+
+fn resolve_https_proxy(
+    args: &ServeArgs,
+    environment: &impl Environment,
+    backend: &CertificateBackendConfig,
+) -> Result<HttpsProxyConfig, ConfigError> {
+    let mode = args
+        .https_proxy
+        .protocol
+        .clone()
+        .or(environment_string(environment, HTTPS_PROXY_PROTOCOL_ENV)?)
+        .unwrap_or_else(|| DEFAULT_HTTPS_PROXY_PROTOCOL.to_owned());
+    let trusted = args
+        .https_proxy
+        .trusted_peer_cidrs
+        .clone()
+        .or(environment_string(
+            environment,
+            HTTPS_PROXY_TRUSTED_PEER_CIDRS_ENV,
+        )?);
+
+    let mode = mode.trim().to_ascii_lowercase();
+    let config = match mode.as_str() {
+        "disabled" => {
+            if trusted
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(ConfigError::HttpsProxyTrustedPeerCidrsWithoutRequiredV2);
+            }
+            HttpsProxyConfig::Disabled
+        }
+        "required-v2" => {
+            let trusted = trusted.ok_or(ConfigError::MissingHttpsProxyTrustedPeerCidrs)?;
+            let mut trusted_peer_cidrs = Vec::new();
+            for value in trusted.split(',') {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(ConfigError::InvalidHttpsProxyTrustedPeerCidr);
+                }
+                let cidr = value.parse::<TrustedPeerCidr>()?;
+                if !trusted_peer_cidrs.contains(&cidr) {
+                    trusted_peer_cidrs.push(cidr);
+                }
+            }
+            if trusted_peer_cidrs.is_empty() {
+                return Err(ConfigError::MissingHttpsProxyTrustedPeerCidrs);
+            }
+            HttpsProxyConfig::RequiredV2 { trusted_peer_cidrs }
+        }
+        _ => return Err(ConfigError::InvalidHttpsProxyProtocol),
+    };
+
+    if !matches!(config, HttpsProxyConfig::Disabled)
+        && matches!(backend, CertificateBackendConfig::Disabled)
+    {
+        return Err(ConfigError::HttpsProxyWithoutCertificateBackend);
+    }
+    Ok(config)
 }
 
 fn resolve_certificate_backend(
@@ -616,6 +824,7 @@ mod tests {
             listen_address: Some("127.0.0.1:9010".parse().expect("test address")),
             http_listen_address: None,
             https_listen_address: None,
+            https_proxy: Box::default(),
             public_base_domain: Some("CLI.Example.".to_owned()),
             max_namespace_depth: Some(3),
             certificate_provider: Some("cloudflare".to_owned()),
@@ -654,6 +863,7 @@ mod tests {
             resolved.certificate_backend,
             CertificateBackendConfig::Disabled
         );
+        assert_eq!(resolved.https_proxy, HttpsProxyConfig::Disabled);
     }
 
     #[test]
@@ -890,6 +1100,78 @@ mod tests {
         assert!(matches!(
             ServeConfig::resolve_with(&ServeArgs::default(), &duplicate),
             Err(ConfigError::DuplicateListenAddresses)
+        ));
+    }
+
+    #[test]
+    fn trusted_peer_cidrs_are_canonical_and_cover_v4_and_v6() {
+        let ipv4 = "192.0.2.99/24"
+            .parse::<TrustedPeerCidr>()
+            .expect("valid IPv4 CIDR");
+        assert_eq!(ipv4.to_string(), "192.0.2.0/24");
+        assert!(ipv4.contains("192.0.2.1".parse().expect("IPv4")));
+        assert!(!ipv4.contains("192.0.3.1".parse().expect("IPv4")));
+
+        let ipv6 = "2001:db8:42::99/48"
+            .parse::<TrustedPeerCidr>()
+            .expect("valid IPv6 CIDR");
+        assert_eq!(ipv6.to_string(), "2001:db8:42::/48");
+        assert!(ipv6.contains("2001:db8:42::1".parse().expect("IPv6")));
+        assert!(!ipv6.contains("2001:db8:43::1".parse().expect("IPv6")));
+
+        for invalid in ["192.0.2.1", "192.0.2.1/33", "2001:db8::1/129", "/24"] {
+            assert!(invalid.parse::<TrustedPeerCidr>().is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn required_proxy_v2_is_explicit_and_validation_safe() {
+        let backend = [
+            (PUBLIC_BASE_DOMAIN_ENV, "example.test"),
+            (CERTIFICATE_BACKEND_ENABLED_ENV, "true"),
+            (HTTPS_LISTEN_ADDRESS_ENV, "127.0.0.1:8443"),
+            (ACME_TERMS_AGREED_ENV, "true"),
+            (ACME_CONTACT_ENV, "mailto:admin@example.test"),
+            (CLOUDFLARE_ZONE_ID_ENV, "0123456789abcdef0123456789abcdef"),
+            (CLOUDFLARE_API_TOKEN_ENV, "token"),
+        ];
+        let mut required = backend.to_vec();
+        required.extend([
+            (HTTPS_PROXY_PROTOCOL_ENV, "required-v2"),
+            (
+                HTTPS_PROXY_TRUSTED_PEER_CIDRS_ENV,
+                "192.0.2.99/24, 2001:db8:42::1/48",
+            ),
+        ]);
+        let resolved = ServeConfig::resolve_with(&ServeArgs::default(), &environment(&required))
+            .expect("valid required PROXY v2 config");
+        assert_eq!(resolved.https_proxy.mode_name(), "required-v2");
+        assert_eq!(
+            resolved
+                .https_proxy
+                .trusted_peer_cidrs()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["192.0.2.0/24", "2001:db8:42::/48"]
+        );
+
+        let mut missing = backend.to_vec();
+        missing.push((HTTPS_PROXY_PROTOCOL_ENV, "required-v2"));
+        assert!(matches!(
+            ServeConfig::resolve_with(&ServeArgs::default(), &environment(&missing)),
+            Err(ConfigError::MissingHttpsProxyTrustedPeerCidrs)
+        ));
+
+        assert!(matches!(
+            ServeConfig::resolve_with(
+                &ServeArgs::default(),
+                &environment(&[
+                    (PUBLIC_BASE_DOMAIN_ENV, "example.test"),
+                    (HTTPS_PROXY_TRUSTED_PEER_CIDRS_ENV, "127.0.0.1/32"),
+                ]),
+            ),
+            Err(ConfigError::HttpsProxyTrustedPeerCidrsWithoutRequiredV2)
         ));
     }
 }

@@ -50,8 +50,10 @@ use crate::{
 };
 
 use self::{
-    admission::{RouteAdmissionError, authorize_hostname_locked},
-    claims::{ClaimLookup, ClaimRegistry},
+    admission::{
+        RouteAdmissionError, authorize_hostname_locked, authorize_passthrough_namespace_locked,
+    },
+    claims::{ClaimLookup, ClaimRegistry, RouteLookup, RouteTarget},
     forwarding::{ForwardingContext, forward_request},
     host::{HostRoute, classify_host},
     listeners::PublicConnectionInfo,
@@ -500,14 +502,67 @@ async fn public_request(state: RuntimeState, request: Request) -> Response<Body>
         HostRoute::Base => fixed_response(StatusCode::OK, ROOT_BODY),
         HostRoute::Control | HostRoute::Invalid => not_found_response(),
         HostRoute::Tunnel(hostname) => {
-            let (broker, owner) = match state.claims.lookup(&hostname, Instant::now()) {
-                ClaimLookup::Active { broker, owner } => (broker, owner),
+            let now = Instant::now();
+            let route = match state.claims.lookup(&hostname, now) {
+                ClaimLookup::Active { broker, owner } => RouteLookup::Active {
+                    target: RouteTarget::exact(hostname.clone()),
+                    broker,
+                    owner,
+                },
                 ClaimLookup::Disconnected => return unavailable_response(),
-                ClaimLookup::Unknown => return not_found_response(),
+                ClaimLookup::Unknown => state.claims.resolve_route(&hostname, now),
+            };
+            let (target, broker, owner) = match route {
+                RouteLookup::Active {
+                    target,
+                    broker,
+                    owner,
+                } => (target, broker, owner),
+                RouteLookup::Disconnected { .. } => return unavailable_response(),
+                RouteLookup::Unknown => {
+                    return match state
+                        .database
+                        .active_passthrough_claim_for_route(hostname.as_str())
+                        .await
+                    {
+                        Ok(Some(_)) => unavailable_response(),
+                        Ok(None) => not_found_response(),
+                        Err(error) => {
+                            tracing::error!(%error, %hostname, "passthrough HTTP boundary lookup failed");
+                            unavailable_response()
+                        }
+                    };
+                }
             };
             let authorized = {
                 let _admission = state.admission_gate.lock().await;
-                authorize_hostname_locked(&state, owner.user_id, &hostname).await
+                let durable_passthrough = match state
+                    .database
+                    .active_passthrough_claim_for_route(hostname.as_str())
+                    .await
+                {
+                    Ok(claim) => claim,
+                    Err(error) => {
+                        tracing::error!(%error, %hostname, "passthrough HTTP boundary lookup failed");
+                        return unavailable_response();
+                    }
+                };
+                match (&target, durable_passthrough) {
+                    (RouteTarget::Exact(_), Some(_)) => Err(RouteAdmissionError::Unavailable),
+                    (RouteTarget::Exact(_), None) => {
+                        authorize_hostname_locked(&state, owner.user_id, &hostname).await
+                    }
+                    (RouteTarget::PassthroughWildcard(namespace), Some(claim))
+                        if claim.fqdn == namespace.as_str() && claim.user_id == owner.user_id =>
+                    {
+                        authorize_passthrough_namespace_locked(&state, owner.user_id, namespace)
+                            .await
+                            .map(|_| ())
+                    }
+                    (RouteTarget::PassthroughWildcard(_), Some(_) | None) => {
+                        Err(RouteAdmissionError::Unauthorized)
+                    }
+                }
             };
             match authorized {
                 Ok(()) => {}
@@ -688,16 +743,28 @@ impl Drop for SessionGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, sync::Arc, time::Duration};
+    use std::{convert::Infallible, error::Error, io, sync::Arc, time::Duration};
 
+    use bytes::Bytes;
+    use futures::future::poll_fn;
     use http_body_util::BodyExt as _;
-    use tokio::sync::oneshot;
+    use hyper::{body::Incoming, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use tokio::{sync::oneshot, task::JoinHandle};
+    use tokio_util::compat::{FuturesAsyncReadCompatExt as _, TokioAsyncReadCompatExt as _};
     use tower::ServiceExt as _;
     use uuid::Uuid;
+    use yamux::{Config, Connection, Mode};
 
     use super::*;
     use crate::certificates::{AuthorizedHostnames, FakeCertificateStorage};
-    use crate::runtime::{broker::StreamBroker, claims::ClaimOwner};
+    use crate::{
+        db::NamespaceTlsMode,
+        runtime::{
+            broker::{DriverExit, StreamBroker, drive_yamux},
+            claims::ClaimOwner,
+        },
+    };
 
     #[test]
     fn bearer_parser_rejects_missing_ambiguous_and_malformed_values() {
@@ -846,6 +913,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_dispatch_uses_one_passthrough_broker_for_apex_and_direct_child()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("http-passthrough.sqlite3")).await?;
+        let issued = database.create_user("http-passthrough").await?;
+        database
+            .create_namespace_claim_with_tls_mode(
+                issued.user.id,
+                "cloud.example.test",
+                "example.test",
+                2,
+                NamespaceTlsMode::Passthrough,
+            )
+            .await?;
+        let state = RuntimeState::new(database, "example.test")?;
+        let (broker, server_driver, client_driver) = http_tunnel();
+        state
+            .claims
+            .acquire_passthrough(
+                ClaimOwner {
+                    user_id: issued.user.id,
+                    session_id: Uuid::from_u128(7),
+                },
+                Hostname::parse("cloud.example.test")?,
+                broker.clone(),
+                Instant::now(),
+            )
+            .map_err(|error| io::Error::other(format!("wildcard claim failed: {error:?}")))?;
+        let app = router(state);
+
+        for host in ["cloud.example.test", "api.cloud.example.test"] {
+            let response = app.clone().oneshot(test_request(host, "/ordinary")).await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await?.to_bytes(),
+                Bytes::from_static(b"legacy-http")
+            );
+        }
+        let deeper = app
+            .oneshot(test_request("deep.api.cloud.example.test", "/"))
+            .await?;
+        assert_eq!(deeper.status(), StatusCode::NOT_FOUND);
+
+        broker.shutdown();
+        assert_eq!(server_driver.await?, DriverExit::Shutdown);
+        client_driver.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_passthrough_without_a_connected_broker_fails_closed_for_http()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("http-fail-closed.sqlite3")).await?;
+        let issued = database.create_user("offline-passthrough").await?;
+        database
+            .create_namespace_claim_with_tls_mode(
+                issued.user.id,
+                "cloud.example.test",
+                "example.test",
+                2,
+                NamespaceTlsMode::Passthrough,
+            )
+            .await?;
+        let state = RuntimeState::new(database, "example.test")?;
+        let (shadow_broker, _shadow_requests) = StreamBroker::channel();
+        state
+            .claims
+            .acquire(
+                ClaimOwner {
+                    user_id: issued.user.id,
+                    session_id: Uuid::from_u128(8),
+                },
+                Hostname::parse("api.cloud.example.test")?,
+                shadow_broker.clone(),
+                Instant::now(),
+            )
+            .map_err(|error| io::Error::other(format!("exact claim failed: {error:?}")))?;
+        let app = router(state);
+
+        for host in ["cloud.example.test", "api.cloud.example.test"] {
+            assert_eq!(
+                app.clone().oneshot(test_request(host, "/")).await?.status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            app.oneshot(test_request("deep.api.cloud.example.test", "/"))
+                .await?
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            shadow_broker
+                .liveness_snapshot(Instant::now())
+                .public_stream_requests,
+            0,
+            "durable passthrough ownership must block an in-memory exact shadow"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_exact_http_dispatch_remains_unchanged() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open(directory.path().join("http-exact.sqlite3")).await?;
+        let state = RuntimeState::new(database, "example.test")?;
+        let (broker, server_driver, client_driver) = http_tunnel();
+        state
+            .claims
+            .acquire(
+                ClaimOwner {
+                    user_id: 1,
+                    session_id: Uuid::from_u128(9),
+                },
+                Hostname::parse("exact.example.test")?,
+                broker.clone(),
+                Instant::now(),
+            )
+            .map_err(|error| io::Error::other(format!("exact claim failed: {error:?}")))?;
+        let response = router(state)
+            .oneshot(test_request("exact.example.test", "/ordinary"))
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await?.to_bytes(),
+            Bytes::from_static(b"legacy-http")
+        );
+        broker.shutdown();
+        assert_eq!(server_driver.await?, DriverExit::Shutdown);
+        client_driver.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tls_requests_require_exact_sni_and_host_agreement() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let database = Database::open(directory.path().join("tls-host.sqlite3")).await?;
@@ -926,5 +1128,38 @@ mod tests {
             .header(HOST, host)
             .body(Body::empty())
             .expect("valid test request")
+    }
+
+    fn http_tunnel() -> (
+        StreamBroker,
+        JoinHandle<DriverExit>,
+        JoinHandle<Result<(), io::Error>>,
+    ) {
+        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+        let (broker, requests) = StreamBroker::channel();
+        let server_driver = tokio::spawn(drive_yamux(server_io.compat(), requests));
+        let client_driver = tokio::spawn(async move {
+            let mut connection =
+                Connection::new(client_io.compat(), Config::default(), Mode::Client);
+            loop {
+                match poll_fn(|context| connection.poll_next_inbound(context)).await {
+                    Some(Ok(stream)) => {
+                        tokio::spawn(async move {
+                            let service = service_fn(|_request: http::Request<Incoming>| async {
+                                Ok::<_, Infallible>(http::Response::new(http_body_util::Full::new(
+                                    Bytes::from_static(b"legacy-http"),
+                                )))
+                            });
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(TokioIo::new(stream.compat()), service)
+                                .await;
+                        });
+                    }
+                    Some(Err(error)) => return Err(io::Error::other(error)),
+                    None => return Ok(()),
+                }
+            }
+        });
+        (broker, server_driver, client_driver)
     }
 }
