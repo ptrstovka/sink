@@ -386,6 +386,27 @@ impl Database {
         base_domain: &str,
         max_depth: u32,
     ) -> Result<NamespaceClaim, DbError> {
+        self.create_namespace_claim_with_tls_mode(
+            user_id,
+            fqdn,
+            base_domain,
+            max_depth,
+            NamespaceTlsMode::Managed,
+        )
+        .await
+    }
+
+    /// Atomically reserve a normalized namespace with an explicit immutable
+    /// TLS mode. Passthrough ownership is active immediately because it has no
+    /// certificate-order prerequisite.
+    pub async fn create_namespace_claim_with_tls_mode(
+        &self,
+        user_id: i64,
+        fqdn: &str,
+        base_domain: &str,
+        max_depth: u32,
+        tls_mode: NamespaceTlsMode,
+    ) -> Result<NamespaceClaim, DbError> {
         let fqdn = normalize_fqdn(fqdn)?;
         let base_domain = normalize_fqdn(base_domain)?;
         let depth = namespace_depth(&fqdn, &base_domain)?;
@@ -399,18 +420,25 @@ impl Database {
         if self.find_user_by_id(user_id).await?.is_none() {
             return Err(DbError::UserIdNotFound { user_id });
         }
+        let initial_state = match tls_mode {
+            NamespaceTlsMode::Managed => NamespaceClaimState::Pending,
+            NamespaceTlsMode::Passthrough => NamespaceClaimState::Active,
+        };
 
         let result = if depth == 1 {
             sqlx::query_as::<_, NamespaceClaimRow>(
                 r#"
-                INSERT INTO namespace_claims (user_id, fqdn, parent_id, depth)
-                VALUES (?, ?, NULL, ?)
-                RETURNING id, user_id, fqdn, parent_id, depth, state, created_at, updated_at
+                INSERT INTO namespace_claims (user_id, fqdn, parent_id, depth, tls_mode, state)
+                VALUES (?, ?, NULL, ?, ?, ?)
+                RETURNING id, user_id, fqdn, parent_id, depth, tls_mode, state,
+                          created_at, updated_at
                 "#,
             )
             .bind(user_id)
             .bind(&fqdn)
             .bind(i64::from(depth))
+            .bind(tls_mode.as_str())
+            .bind(initial_state.as_str())
             .fetch_one(&self.pool)
             .await
         } else {
@@ -418,16 +446,21 @@ impl Database {
                 direct_parent(&fqdn).ok_or_else(|| DbError::InvalidFqdn { fqdn: fqdn.clone() })?;
             let inserted = sqlx::query_as::<_, NamespaceClaimRow>(
                 r#"
-                INSERT INTO namespace_claims (user_id, fqdn, parent_id, depth)
-                SELECT ?, ?, id, ?
+                INSERT INTO namespace_claims (
+                    user_id, fqdn, parent_id, depth, tls_mode, state
+                )
+                SELECT ?, ?, id, ?, ?, ?
                 FROM namespace_claims
                 WHERE fqdn = ? AND user_id = ? AND state <> 'releasing'
-                RETURNING id, user_id, fqdn, parent_id, depth, state, created_at, updated_at
+                RETURNING id, user_id, fqdn, parent_id, depth, tls_mode, state,
+                          created_at, updated_at
                 "#,
             )
             .bind(user_id)
             .bind(&fqdn)
             .bind(i64::from(depth))
+            .bind(tls_mode.as_str())
+            .bind(initial_state.as_str())
             .bind(parent_fqdn)
             .bind(user_id)
             .fetch_optional(&self.pool)
@@ -455,6 +488,9 @@ impl Database {
 
         match result {
             Ok(row) => NamespaceClaim::try_from(row),
+            Err(error) if is_passthrough_overlap_violation(&error) => {
+                Err(DbError::PassthroughNamespaceOverlap { fqdn })
+            }
             Err(error) if is_unique_violation(&error) => {
                 let existing = self.find_namespace_claim_normalized(&fqdn).await?;
                 if let Some(existing) = existing {
@@ -493,13 +529,62 @@ impl Database {
         self.find_namespace_claim_normalized(parent).await
     }
 
+    /// Return the active passthrough namespace whose wildcard covers this
+    /// hostname. Coverage is deliberately limited to the apex and one label
+    /// below it, even when a deeper managed namespace exists.
+    pub async fn active_passthrough_claim_for_route(
+        &self,
+        hostname: &str,
+    ) -> Result<Option<NamespaceClaim>, DbError> {
+        let hostname = normalize_fqdn(hostname)?;
+        if let Some(exact) = self.find_namespace_claim_normalized(&hostname).await?
+            && exact.tls_mode == NamespaceTlsMode::Passthrough
+            && exact.state == NamespaceClaimState::Active
+        {
+            return Ok(Some(exact));
+        }
+        let Some(parent) = direct_parent(&hostname) else {
+            return Ok(None);
+        };
+        let claim = self.find_namespace_claim_normalized(parent).await?;
+        Ok(claim.filter(|claim| {
+            claim.tls_mode == NamespaceTlsMode::Passthrough
+                && claim.state == NamespaceClaimState::Active
+        }))
+    }
+
+    /// List managed-TLS claims only. Certificate lifecycle and TLS-boundary
+    /// restart code intentionally use this view so passthrough namespaces can
+    /// never schedule or require Sink certificate material.
     pub async fn list_namespace_claims(
         &self,
         user_id: i64,
     ) -> Result<Vec<NamespaceClaim>, DbError> {
         let rows = sqlx::query_as::<_, NamespaceClaimRow>(
             r#"
-            SELECT id, user_id, fqdn, parent_id, depth, state, created_at, updated_at
+            SELECT id, user_id, fqdn, parent_id, depth, tls_mode, state,
+                   created_at, updated_at
+            FROM namespace_claims
+            WHERE user_id = ? AND tls_mode = 'managed'
+            ORDER BY depth, fqdn COLLATE NOCASE, id
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(NamespaceClaim::try_from).collect()
+    }
+
+    /// List every namespace mode for control-plane status, hierarchy, and
+    /// release decisions.
+    pub async fn list_all_namespace_claims(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<NamespaceClaim>, DbError> {
+        let rows = sqlx::query_as::<_, NamespaceClaimRow>(
+            r#"
+            SELECT id, user_id, fqdn, parent_id, depth, tls_mode, state,
+                   created_at, updated_at
             FROM namespace_claims
             WHERE user_id = ?
             ORDER BY depth, fqdn COLLATE NOCASE, id
@@ -509,6 +594,40 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(NamespaceClaim::try_from).collect()
+    }
+
+    /// Find a live passthrough wildcard whose apex is equal or immediately
+    /// adjacent to `fqdn`. Such a claim would overlap a new wildcard.
+    pub async fn overlapping_active_passthrough_claim(
+        &self,
+        fqdn: &str,
+    ) -> Result<Option<NamespaceClaim>, DbError> {
+        let fqdn = normalize_fqdn(fqdn)?;
+        let rows = sqlx::query_as::<_, NamespaceClaimRow>(
+            r#"
+            SELECT id, user_id, fqdn, parent_id, depth, tls_mode, state,
+                   created_at, updated_at
+            FROM namespace_claims
+            WHERE tls_mode = 'passthrough' AND state = 'active'
+            ORDER BY depth DESC, fqdn COLLATE NOCASE, id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(NamespaceClaim::try_from)
+            .find_map(|claim| match claim {
+                Ok(claim)
+                    if claim.fqdn == fqdn
+                        || direct_parent(&claim.fqdn) == Some(fqdn.as_str())
+                        || direct_parent(&fqdn) == Some(claim.fqdn.as_str()) =>
+                {
+                    Some(Ok(claim))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .transpose()
     }
 
     /// Compare-and-set a claim lifecycle state. This primitive lets the later
@@ -527,7 +646,8 @@ impl Database {
             UPDATE namespace_claims
             SET state = ?, updated_at = unixepoch()
             WHERE fqdn = ? AND user_id = ? AND state = ?
-            RETURNING id, user_id, fqdn, parent_id, depth, state, created_at, updated_at
+            RETURNING id, user_id, fqdn, parent_id, depth, tls_mode, state,
+                      created_at, updated_at
             "#,
         )
         .bind(next.as_str())
@@ -571,7 +691,8 @@ impl Database {
                   SELECT 1 FROM namespace_claims AS child
                   WHERE child.parent_id = namespace_claims.id
               )
-            RETURNING id, user_id, fqdn, parent_id, depth, state, created_at, updated_at
+            RETURNING id, user_id, fqdn, parent_id, depth, tls_mode, state,
+                      created_at, updated_at
             "#,
         )
         .bind(&fqdn)
@@ -692,7 +813,8 @@ impl Database {
     ) -> Result<Option<NamespaceClaim>, DbError> {
         let row = sqlx::query_as::<_, NamespaceClaimRow>(
             r#"
-            SELECT id, user_id, fqdn, parent_id, depth, state, created_at, updated_at
+            SELECT id, user_id, fqdn, parent_id, depth, tls_mode, state,
+                   created_at, updated_at
             FROM namespace_claims
             WHERE fqdn = ?
             "#,
@@ -912,6 +1034,41 @@ impl TryFrom<&str> for NamespaceClaimState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceTlsMode {
+    Managed,
+    Passthrough,
+}
+
+impl NamespaceTlsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::Passthrough => "passthrough",
+        }
+    }
+}
+
+impl fmt::Display for NamespaceTlsMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for NamespaceTlsMode {
+    type Error = DbError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "managed" => Ok(Self::Managed),
+            "passthrough" => Ok(Self::Passthrough),
+            other => Err(DbError::InvalidNamespaceTlsMode {
+                tls_mode: other.to_owned(),
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamespaceClaim {
     pub id: i64,
@@ -919,6 +1076,7 @@ pub struct NamespaceClaim {
     pub fqdn: String,
     pub parent_id: Option<i64>,
     pub depth: u32,
+    pub tls_mode: NamespaceTlsMode,
     pub state: NamespaceClaimState,
     pub created_at: i64,
     pub updated_at: i64,
@@ -979,6 +1137,8 @@ pub enum DbError {
     },
     #[error("namespace `{fqdn}` is already claimed by user id {owner_user_id}")]
     NamespaceAlreadyClaimed { fqdn: String, owner_user_id: i64 },
+    #[error("passthrough namespace `{fqdn}` overlaps an active passthrough namespace")]
+    PassthroughNamespaceOverlap { fqdn: String },
     #[error("parent namespace `{fqdn}` has not been claimed")]
     ParentNamespaceNotClaimed { fqdn: String },
     #[error("parent namespace `{fqdn}` belongs to another user")]
@@ -999,6 +1159,8 @@ pub enum DbError {
     },
     #[error("database contained invalid namespace state `{state}`")]
     InvalidNamespaceState { state: String },
+    #[error("database contained invalid namespace TLS mode `{tls_mode}`")]
+    InvalidNamespaceTlsMode { tls_mode: String },
     #[error("database operation failed")]
     Sql(#[from] sqlx::Error),
     #[error("database migration failed")]
@@ -1009,7 +1171,7 @@ type UserRow = (i64, String, bool, i64, i64, i64);
 type UserTokenRow = (i64, i64, String, i64, i64, i64);
 type AuthenticationRow = (i64, String, i64, i64);
 type AuthenticationStateRow = (i64, bool, i64, i64);
-type NamespaceClaimRow = (i64, i64, String, Option<i64>, i64, String, i64, i64);
+type NamespaceClaimRow = (i64, i64, String, Option<i64>, i64, String, String, i64, i64);
 
 impl From<UserRow> for UserSummary {
     fn from((id, username, enabled, token_generation, auth_revision, created_at): UserRow) -> Self {
@@ -1063,7 +1225,17 @@ impl TryFrom<NamespaceClaimRow> for NamespaceClaim {
     type Error = DbError;
 
     fn try_from(
-        (id, user_id, fqdn, parent_id, depth, state, created_at, updated_at): NamespaceClaimRow,
+        (
+            id,
+            user_id,
+            fqdn,
+            parent_id,
+            depth,
+            tls_mode,
+            state,
+            created_at,
+            updated_at,
+        ): NamespaceClaimRow,
     ) -> Result<Self, Self::Error> {
         let depth =
             u32::try_from(depth).map_err(|_| DbError::InvalidFqdn { fqdn: fqdn.clone() })?;
@@ -1073,6 +1245,7 @@ impl TryFrom<NamespaceClaimRow> for NamespaceClaim {
             fqdn,
             parent_id,
             depth,
+            tls_mode: NamespaceTlsMode::try_from(tls_mode.as_str())?,
             state: NamespaceClaimState::try_from(state.as_str())?,
             created_at,
             updated_at,
@@ -1173,6 +1346,14 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(error) if error.is_unique_violation())
 }
 
+fn is_passthrough_overlap_violation(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(error)
+            if error.message().contains("overlapping passthrough namespace")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, fs};
@@ -1248,6 +1429,71 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].name, DEFAULT_TOKEN_NAME);
         assert_eq!(tokens[0].generation, 7);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn namespace_tls_mode_migration_backfills_managed_and_enforces_values()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("namespace-mode-migration.sqlite3");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let mut connection = SqliteConnection::connect_with(&options).await?;
+        connection
+            .execute(sqlx::raw_sql(include_str!("../migrations/0001_users.sql")))
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO users (username, token_digest)
+            VALUES ('legacy', zeroblob(32))
+            "#,
+        )
+        .execute(&mut connection)
+        .await?;
+        connection
+            .execute(sqlx::raw_sql(include_str!(
+                "../migrations/0002_user_tokens_and_namespace_claims.sql"
+            )))
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO namespace_claims (user_id, fqdn, depth, state)
+            VALUES (1, 'cloud.example.test', 1, 'active')
+            "#,
+        )
+        .execute(&mut connection)
+        .await?;
+        connection
+            .execute(sqlx::raw_sql(include_str!(
+                "../migrations/0004_namespace_tls_mode.sql"
+            )))
+            .await?;
+
+        let mode: String = sqlx::query_scalar("SELECT tls_mode FROM namespace_claims WHERE id = 1")
+            .fetch_one(&mut connection)
+            .await?;
+        assert_eq!(mode, "managed");
+        assert!(
+            sqlx::query("UPDATE namespace_claims SET tls_mode = 'passthrough' WHERE id = 1")
+                .execute(&mut connection)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query(
+                r#"
+                INSERT INTO namespace_claims (user_id, fqdn, depth, tls_mode)
+                VALUES (1, 'invalid.example.test', 1, 'invalid')
+                "#,
+            )
+            .execute(&mut connection)
+            .await
+            .is_err()
+        );
+        connection.close().await?;
         Ok(())
     }
 
@@ -1448,6 +1694,106 @@ mod tests {
                 .create_namespace_claim(alice.user.id, "other.test", "example.test", 2)
                 .await,
             Err(DbError::NamespaceOutsideBaseDomain { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn passthrough_mode_is_active_persistent_and_excluded_from_managed_tls_views()
+    -> Result<(), Box<dyn Error>> {
+        let (directory, path, database) = temporary_database().await?;
+        let alice = database.create_user("alice").await?;
+        let claim = database
+            .create_namespace_claim_with_tls_mode(
+                alice.user.id,
+                "cloud.example.test",
+                "example.test",
+                2,
+                NamespaceTlsMode::Passthrough,
+            )
+            .await?;
+        assert_eq!(claim.tls_mode, NamespaceTlsMode::Passthrough);
+        assert_eq!(claim.state, NamespaceClaimState::Active);
+        assert!(
+            database
+                .list_namespace_claims(alice.user.id)
+                .await?
+                .is_empty(),
+            "passthrough claims must not enter managed certificate lifecycle views"
+        );
+        assert_eq!(
+            database.list_all_namespace_claims(alice.user.id).await?,
+            vec![claim.clone()]
+        );
+
+        database.close().await;
+        let reopened = Database::open(&path).await?;
+        let persisted = reopened
+            .namespace_claim("cloud.example.test")
+            .await?
+            .ok_or("passthrough claim did not survive reopen")?;
+        assert_eq!(persisted.tls_mode, NamespaceTlsMode::Passthrough);
+        assert_eq!(persisted.state, NamespaceClaimState::Active);
+        reopened.close().await;
+        drop(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn passthrough_wildcards_reject_overlap_and_cover_only_direct_children()
+    -> Result<(), Box<dyn Error>> {
+        let (_directory, _path, database) = temporary_database().await?;
+        let alice = database.create_user("alice").await?;
+        let bob = database.create_user("bob").await?;
+        let root = database
+            .create_namespace_claim_with_tls_mode(
+                alice.user.id,
+                "cloud.example.test",
+                "example.test",
+                2,
+                NamespaceTlsMode::Passthrough,
+            )
+            .await?;
+
+        for covered in ["cloud.example.test", "api.cloud.example.test"] {
+            assert_eq!(
+                database
+                    .active_passthrough_claim_for_route(covered)
+                    .await?
+                    .ok_or("covered hostname had no passthrough owner")?
+                    .id,
+                root.id
+            );
+        }
+        assert!(
+            database
+                .active_passthrough_claim_for_route("deep.api.cloud.example.test")
+                .await?
+                .is_none()
+        );
+        assert!(matches!(
+            database
+                .create_namespace_claim_with_tls_mode(
+                    bob.user.id,
+                    "edge.cloud.example.test",
+                    "example.test",
+                    2,
+                    NamespaceTlsMode::Passthrough,
+                )
+                .await,
+            Err(DbError::ParentNamespaceOwnedByAnotherUser { .. })
+        ));
+        assert!(matches!(
+            database
+                .create_namespace_claim_with_tls_mode(
+                    alice.user.id,
+                    "edge.cloud.example.test",
+                    "example.test",
+                    2,
+                    NamespaceTlsMode::Passthrough,
+                )
+                .await,
+            Err(DbError::PassthroughNamespaceOverlap { .. })
         ));
         Ok(())
     }

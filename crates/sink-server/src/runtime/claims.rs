@@ -24,8 +24,62 @@ pub(crate) struct ClaimOwner {
 #[derive(Clone, Debug)]
 pub(crate) struct ClaimLease {
     pub(crate) hostname: Hostname,
+    #[allow(dead_code)] // Consumed by the Wave 2 raw-route session path.
+    pub(crate) route_kind: RouteKind,
     pub(crate) owner: ClaimOwner,
     pub(crate) lease_id: u64,
+}
+
+/// A live control link either owns one exact HTTP route or one passthrough
+/// wildcard. The wildcard covers its apex and direct children only.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+#[allow(dead_code)] // Passthrough variant is the Wave 2 listener contract.
+pub(crate) enum RouteTarget {
+    Exact(Hostname),
+    PassthroughWildcard(Hostname),
+}
+
+impl RouteTarget {
+    pub(crate) fn exact(hostname: Hostname) -> Self {
+        Self::Exact(hostname)
+    }
+
+    #[allow(dead_code)] // Wave 2 listener/control-session integration contract.
+    pub(crate) fn passthrough(namespace: Hostname) -> Self {
+        Self::PassthroughWildcard(namespace)
+    }
+
+    pub(crate) fn hostname(&self) -> &Hostname {
+        match self {
+            Self::Exact(hostname) | Self::PassthroughWildcard(hostname) => hostname,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> RouteKind {
+        match self {
+            Self::Exact(_) => RouteKind::Exact,
+            Self::PassthroughWildcard(_) => RouteKind::PassthroughWildcard,
+        }
+    }
+
+    fn covers(&self, hostname: &Hostname) -> bool {
+        match self {
+            Self::Exact(exact) => exact == hostname,
+            Self::PassthroughWildcard(namespace) => {
+                matches!(hostname.depth_below(namespace), Some(0 | 1))
+            }
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.covers(other.hostname()) || other.covers(self.hostname())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub(crate) enum RouteKind {
+    Exact,
+    PassthroughWildcard,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +92,20 @@ pub(crate) enum ClaimLookup {
     Unknown,
 }
 
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Wave 2 listener consumes this resolved route shape.
+pub(crate) enum RouteLookup {
+    Active {
+        target: RouteTarget,
+        broker: StreamBroker,
+        owner: ClaimOwner,
+    },
+    Disconnected {
+        target: RouteTarget,
+    },
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClaimError {
     Conflict(Box<ClaimConflict>),
@@ -47,6 +115,7 @@ pub(crate) enum ClaimError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClaimConflict {
     pub(crate) hostname: Hostname,
+    pub(crate) route_kind: RouteKind,
     pub(crate) owner: ClaimOwner,
     pub(crate) status: ClaimStatusKind,
     pub(crate) broker_available: bool,
@@ -81,6 +150,7 @@ enum ClaimStatus {
 
 #[derive(Debug)]
 struct Claim {
+    target: RouteTarget,
     owner: ClaimOwner,
     liveness: ControlLinkLiveness,
     status: ClaimStatus,
@@ -105,6 +175,30 @@ impl ClaimRegistry {
         broker: StreamBroker,
         now: Instant,
     ) -> Result<ClaimLease, ClaimError> {
+        self.acquire_route(owner, RouteTarget::exact(requested), broker, now)
+    }
+
+    #[allow(dead_code)] // Wave 2 control-session integration contract.
+    pub(crate) fn acquire_passthrough(
+        &self,
+        owner: ClaimOwner,
+        namespace: Hostname,
+        broker: StreamBroker,
+        now: Instant,
+    ) -> Result<ClaimLease, ClaimError> {
+        self.acquire_route(owner, RouteTarget::passthrough(namespace), broker, now)
+    }
+
+    /// Acquire a previously authorized route target. Exact targets may not
+    /// shadow a passthrough wildcard, and passthrough wildcards may not overlap
+    /// any live exact route or wildcard.
+    pub(crate) fn acquire_route(
+        &self,
+        owner: ClaimOwner,
+        requested: RouteTarget,
+        broker: StreamBroker,
+        now: Instant,
+    ) -> Result<ClaimLease, ClaimError> {
         let mut inner = self.lock();
         expire_locked(&mut inner, now);
 
@@ -113,27 +207,30 @@ impl ClaimRegistry {
             .iter()
             .find(|(_, claim)| claim.owner == owner)
         {
-            if requested != *hostname {
+            if requested != claim.target {
                 return Err(ClaimError::Conflict(Box::new(conflict(
                     hostname, claim, now,
                 ))));
             }
 
-            let hostname = hostname.clone();
             let replaced = match &claim.status {
                 ClaimStatus::Active { broker, .. } => Some(broker.clone()),
                 ClaimStatus::Disconnected { .. } => None,
             };
-            let lease = activate_locked(&mut inner, hostname, owner, broker);
+            let lease = activate_locked(&mut inner, requested, owner, broker);
             if let Some(replaced) = replaced {
                 replaced.replace();
             }
             return Ok(lease);
         }
 
-        if let Some(claim) = inner.by_hostname.get(&requested) {
+        if let Some((hostname, claim)) = inner
+            .by_hostname
+            .iter()
+            .find(|(_, claim)| requested.overlaps(&claim.target))
+        {
             return Err(ClaimError::Conflict(Box::new(conflict(
-                &requested, claim, now,
+                hostname, claim, now,
             ))));
         }
 
@@ -165,6 +262,7 @@ impl ClaimRegistry {
         expire_locked(&mut inner, now);
         match inner.by_hostname.get(hostname) {
             Some(Claim {
+                target: RouteTarget::Exact(_),
                 owner,
                 status: ClaimStatus::Active { broker, .. },
                 ..
@@ -173,10 +271,45 @@ impl ClaimRegistry {
                 owner: *owner,
             },
             Some(Claim {
+                target: RouteTarget::Exact(_),
                 status: ClaimStatus::Active { .. } | ClaimStatus::Disconnected { .. },
                 ..
             }) => ClaimLookup::Disconnected,
-            None => ClaimLookup::Unknown,
+            Some(_) | None => ClaimLookup::Unknown,
+        }
+    }
+
+    /// Resolve an exact or passthrough route for the Wave 2 listener. Exact
+    /// lookup wins defensively, although acquisition prevents overlap.
+    #[allow(dead_code)] // Wave 2 listener integration contract.
+    pub(crate) fn resolve_route(&self, hostname: &Hostname, now: Instant) -> RouteLookup {
+        let mut inner = self.lock();
+        expire_locked(&mut inner, now);
+        let claim = inner
+            .by_hostname
+            .get(hostname)
+            .filter(|claim| matches!(&claim.target, RouteTarget::Exact(_)))
+            .or_else(|| {
+                inner.by_hostname.values().find(|claim| {
+                    matches!(&claim.target, RouteTarget::PassthroughWildcard(_))
+                        && claim.target.covers(hostname)
+                })
+            });
+        match claim {
+            Some(Claim {
+                target,
+                owner,
+                status: ClaimStatus::Active { broker, .. },
+                ..
+            }) if broker.is_available() => RouteLookup::Active {
+                target: target.clone(),
+                broker: broker.clone(),
+                owner: *owner,
+            },
+            Some(Claim { target, .. }) => RouteLookup::Disconnected {
+                target: target.clone(),
+            },
+            None => RouteLookup::Unknown,
         }
     }
 
@@ -184,6 +317,9 @@ impl ClaimRegistry {
         let mut inner = self.lock();
         expire_locked(&mut inner, now);
         let claim = inner.by_hostname.get(hostname)?;
+        if !matches!(&claim.target, RouteTarget::Exact(_)) {
+            return None;
+        }
         Some(RouteClaim { owner: claim.owner })
     }
 
@@ -262,6 +398,7 @@ fn conflict(hostname: &Hostname, claim: &Claim, now: Instant) -> ClaimConflict {
     };
     ClaimConflict {
         hostname: hostname.clone(),
+        route_kind: claim.target.kind(),
         owner: claim.owner,
         status,
         broker_available,
@@ -271,16 +408,18 @@ fn conflict(hostname: &Hostname, claim: &Claim, now: Instant) -> ClaimConflict {
 
 fn activate_locked(
     inner: &mut ClaimsInner,
-    hostname: Hostname,
+    target: RouteTarget,
     owner: ClaimOwner,
     broker: StreamBroker,
 ) -> ClaimLease {
     inner.next_lease_id = inner.next_lease_id.wrapping_add(1).max(1);
     let lease_id = inner.next_lease_id;
     let liveness = broker.liveness();
+    let hostname = target.hostname().clone();
     inner.by_hostname.insert(
         hostname.clone(),
         Claim {
+            target: target.clone(),
             owner,
             liveness,
             status: ClaimStatus::Active { broker, lease_id },
@@ -288,6 +427,7 @@ fn activate_locked(
     );
     ClaimLease {
         hostname,
+        route_kind: target.kind(),
         owner,
         lease_id,
     }
@@ -456,6 +596,128 @@ mod tests {
 
         assert!(registry.has_routes_covered_by(&hostname("edge.cloud.example.test"), now));
         assert!(!registry.has_routes_covered_by(&hostname("cloud.example.test"), now));
+    }
+
+    #[test]
+    fn passthrough_wildcard_resolves_apex_and_direct_children_only() {
+        let registry = ClaimRegistry::default();
+        let now = Instant::now();
+        let namespace = hostname("cloud.example.test");
+        let (active_broker, _active_requests) = StreamBroker::channel();
+        let lease = registry
+            .acquire_passthrough(owner(1, 1), namespace.clone(), active_broker, now)
+            .expect("passthrough wildcard");
+        assert_eq!(lease.route_kind, RouteKind::PassthroughWildcard);
+
+        for covered in [namespace.clone(), hostname("api.cloud.example.test")] {
+            match registry.resolve_route(&covered, now) {
+                RouteLookup::Active {
+                    target,
+                    owner: route_owner,
+                    ..
+                } => {
+                    assert_eq!(target, RouteTarget::passthrough(namespace.clone()));
+                    assert_eq!(route_owner, owner(1, 1));
+                }
+                other => panic!("expected active passthrough route, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            registry.resolve_route(&hostname("deep.api.cloud.example.test"), now),
+            RouteLookup::Unknown
+        ));
+        assert!(matches!(
+            registry.lookup(&namespace, now),
+            ClaimLookup::Unknown
+        ));
+        assert!(registry.route_claim(&namespace, now).is_none());
+    }
+
+    #[test]
+    fn exact_routes_and_overlapping_wildcards_conflict() {
+        let registry = ClaimRegistry::default();
+        let now = Instant::now();
+        let namespace = hostname("cloud.example.test");
+        registry
+            .acquire_passthrough(owner(1, 1), namespace.clone(), broker(), now)
+            .expect("passthrough wildcard");
+
+        for exact in [namespace.clone(), hostname("api.cloud.example.test")] {
+            let conflict = registry
+                .acquire(owner(2, 2), exact, broker(), now)
+                .expect_err("exact route must not shadow wildcard");
+            let ClaimError::Conflict(conflict) = conflict else {
+                panic!("expected conflict");
+            };
+            assert_eq!(conflict.route_kind, RouteKind::PassthroughWildcard);
+        }
+        assert!(matches!(
+            registry.acquire_passthrough(
+                owner(3, 3),
+                hostname("edge.cloud.example.test"),
+                broker(),
+                now
+            ),
+            Err(ClaimError::Conflict(_))
+        ));
+        registry
+            .acquire_passthrough(owner(4, 4), hostname("other.example.test"), broker(), now)
+            .expect("disjoint wildcard");
+    }
+
+    #[test]
+    fn passthrough_acquisition_rejects_preexisting_covered_exact_route() {
+        let registry = ClaimRegistry::default();
+        let now = Instant::now();
+        registry
+            .acquire(
+                owner(1, 1),
+                hostname("api.cloud.example.test"),
+                broker(),
+                now,
+            )
+            .expect("exact route");
+        assert!(matches!(
+            registry.acquire_passthrough(
+                owner(2, 2),
+                hostname("cloud.example.test"),
+                broker(),
+                now
+            ),
+            Err(ClaimError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn passthrough_wildcard_reconnect_and_release_preserve_target_identity() {
+        let registry = ClaimRegistry::default();
+        let now = Instant::now();
+        let namespace = hostname("cloud.example.test");
+        let claim_owner = owner(1, 1);
+        let first = registry
+            .acquire_passthrough(claim_owner, namespace.clone(), broker(), now)
+            .expect("passthrough wildcard");
+        registry
+            .disconnect(&first, now)
+            .expect("passthrough lease disconnects");
+
+        let (replacement_broker, _replacement_requests) = StreamBroker::channel();
+        let replacement = registry
+            .acquire_passthrough(
+                claim_owner,
+                namespace.clone(),
+                replacement_broker,
+                now + Duration::from_secs(29),
+            )
+            .expect("same session reclaims passthrough target");
+        assert_eq!(replacement.route_kind, RouteKind::PassthroughWildcard);
+        assert_ne!(replacement.lease_id, first.lease_id);
+        assert!(!registry.release(&first));
+        assert!(registry.release(&replacement));
+        assert!(matches!(
+            registry.resolve_route(&namespace, now + Duration::from_secs(29)),
+            RouteLookup::Unknown
+        ));
     }
 
     #[test]

@@ -12,6 +12,35 @@ pub struct NamespaceClaimRequest {
     pub hostname: String,
 }
 
+impl NamespaceClaimRequest {
+    pub const MANAGED_TLS_MODE: &'static str = "managed";
+    pub const PASSTHROUGH_TLS_MODE: &'static str = "passthrough";
+
+    #[must_use]
+    pub fn managed(hostname: impl Into<String>) -> Self {
+        Self {
+            hostname: hostname.into(),
+        }
+    }
+
+    /// Build the opt-in passthrough request shape without changing the legacy
+    /// managed request type or its serialized form.
+    #[must_use]
+    pub fn passthrough(hostname: impl Into<String>) -> impl Serialize {
+        NamespaceClaimWithModeRequest {
+            hostname: hostname.into(),
+            tls_mode: Self::PASSTHROUGH_TLS_MODE,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct NamespaceClaimWithModeRequest {
+    hostname: String,
+    tls_mode: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NamespaceState {
@@ -60,6 +89,12 @@ pub enum ManagementErrorCode {
     ServiceUnavailable,
 }
 
+impl ManagementErrorCode {
+    pub const INVALID_TLS_MODE_CODE: &'static str = "invalid_tls_mode";
+    pub const NAMESPACE_MODE_CONFLICT_CODE: &'static str = "namespace_mode_conflict";
+    pub const WILDCARD_CONFLICT_CODE: &'static str = "wildcard_conflict";
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementError {
@@ -91,8 +126,37 @@ mod tests {
 
         let json = serde_json::to_value(&response)?;
         assert_eq!(json["namespace"]["hostname"], "cloud.example.test");
+        assert!(json["namespace"].get("tls_mode").is_none());
         assert_eq!(json["namespace"]["state"], "retrying");
         assert_eq!(serde_json::from_value::<NamespaceResponse>(json)?, response);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_mode_is_the_backward_compatible_request_default() -> Result<(), serde_json::Error> {
+        let legacy =
+            serde_json::from_str::<NamespaceClaimRequest>(r#"{"hostname":"cloud.example.test"}"#)?;
+        assert_eq!(legacy, NamespaceClaimRequest::managed("cloud.example.test"));
+
+        let serialized = serde_json::to_value(&legacy)?;
+        assert_eq!(
+            serialized,
+            serde_json::json!({"hostname": "cloud.example.test"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn passthrough_mode_has_stable_opt_in_serialization() -> Result<(), serde_json::Error> {
+        let request = NamespaceClaimRequest::passthrough("cloud.example.test");
+        let serialized = serde_json::to_value(&request)?;
+        assert_eq!(serialized["tls_mode"], "passthrough");
+        assert!(
+            serde_json::from_str::<NamespaceClaimRequest>(
+                r#"{"hostname":"cloud.example.test","tls_mode":"passthrough"}"#
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -108,6 +172,18 @@ mod tests {
         let json = serde_json::to_value(response)?;
         assert_eq!(json["error"]["code"], "namespace_in_use");
         assert_eq!(json["error"]["message"], "namespace has active routes");
+        assert_eq!(
+            ManagementErrorCode::INVALID_TLS_MODE_CODE,
+            "invalid_tls_mode"
+        );
+        assert_eq!(
+            ManagementErrorCode::NAMESPACE_MODE_CONFLICT_CODE,
+            "namespace_mode_conflict"
+        );
+        assert_eq!(
+            ManagementErrorCode::WILDCARD_CONFLICT_CODE,
+            "wildcard_conflict"
+        );
         Ok(())
     }
 }

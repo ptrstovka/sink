@@ -13,14 +13,13 @@ use axum::{
     },
 };
 use sink_protocol::{
-    ManagementError, ManagementErrorCode, ManagementErrorResponse, Namespace,
-    NamespaceClaimRequest, NamespaceListResponse, NamespaceResponse,
+    ManagementError, ManagementErrorCode, ManagementErrorResponse, NamespaceClaimRequest,
 };
 
 use crate::{
     certificates::{Hostname, QuotaSnapshot, Timestamp},
     config::ConfiguredDomain,
-    db::{AuthenticatedUser, DbError, NamespaceClaim, NamespaceClaimState},
+    db::{AuthenticatedUser, DbError, NamespaceClaim, NamespaceClaimState, NamespaceTlsMode},
     namespace_control::{NamespaceCertificateRequest, NamespaceCertificateStatus},
 };
 
@@ -53,6 +52,50 @@ impl NamespaceOperationLocks {
 }
 
 const MAX_MANAGEMENT_BODY_BYTES: usize = 16 * 1024;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamespaceClaimWireRequest {
+    hostname: String,
+    #[serde(default = "default_managed_tls_mode")]
+    tls_mode: String,
+}
+
+fn default_managed_tls_mode() -> String {
+    NamespaceClaimRequest::MANAGED_TLS_MODE.to_owned()
+}
+
+#[derive(serde::Serialize)]
+struct NamespaceContract {
+    hostname: String,
+    depth: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_mode: Option<&'static str>,
+    state: sink_protocol::NamespaceState,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(serde::Serialize)]
+struct NamespaceContractResponse {
+    namespace: NamespaceContract,
+}
+
+#[derive(serde::Serialize)]
+struct NamespaceContractListResponse {
+    namespaces: Vec<NamespaceContract>,
+}
+
+#[derive(serde::Serialize)]
+struct ExtendedManagementErrorResponse {
+    error: ExtendedManagementError,
+}
+
+#[derive(serde::Serialize)]
+struct ExtendedManagementError {
+    code: &'static str,
+    message: &'static str,
+}
 
 pub(crate) async fn namespace_collection_ingress(
     State(state): State<RuntimeState>,
@@ -138,10 +181,10 @@ async fn authenticate(
 }
 
 async fn list_namespaces(state: &RuntimeState, user: &AuthenticatedUser) -> Response<Body> {
-    match state.database.list_namespace_claims(user.id).await {
+    match state.database.list_all_namespace_claims(user.id).await {
         Ok(claims) => json_response(
             StatusCode::OK,
-            &NamespaceListResponse {
+            &NamespaceContractListResponse {
                 namespaces: claims.into_iter().map(namespace_contract).collect(),
             },
         ),
@@ -160,7 +203,7 @@ async fn namespace_status(
     match state.database.namespace_claim(hostname.as_str()).await {
         Ok(Some(claim)) if claim.user_id == user.id => json_response(
             StatusCode::OK,
-            &NamespaceResponse {
+            &NamespaceContractResponse {
                 namespace: namespace_contract(claim),
             },
         ),
@@ -181,9 +224,14 @@ async fn claim_namespace(
         Ok(bytes) => bytes,
         Err(_) => return invalid_request(),
     };
-    let request = match serde_json::from_slice::<NamespaceClaimRequest>(&bytes) {
+    let request = match serde_json::from_slice::<NamespaceClaimWireRequest>(&bytes) {
         Ok(request) => request,
+        Err(_) if request_has_invalid_tls_mode(&bytes) => return invalid_tls_mode(),
         Err(_) => return invalid_request(),
+    };
+    let tls_mode = match NamespaceTlsMode::try_from(request.tls_mode.as_str()) {
+        Ok(tls_mode) => tls_mode,
+        Err(_) => return invalid_tls_mode(),
     };
     let (hostname, domain) = match validate_namespace(state, &request.hostname) {
         Ok(validated) => validated,
@@ -193,24 +241,35 @@ async fn claim_namespace(
     let _mutation = state.namespace_mutations.lock(&hostname).await;
     let (claim, created) = {
         let _admission = state.admission_gate.lock().await;
-        // Publish the child certificate boundary before a durable claim can
-        // become observable. Rustls does not take the admission gate, so the
-        // boundary itself closes the parent-wildcard fallback window while
-        // ownership and issuance state are being established.
-        state.tls_boundaries.insert(hostname.clone());
-        match prepare_claim(state, user.id, &hostname, &domain).await {
+        // Managed TLS publishes the child certificate boundary before durable
+        // ownership becomes observable. Passthrough never enters Sink's TLS
+        // termination or certificate lifecycle.
+        if tls_mode == NamespaceTlsMode::Managed {
+            state.tls_boundaries.insert(hostname.clone());
+        }
+        match prepare_claim(state, user.id, &hostname, &domain, tls_mode).await {
             Ok(prepared) => prepared,
             Err(response) => {
-                rollback_provisional_tls_boundary(state, &hostname).await;
+                if tls_mode == NamespaceTlsMode::Managed {
+                    rollback_provisional_tls_boundary(state, &hostname).await;
+                }
                 return response;
             }
         }
     };
 
     if claim.state == NamespaceClaimState::Active {
-        return claim_response(StatusCode::OK, claim);
+        return claim_response(
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            claim,
+        );
     }
 
+    debug_assert_eq!(claim.tls_mode, NamespaceTlsMode::Managed);
     let claims = match state.database.list_namespace_claims(user.id).await {
         Ok(claims) => claims,
         Err(error) => {
@@ -254,10 +313,11 @@ async fn claim_namespace(
 async fn rollback_provisional_tls_boundary(state: &RuntimeState, hostname: &Hostname) {
     match state.database.namespace_claim(hostname.as_str()).await {
         Ok(None) => state.tls_boundaries.remove(hostname),
-        Ok(Some(_)) => {
+        Ok(Some(claim)) if claim.tls_mode == NamespaceTlsMode::Managed => {
             // Durable ownership exists, even if this request cannot use it.
             // Keep the boundary so TLS remains fail-closed for the child.
         }
+        Ok(Some(_)) => state.tls_boundaries.remove(hostname),
         Err(error) => {
             // Database uncertainty must not re-enable a parent wildcard.
             tracing::error!(hostname = %hostname, %error, "could not reconcile provisional TLS boundary; retaining it fail-closed");
@@ -270,11 +330,15 @@ async fn prepare_claim(
     user_id: i64,
     hostname: &Hostname,
     domain: &ConfiguredDomain,
+    tls_mode: NamespaceTlsMode,
 ) -> Result<(NamespaceClaim, bool), Response<Body>> {
     match state.database.namespace_claim(hostname.as_str()).await {
         Ok(Some(claim)) if claim.user_id != user_id => return Err(namespace_unavailable()),
         Ok(Some(claim)) if claim.state == NamespaceClaimState::Releasing => {
             return Err(namespace_unavailable());
+        }
+        Ok(Some(claim)) if claim.tls_mode != tls_mode => {
+            return Err(namespace_mode_conflict());
         }
         Ok(Some(claim)) => return Ok((claim, false)),
         Ok(None) => {}
@@ -312,13 +376,32 @@ async fn prepare_claim(
         }
     }
 
+    if tls_mode == NamespaceTlsMode::Passthrough {
+        if state.claims.has_routes_covered_by(hostname, Instant::now()) {
+            return Err(wildcard_conflict());
+        }
+        match state
+            .database
+            .overlapping_active_passthrough_claim(hostname.as_str())
+            .await
+        {
+            Ok(Some(_)) => return Err(wildcard_conflict()),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(user_id, hostname = %hostname, %error, "passthrough overlap lookup failed");
+                return Err(service_unavailable());
+            }
+        }
+    }
+
     state
         .database
-        .create_namespace_claim(
+        .create_namespace_claim_with_tls_mode(
             user_id,
             hostname.as_str(),
             domain.hostname.as_str(),
             u32::from(domain.max_namespace_depth),
+            tls_mode,
         )
         .await
         .map(|claim| (claim, true))
@@ -351,7 +434,7 @@ async fn release_namespace(
     domain: ConfiguredDomain,
 ) -> Response<Body> {
     let _mutation = state.namespace_mutations.lock(&hostname).await;
-    {
+    let tls_mode = {
         let _admission = state.admission_gate.lock().await;
         let claim = match state.database.namespace_claim(hostname.as_str()).await {
             Ok(Some(claim)) if claim.user_id == user.id => claim,
@@ -361,7 +444,7 @@ async fn release_namespace(
                 return service_unavailable();
             }
         };
-        let owned_claims = match state.database.list_namespace_claims(user.id).await {
+        let owned_claims = match state.database.list_all_namespace_claims(user.id).await {
             Ok(claims) => claims,
             Err(error) => {
                 tracing::error!(user_id = user.id, %error, "namespace child lookup failed");
@@ -402,17 +485,18 @@ async fn release_namespace(
             tracing::error!(user_id = user.id, hostname = %hostname, %error, "namespace release transition failed");
             return service_unavailable();
         }
-    }
-
-    if state
-        .certificates
-        .release(
-            hostname.clone(),
-            domain.certificate_provider,
-            now_timestamp(),
-        )
-        .await
-        .is_err()
+        claim.tls_mode
+    };
+    if tls_mode == NamespaceTlsMode::Managed
+        && state
+            .certificates
+            .release(
+                hostname.clone(),
+                domain.certificate_provider,
+                now_timestamp(),
+            )
+            .await
+            .is_err()
     {
         tracing::error!(user_id = user.id, hostname = %hostname, "namespace certificate release failed");
         return management_error(
@@ -468,6 +552,20 @@ fn validate_namespace(
     Ok((hostname, domain))
 }
 
+fn request_has_invalid_tls_mode(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    match value.get("tls_mode") {
+        None => false,
+        Some(serde_json::Value::String(mode)) => !matches!(
+            mode.as_str(),
+            NamespaceClaimRequest::MANAGED_TLS_MODE | NamespaceClaimRequest::PASSTHROUGH_TLS_MODE
+        ),
+        Some(_) => true,
+    }
+}
+
 fn quota_snapshot(claims: &[NamespaceClaim], target_id: i64) -> QuotaSnapshot {
     let active_claims_for_user = claims
         .iter()
@@ -501,10 +599,12 @@ fn now_timestamp() -> Timestamp {
     Timestamp::from_unix_seconds(seconds)
 }
 
-fn namespace_contract(claim: NamespaceClaim) -> Namespace {
-    Namespace {
+fn namespace_contract(claim: NamespaceClaim) -> NamespaceContract {
+    NamespaceContract {
         hostname: claim.fqdn,
         depth: claim.depth,
+        tls_mode: (claim.tls_mode == NamespaceTlsMode::Passthrough)
+            .then_some(NamespaceClaimRequest::PASSTHROUGH_TLS_MODE),
         state: match claim.state {
             NamespaceClaimState::Pending => sink_protocol::NamespaceState::Pending,
             NamespaceClaimState::Active => sink_protocol::NamespaceState::Active,
@@ -520,7 +620,7 @@ fn namespace_contract(claim: NamespaceClaim) -> Namespace {
 fn claim_response(status: StatusCode, claim: NamespaceClaim) -> Response<Body> {
     json_response(
         status,
-        &NamespaceResponse {
+        &NamespaceContractResponse {
             namespace: namespace_contract(claim),
         },
     )
@@ -529,6 +629,7 @@ fn claim_response(status: StatusCode, claim: NamespaceClaim) -> Response<Body> {
 fn map_claim_error(user_id: i64, hostname: &Hostname, error: DbError) -> Response<Body> {
     match error {
         DbError::NamespaceAlreadyClaimed { .. } => namespace_unavailable(),
+        DbError::PassthroughNamespaceOverlap { .. } => wildcard_conflict(),
         DbError::ParentNamespaceNotClaimed { .. }
         | DbError::ParentNamespaceOwnedByAnotherUser { .. }
         | DbError::ParentNamespaceReleasing { .. } => parent_namespace_unavailable(),
@@ -582,6 +683,19 @@ fn management_error(
     )
 }
 
+fn extended_management_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> Response<Body> {
+    json_response(
+        status,
+        &ExtendedManagementErrorResponse {
+            error: ExtendedManagementError { code, message },
+        },
+    )
+}
+
 fn authentication_error() -> Response<Body> {
     let mut response = management_error(
         StatusCode::UNAUTHORIZED,
@@ -610,11 +724,35 @@ fn invalid_hostname() -> Response<Body> {
     )
 }
 
+fn invalid_tls_mode() -> Response<Body> {
+    extended_management_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ManagementErrorCode::INVALID_TLS_MODE_CODE,
+        "tls_mode must be `managed` or `passthrough`",
+    )
+}
+
 fn namespace_unavailable() -> Response<Body> {
     management_error(
         StatusCode::CONFLICT,
         ManagementErrorCode::NamespaceUnavailable,
         "namespace is unavailable",
+    )
+}
+
+fn namespace_mode_conflict() -> Response<Body> {
+    extended_management_error(
+        StatusCode::CONFLICT,
+        ManagementErrorCode::NAMESPACE_MODE_CONFLICT_CODE,
+        "namespace is already claimed with a different TLS mode",
+    )
+}
+
+fn wildcard_conflict() -> Response<Body> {
+    extended_management_error(
+        StatusCode::CONFLICT,
+        ManagementErrorCode::WILDCARD_CONFLICT_CODE,
+        "passthrough wildcard overlaps an existing namespace or route",
     )
 }
 
@@ -672,9 +810,12 @@ mod tests {
             NamespaceCertificateProvisioner, NamespaceCertificateRequest,
         },
         runtime::{
-            admission::{RouteAdmissionError, authorize_hostname_locked},
+            admission::{
+                RouteAdmissionError, authorize_hostname_locked,
+                authorize_passthrough_namespace_locked,
+            },
             broker::StreamBroker,
-            claims::ClaimOwner,
+            claims::{ClaimOwner, RouteTarget},
             router,
         },
     };
@@ -884,9 +1025,7 @@ mod tests {
         let certificates = Arc::new(FakeCertificates::new(NamespaceCertificateStatus::Ready));
         let (_directory, state, alice, bob) = fixture(Arc::clone(&certificates)).await?;
         let app = router(state);
-        let body = serde_json::to_vec(&NamespaceClaimRequest {
-            hostname: "Cloud.Example.Test.".to_owned(),
-        })?;
+        let body = serde_json::to_vec(&NamespaceClaimRequest::managed("Cloud.Example.Test."))?;
 
         let unauthenticated = app
             .clone()
@@ -971,6 +1110,293 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passthrough_claim_is_immediately_active_idempotent_and_certificate_free()
+    -> Result<(), Box<dyn Error>> {
+        let certificates = Arc::new(FakeCertificates::new(NamespaceCertificateStatus::Ready));
+        let (_directory, state, alice, _bob) = fixture(Arc::clone(&certificates)).await?;
+        let app = router(state.clone());
+        let body = serde_json::to_vec(&NamespaceClaimRequest::passthrough("cloud.example.test"))?;
+
+        let created = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(body.clone()),
+            ))
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: serde_json::Value = json(created).await?;
+        assert_eq!(created["namespace"]["tls_mode"], "passthrough");
+        assert_eq!(created["namespace"]["state"], "active");
+        assert_eq!(certificates.provision_count(), 0);
+
+        let persisted = state
+            .database
+            .namespace_claim("cloud.example.test")
+            .await?
+            .ok_or("passthrough claim missing")?;
+        assert_eq!(persisted.tls_mode, NamespaceTlsMode::Passthrough);
+        assert_eq!(persisted.state, NamespaceClaimState::Active);
+        assert!(
+            state
+                .database
+                .list_namespace_claims(alice.user.id)
+                .await?
+                .is_empty()
+        );
+
+        let listed = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::empty(),
+            ))
+            .await?;
+        let listed: serde_json::Value = json(listed).await?;
+        assert_eq!(listed["namespaces"][0]["tls_mode"], "passthrough");
+        let status = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                "/_sink/api/v1/namespaces/cloud.example.test",
+                Some(alice.token.expose_secret()),
+                Body::empty(),
+            ))
+            .await?;
+        let status: serde_json::Value = json(status).await?;
+        assert_eq!(status["namespace"]["tls_mode"], "passthrough");
+
+        let idempotent = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(body.clone()),
+            ))
+            .await?;
+        assert_eq!(idempotent.status(), StatusCode::OK);
+        assert_eq!(certificates.provision_count(), 0);
+
+        let mode_conflict = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                    "cloud.example.test",
+                ))?),
+            ))
+            .await?;
+        assert_eq!(mode_conflict.status(), StatusCode::CONFLICT);
+        let error: serde_json::Value = json(mode_conflict).await?;
+        assert_eq!(
+            error["error"]["code"],
+            ManagementErrorCode::NAMESPACE_MODE_CONFLICT_CODE
+        );
+
+        for invalid_body in [
+            r#"{"hostname":"invalid.example.test","tls_mode":"edge"}"#,
+            r#"{"hostname":"invalid.example.test","tls_mode":null}"#,
+        ] {
+            let invalid_mode = app
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    sink_protocol::NAMESPACE_COLLECTION_PATH,
+                    Some(alice.token.expose_secret()),
+                    Body::from(invalid_body),
+                ))
+                .await?;
+            assert_eq!(invalid_mode.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let error: serde_json::Value = json(invalid_mode).await?;
+            assert_eq!(
+                error["error"]["code"],
+                ManagementErrorCode::INVALID_TLS_MODE_CODE
+            );
+        }
+
+        let released = app
+            .clone()
+            .oneshot(request(
+                Method::DELETE,
+                "/_sink/api/v1/namespaces/cloud.example.test",
+                Some(alice.token.expose_secret()),
+                Body::empty(),
+            ))
+            .await?;
+        assert_eq!(released.status(), StatusCode::NO_CONTENT);
+        assert_eq!(certificates.release_count(), 0);
+        assert!(
+            state
+                .database
+                .namespace_claim("cloud.example.test")
+                .await?
+                .is_none()
+        );
+
+        let reclaimed = app
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(body),
+            ))
+            .await?;
+        assert_eq!(reclaimed.status(), StatusCode::CREATED);
+        assert_eq!(certificates.provision_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn passthrough_admission_blocks_exact_shadowing_but_not_deeper_managed_routes()
+    -> Result<(), Box<dyn Error>> {
+        let certificates = Arc::new(FakeCertificates::new(NamespaceCertificateStatus::Ready));
+        let (_directory, state, alice, bob) = fixture(Arc::clone(&certificates)).await?;
+        let app = router(state.clone());
+        let root = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::passthrough(
+                    "cloud.example.test",
+                ))?),
+            ))
+            .await?;
+        assert_eq!(root.status(), StatusCode::CREATED);
+
+        let foreign_child = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(bob.token.expose_secret()),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                    "edge.cloud.example.test",
+                ))?),
+            ))
+            .await?;
+        let error: ManagementErrorResponse = json(foreign_child).await?;
+        assert_eq!(
+            error.error.code,
+            ManagementErrorCode::ParentNamespaceUnavailable
+        );
+
+        let overlapping_child = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::passthrough(
+                    "edge.cloud.example.test",
+                ))?),
+            ))
+            .await?;
+        let error: serde_json::Value = json(overlapping_child).await?;
+        assert_eq!(
+            error["error"]["code"],
+            ManagementErrorCode::WILDCARD_CONFLICT_CODE
+        );
+
+        let managed_child = app
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                    "edge.cloud.example.test",
+                ))?),
+            ))
+            .await?;
+        assert_eq!(managed_child.status(), StatusCode::CREATED);
+        assert_eq!(certificates.provision_count(), 1);
+
+        let alice = state
+            .database
+            .authenticate(alice.token.expose_secret())
+            .await?
+            .ok_or("alice authentication missing")?;
+        let _admission = state.admission_gate.lock().await;
+        let namespace = Hostname::parse("cloud.example.test")?;
+        assert_eq!(
+            authorize_passthrough_namespace_locked(&state, alice.id, &namespace).await,
+            Ok(RouteTarget::passthrough(namespace.clone()))
+        );
+        for shadowed in [
+            "cloud.example.test",
+            "api.cloud.example.test",
+            "edge.cloud.example.test",
+        ] {
+            assert_eq!(
+                authorize_hostname_locked(&state, alice.id, &Hostname::parse(shadowed)?).await,
+                Err(RouteAdmissionError::Unauthorized),
+                "{shadowed}"
+            );
+        }
+        assert_eq!(
+            authorize_hostname_locked(
+                &state,
+                alice.id,
+                &Hostname::parse("api.edge.cloud.example.test")?
+            )
+            .await,
+            Ok(())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn passthrough_claim_rejects_preexisting_covered_exact_route()
+    -> Result<(), Box<dyn Error>> {
+        let certificates = Arc::new(FakeCertificates::new(NamespaceCertificateStatus::Ready));
+        let (_directory, state, alice, _bob) = fixture(certificates).await?;
+        let alice_auth = state
+            .database
+            .authenticate(alice.token.expose_secret())
+            .await?
+            .ok_or("alice authentication missing")?;
+        let (broker, _requests) = StreamBroker::channel();
+        state
+            .claims
+            .acquire(
+                ClaimOwner {
+                    user_id: alice_auth.id,
+                    session_id: Uuid::new_v4(),
+                },
+                Hostname::parse("api.cloud.example.test")?,
+                broker,
+                Instant::now(),
+            )
+            .map_err(|error| format!("route claim failed: {error:?}"))?;
+
+        let response = router(state)
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::passthrough(
+                    "cloud.example.test",
+                ))?),
+            ))
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error: serde_json::Value = json(response).await?;
+        assert_eq!(
+            error["error"]["code"],
+            ManagementErrorCode::WILDCARD_CONFLICT_CODE
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancelled_claim_request_finishes_issuance_and_later_claim_activates()
     -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
@@ -998,9 +1424,7 @@ mod tests {
         )?;
         let app = router(state.clone());
         let hostname = "cancelled.example.test";
-        let body = serde_json::to_vec(&NamespaceClaimRequest {
-            hostname: hostname.to_owned(),
-        })?;
+        let body = serde_json::to_vec(&NamespaceClaimRequest::managed(hostname))?;
 
         let claim_task = tokio::spawn(app.clone().oneshot(request(
             Method::POST,
@@ -1107,9 +1531,9 @@ mod tests {
                     Method::POST,
                     sink_protocol::NAMESPACE_COLLECTION_PATH,
                     Some(alice.token.expose_secret()),
-                    Body::from(serde_json::to_vec(&NamespaceClaimRequest {
-                        hostname: hostname.to_owned(),
-                    })?),
+                    Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                        hostname,
+                    ))?),
                 ))
                 .await?;
             assert_eq!(response.status(), StatusCode::CREATED, "{hostname}");
@@ -1121,9 +1545,9 @@ mod tests {
                 Method::POST,
                 sink_protocol::NAMESPACE_COLLECTION_PATH,
                 Some(bob.token.expose_secret()),
-                Body::from(serde_json::to_vec(&NamespaceClaimRequest {
-                    hostname: "other.cloud.example.test".to_owned(),
-                })?),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                    "other.cloud.example.test",
+                ))?),
             ))
             .await?;
         assert_eq!(foreign_child.status(), StatusCode::CONFLICT);
@@ -1150,9 +1574,9 @@ mod tests {
                     Method::POST,
                     sink_protocol::NAMESPACE_COLLECTION_PATH,
                     Some(alice.token.expose_secret()),
-                    Body::from(serde_json::to_vec(&NamespaceClaimRequest {
-                        hostname: hostname.to_owned(),
-                    })?),
+                    Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                        hostname,
+                    ))?),
                 ))
                 .await?;
             let error: ManagementErrorResponse = json(response).await?;
@@ -1178,9 +1602,9 @@ mod tests {
                     Method::POST,
                     sink_protocol::NAMESPACE_COLLECTION_PATH,
                     Some(alice.token.expose_secret()),
-                    Body::from(serde_json::to_vec(&NamespaceClaimRequest {
-                        hostname: hostname.to_owned(),
-                    })?),
+                    Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                        hostname,
+                    ))?),
                 ))
                 .await?;
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -1262,9 +1686,9 @@ mod tests {
                 Method::POST,
                 sink_protocol::NAMESPACE_COLLECTION_PATH,
                 Some(alice.token.expose_secret()),
-                Body::from(serde_json::to_vec(&NamespaceClaimRequest {
-                    hostname: "cloud.example.test".to_owned(),
-                })?),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                    "cloud.example.test",
+                ))?),
             ))
             .await?;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -1329,9 +1753,9 @@ mod tests {
                     Method::POST,
                     sink_protocol::NAMESPACE_COLLECTION_PATH,
                     Some(alice.token.expose_secret()),
-                    Body::from(serde_json::to_vec(&NamespaceClaimRequest {
-                        hostname: hostname.to_owned(),
-                    })?),
+                    Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                        hostname,
+                    ))?),
                 ))
                 .await?;
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -1402,9 +1826,7 @@ mod tests {
             )
             .map_err(|error| format!("route claim failed: {error:?}"))?;
         let app = router(state);
-        let body = serde_json::to_vec(&NamespaceClaimRequest {
-            hostname: "taken.example.test".to_owned(),
-        })?;
+        let body = serde_json::to_vec(&NamespaceClaimRequest::managed("taken.example.test"))?;
 
         let foreign = app
             .clone()
@@ -1467,9 +1889,9 @@ mod tests {
                 Method::POST,
                 sink_protocol::NAMESPACE_COLLECTION_PATH,
                 Some(alice.token.expose_secret()),
-                Body::from(serde_json::to_vec(&NamespaceClaimRequest {
-                    hostname: "cloud.example.test".to_owned(),
-                })?),
+                Body::from(serde_json::to_vec(&NamespaceClaimRequest::managed(
+                    "cloud.example.test",
+                ))?),
             ))
             .await?;
         assert_eq!(created.status(), StatusCode::CREATED);
