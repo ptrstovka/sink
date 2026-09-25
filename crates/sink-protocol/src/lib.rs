@@ -9,6 +9,8 @@
 mod handshake;
 mod management;
 mod message_io;
+mod proxy_v2;
+mod stream_open;
 mod subdomain;
 
 pub use handshake::{
@@ -20,6 +22,15 @@ pub use management::{
     NamespaceResponse, NamespaceState,
 };
 pub use message_io::MessageIo;
+pub use proxy_v2::{
+    MAX_PROXY_V2_HEADER_BYTES, PROXY_V2_PREFIX_BYTES, PROXY_V2_SIGNATURE, ParsedProxyV2,
+    ProxyV2Error, ProxyV2Header, ProxyV2ReadError, parse_proxy_v2, read_proxy_v2,
+};
+pub use stream_open::{
+    DecodedRawStreamOpen, MAX_ROUTE_HOSTNAME_BYTES, MAX_STREAM_OPEN_BYTES, RAW_STREAM_OPEN_MAGIC,
+    RAW_STREAM_OPEN_PREFIX_BYTES, RAW_STREAM_OPEN_VERSION, RAW_TCP_STREAM_KIND, RawTcpStreamOpen,
+    StreamOpen, StreamOpenError, StreamOpenReadError, decode_raw_stream_open, read_raw_stream_open,
+};
 pub use subdomain::{Subdomain, SubdomainError};
 
 /// Current wire-contract version.
