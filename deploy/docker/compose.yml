@@ -6,6 +6,11 @@ services:
       SINK_SERVER_PUBLIC_BASE_DOMAIN: ${SINK_PUBLIC_BASE_DOMAIN:?set SINK_PUBLIC_BASE_DOMAIN}
       SINK_SERVER_HTTP_LISTEN_ADDRESS: 0.0.0.0:8080
       SINK_SERVER_HTTPS_LISTEN_ADDRESS: 0.0.0.0:8443
+      SINK_SERVER_HTTPS_PROXY_PROTOCOL: required-v2
+      # Use the canonical CIDR Sink observes for the Traefik peer. For a
+      # host Traefik reaching this published port through Docker, that may be
+      # the exact bridge-gateway /32 rather than 127.0.0.1/32.
+      SINK_SERVER_HTTPS_PROXY_TRUSTED_PEER_CIDRS: ${SINK_HTTPS_PROXY_TRUSTED_PEER_CIDRS:?set SINK_HTTPS_PROXY_TRUSTED_PEER_CIDRS to the exact Traefik peer CIDR}
       SINK_SERVER_MAX_NAMESPACE_DEPTH: ${SINK_MAX_NAMESPACE_DEPTH:-2}
       SINK_SERVER_CERTIFICATE_PROVIDER: cloudflare
       SINK_SERVER_CERTIFICATE_BACKEND_ENABLED: "true"

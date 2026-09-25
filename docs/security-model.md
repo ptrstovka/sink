@@ -4,9 +4,15 @@
 
 - Public visitors are untrusted. A public tunnel has no Sink-provided visitor
   authentication; the local application must enforce its own access control.
-- Traefik is the public TLS boundary. It forwards plaintext HTTP to one
-  `sink-server` listener, so that hop must stay on loopback or an equivalently
-  trusted private network.
+- Traefik is the public TCP/SNI boundary for the Sink domain tree, not its TLS
+  endpoint. It forwards plaintext port-80 HTTP to one `sink-server` listener
+  and unchanged port-443 TLS to another. Sink terminates managed TLS, while an
+  Edge service terminates TLS for a passthrough namespace. Both upstream hops
+  must stay on loopback or an equivalently trusted private network.
+- When HTTPS ingress uses PROXY v2, Traefik is a trusted metadata source only
+  from its explicitly configured canonical peer CIDR. Sink's `required-v2`
+  mode rejects untrusted peers and missing, malformed, oversized, unsupported,
+  or `LOCAL` headers before TLS dispatch.
 - Client control traffic authenticates with a per-account bearer token over
   TLS. The client validates the control hostname and never silently
   downgrades.
@@ -31,12 +37,33 @@ replace its own older control link. Control-channel heartbeats bound how long a
 silently lost link can remain active. Sink does not replay interrupted
 application requests.
 
+A durable passthrough claim is explicit and mode-stable. It authorizes one
+runtime route for exactly its apex and direct children. Covered exact routes
+cannot shadow it, deeper names receive no implicit coverage, and overlapping
+passthrough wildcards are rejected. When its client broker is missing or
+disconnected, matching HTTP and TLS fail closed rather than falling back to a
+managed certificate or another route.
+
 ## Forwarded headers
 
 Sink forwards the public host, scheme, and visitor address to the local
 application. Traefik must replace visitor-supplied forwarding headers. If
 another proxy sits in front of Traefik, trust its headers only from its known
 source addresses.
+
+Raw TLS uses a separate binary metadata chain. The outer proxy creates PROXY
+v2; Sink accepts it only from a configured peer, validates it, and carries only
+the trusted source/destination sockets plus route hostname inside the
+authenticated tunnel stream. If the route opts into outgoing PROXY v2, the
+client constructs a fresh header and does not copy inbound TLVs. Edge must
+require PROXY v2 only on this listener and trust only the Sink client peer;
+accepting it from an application or visitor network would allow source-address
+spoofing.
+
+The route file contains targets and policy, not the bearer token. Keep the
+token in the client's private saved configuration and keep both files readable
+only by the service identity. Command-line token overrides may appear in
+process listings.
 
 ## Local inspector boundary
 
@@ -104,8 +131,11 @@ are unacceptable.
 Sink does not authenticate public visitors or apply per-account quotas. The
 server does not retain tunneled bodies; the optional local client inspector has
 the bounded retention described above. Sink is not a WAF, DDoS service, or
-malware scanner. Public TLS ends at Traefik, and a random tunnel URL is not
-access control.
+malware scanner. A random tunnel URL is not access control. Public TLS ends at
+Sink for managed namespaces and at Edge for passthrough namespaces; Sink never
+terminates, inspects, or supplies the Edge certificate for passthrough traffic.
+HTTP-to-HTTPS redirects are application or Edge policy and are not added by
+this implementation.
 
 ## Leaked token
 

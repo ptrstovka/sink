@@ -5,22 +5,29 @@ Sink uses two executables and one public ingress:
 ```text
 sink client --TLS/WebSocket--+
                              |
-public HTTPS :443 --TLS/SNI--> Traefik --TCP passthrough--> Sink HTTPS listener
-                                                               |
-public HTTP  :80 ---Host-----> Traefik ----plain HTTP-------> Sink HTTP listener
-                                                               |
-                                      control and tunnel routing
-                                                               |
-local HTTP/S application <--- multiplexed streams <--- sink client
+public TLS :443 --SNI--> Traefik --PROXY v2 + unchanged TLS--> Sink HTTPS listener
+                                                                   |
+                        +--------------- managed TLS termination ---+--- HTTP tunnel
+                        |
+                        +-- passthrough SNI dispatch -- raw tunnel ------+
+                                                                         |
+public HTTP :80 --Host--> Traefik --plain HTTP--> Sink HTTP listener ----+-- HTTP tunnel
+                                                                         |
+                                         one authenticated route session |
+                                                                         v
+                                         sink client --> Edge :80 / :443
 ```
 
 Traefik remains the shared-public-IP multiplexer, not the TLS endpoint for the
 configured Sink domain tree. On port 80 it selects the base-domain apex and
 every descendant using the HTTP Host and forwards plaintext HTTP to Sink's HTTP
 listener. On port 443 it selects the same tree using TLS SNI and forwards the
-TCP stream unchanged to Sink's HTTPS listener. Sink selects the certificate,
-terminates TLS, and requires the resulting HTTP Host to match the SNI. Neither
-layer automatically redirects HTTP to HTTPS.
+TCP stream unchanged after a PROXY v2 header to Sink's HTTPS listener. Sink
+authenticates the immediate proxy peer before trusting that header. It then
+either selects a managed certificate and terminates TLS, or routes a durable
+passthrough namespace without consuming or changing the TLS bytes. For managed
+TLS, the resulting HTTP Host must match the SNI. Neither layer automatically
+redirects HTTP to HTTPS.
 
 The entire configured base-domain tree reaches Sink. Traefik deliberately does
 not limit the number of descendant labels or know about users, namespaces, or
@@ -36,11 +43,23 @@ concurrency and backpressure while allowing request/response bodies, SSE, and
 WebSockets to flow without whole-body buffering.
 
 Persistent namespace claims and active tunnel route leases are different
-resources. A namespace claim authorizes its apex and one wildcard certificate;
-only the adjacent parent owner can create a nested claim, and configured
-maximum depth bounds persistent claims. Certificate issuance happens while a
-namespace claim progresses toward active state, never as a side effect of
-starting a tunnel. System names such as `connect` remain reserved.
+resources. A managed namespace claim authorizes its apex and one wildcard
+certificate. A passthrough claim authorizes one canonical wildcard route whose
+scope is exactly the namespace apex and one direct child label. It neither
+permits deeper names implicitly nor allows an exact route at the apex or a
+covered direct child to override it. Only the adjacent parent owner can create
+a nested claim, and configured maximum depth bounds persistent claims.
+Certificate issuance happens only for managed claims while they progress
+toward active state, never as a side effect of starting a tunnel. Passthrough
+claims become active without Sink certificate issuance. System names such as
+`connect` remain reserved.
+
+The client represents a passthrough namespace with one `[[routes]]` entry and
+one control session. Its existing HTTP `target` receives port-80 traffic for
+the apex and direct children; its optional `tls_target` receives the raw
+port-443 streams. `proxy_protocol = "v2"` makes the client construct a new,
+minimal PROXY v2 header for the Edge connection. A normal route has neither
+field by default and remains an exact HTTP/managed-TLS route.
 
 An active tunnel route is still owned by a client-run UUID. Clean exit releases
 the route, while an unexpected disconnect retains it briefly for same-run
@@ -54,20 +73,35 @@ is never automatically replayed.
 SQLite stores accounts, named token digests and revisions, persistent namespace
 claims, ACME account/order state, certificate material, and other durable
 administrative data. Active tunnel routes remain runtime leases rather than
-permanent reservations. A short revocation check closes active sessions after
-account disable or token rotation.
+permanent reservations. A durable passthrough claim whose broker is absent or
+disconnected is still an authorization boundary: matching HTTP fails
+unavailable and matching TLS is closed rather than falling through to an exact
+or managed route. A short revocation check closes active sessions after account
+disable or token rotation.
 
 With managed TLS enabled, startup reconciles durable certificate orders,
 provisions or reuses the base-domain apex-plus-wildcard certificate, loads the
-fail-closed SNI resolver, and refreshes namespace authorization before either
-listener accepts traffic. Base-certificate unavailability fails startup. The
-certificate lifecycle runs immediately after readiness and every 30 seconds;
-shutdown drains it together with both listeners.
+fail-closed SNI resolver, and refreshes managed and passthrough namespace
+authorization before either listener accepts traffic. Base-certificate
+unavailability fails startup. The certificate lifecycle runs immediately after
+readiness and every 30 seconds; shutdown drains it together with both
+listeners. Managed and passthrough namespaces therefore coexist on one HTTPS
+listener without making Edge certificates available to Sink.
 
 Forwarding preserves method, path, query, body, status, and end-to-end headers.
 The local Host targets the local service; standard forwarded headers carry the
 original public host/scheme and visitor address. Control credentials never
 enter the forwarded HTTP exchange.
+
+For raw TLS, the trusted address chain is deliberately rebuilt at each trust
+boundary. Traefik sends public source/destination addresses in PROXY v2; Sink
+accepts them only from configured canonical peer CIDRs; Sink encodes those
+addresses as server-originated metadata inside the authenticated,
+integrity-protected tunnel; and the client optionally creates a fresh PROXY v2
+header for Edge. Inbound TLVs and untrusted visitor-supplied bytes are never
+copied through as trusted metadata. Edge must accept PROXY v2 only from the
+exact Sink client peer. Edge owns the certificate and performs the public TLS
+handshake.
 
 ## Local traffic inspector
 

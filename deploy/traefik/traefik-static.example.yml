@@ -5,6 +5,9 @@
 # The websecure entry point may also retain unrelated HTTP routers: Traefik
 # evaluates a matching Sink TCP/SNI router first and falls through to HTTP
 # routing for other domains.
+# The dynamic Sink TCP service sends PROXY v2 to its upstream. Configure Sink
+# to require it and trust only the exact Traefik peer CIDR; do not enable
+# entry-point forwarded-header trust for arbitrary public sources.
 entryPoints:
   web:
     address: ":80"

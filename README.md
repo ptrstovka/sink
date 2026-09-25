@@ -2,7 +2,9 @@
 
 Sink is a self-hosted reverse tunnel for HTTP and HTTPS. Run the `sink` client
 beside a local web service, and `sink-server` makes it available at a generated
-or chosen subdomain of your own domain.
+or chosen subdomain of your own domain. A durable namespace can use
+Sink-managed TLS or opt into raw TLS passthrough to an Edge service that owns
+its certificates.
 
 Sink streams request and response bodies without buffering them in full. It
 supports large transfers, SSE, WebSockets, concurrent requests, reconnecting
@@ -13,14 +15,17 @@ request/response previews while a tunnel is running.
 ## How it fits together
 
 ```text
-public visitor --HTTP/S--> Traefik --plaintext HTTP--> sink-server
-                                                       ^
-sink client --authenticated TLS control WebSocket------+---> local HTTP/S app
+public HTTP -------> Traefik -----------> sink-server --tunnel--> sink client --HTTP--> app/Edge :80
+public TLS --------> Traefik --PROXY v2--> sink-server --raw TLS-> sink client --TCP---> Edge :443
+                                                  \--managed TLS/HTTP tunnel for other namespaces
 ```
 
-Traefik owns public TLS. Both `connect.<base-domain>` and public tunnel hosts
-route to one loopback-bound `sink-server` listener. See
-[architecture](docs/architecture.md) and [security model](docs/security-model.md).
+Traefik selects the Sink domain tree but does not terminate its TLS. Sink
+terminates managed namespaces and forwards passthrough namespace TLS unchanged.
+The HTTPS proxy hop can preserve public socket addresses with required,
+peer-restricted PROXY v2. See [architecture](docs/architecture.md), the
+[security model](docs/security-model.md), and the
+[server deployment reference](docs/server-reference.md).
 
 ## Install
 
@@ -53,6 +58,20 @@ sink http 3000 --url https://demo.example.com
 
 Targets may also be `host:port`, `http://...`, or `https://...`. The control
 connection and local HTTPS targets validate certificates by default.
+
+For a raw-TLS Edge namespace, claim it explicitly and use one `sink connect`
+route whose HTTP `target` and raw `tls_target` share the same public namespace:
+
+```console
+sink namespace claim edge.example.com --passthrough
+sink connect --config edge-routes.toml
+```
+
+The route file and required trust chain are documented in the
+[client reference](docs/client-reference.md#raw-tls-passthrough-to-an-edge-service).
+Omitting `--passthrough` preserves managed namespace claims; ordinary routes
+without `tls_target` or `proxy_protocol` remain exact HTTP/managed-TLS routes.
+Sink never adds an HTTP-to-HTTPS redirect.
 
 For cross-origin assets, use `--cors-allow-origin https://other.example.com`
 or `--cors-allow-origin '*'`. Credentialed requests additionally require

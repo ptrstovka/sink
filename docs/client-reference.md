@@ -74,6 +74,71 @@ network or server interruption it reconnects and reclaims the same address.
 The interrupted in-flight operation fails and is never replayed; new traffic
 works after reconnection.
 
+## Raw TLS passthrough to an Edge service
+
+Claim the Edge namespace with the explicit passthrough mode. Omitting the flag
+continues to create a managed-TLS namespace:
+
+```console
+sink namespace claim edge.example.com --passthrough
+sink namespace status edge.example.com
+```
+
+A passthrough claim becomes active without requesting a certificate from
+Sink's ACME provider. Its route covers exactly `edge.example.com` and one
+direct child such as `app.edge.example.com`. It does not cover
+`deep.app.edge.example.com`, and neither the apex nor a covered direct child can
+be shadowed by an exact route. Use a separate authorized namespace for deeper
+names.
+
+Run the namespace with one `[[routes]]` entry and one control session. For
+example, save this as `edge-routes.toml`:
+
+```toml
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+target = "http://edge.internal:80"
+tls_target = "tcp://edge.internal:443"
+proxy_protocol = "v2"
+inspect = false
+```
+
+The route `url` is the claimed namespace apex. Its normal `target` receives
+HTTP for the apex and direct children through the HTTP tunnel. `tls_target`
+must be a `tcp://host:port` address and receives the original TLS bytes for the
+same scope. Edge, not Sink, presents and manages the certificate on port 443.
+Sink never terminates the passthrough handshake. There is no implicit
+HTTP-to-HTTPS redirect. The example explicitly disables the HTTP inspector so
+a long-running Edge route does not retain request/response previews; raw TLS is
+never inspected regardless of this setting.
+
+`proxy_protocol = "v2"` is optional. When present, the client creates a fresh
+PROXY v2 header from the source/destination metadata authenticated by
+`sink-server`, writes it before the untouched TLS bytes, and connects to Edge.
+Configure Edge to accept PROXY v2 only from the exact Sink client peer. When the
+field is omitted, the client sends no PROXY header. `proxy_protocol` is invalid
+without `tls_target`; the only accepted outgoing version is `v2`.
+
+The command validates the entire file before it starts any route:
+
+```console
+sink connect --config edge-routes.toml
+```
+
+Authentication and the control server remain in the private saved client
+configuration or the command's global overrides; they are not route-file
+fields. Keep the route file private if internal hostnames are sensitive. A
+generic `[[routes]]` entry with only `name`, `url`, and `target` remains an exact
+HTTP/managed-TLS route: raw TLS and outgoing PROXY v2 are off by default.
+
+Use a process manager for production. Restart gracefully so the old route is
+released before the replacement starts. An unexpected exit retains the lease
+briefly for same-run reconnect; a new process has a new run identity and may
+need to wait for that grace period. The durable namespace persists in server
+SQLite, but the HTTP and raw-TLS broker exists only while `sink connect` is
+connected. During client or Edge downtime the namespace fails closed.
+
 ## Cross-origin assets and requests
 
 CORS is opt-in per tunnel and applies to all its HTTP paths for the current run.
@@ -198,6 +263,12 @@ validated by default; `--local-tls-insecure` applies only to an explicit
 - Address conflict: choose another name or wait until the active claimant exits.
 - Public `503`: the client is disconnected or its local target is unavailable;
   start the target and retry a new request.
+- Passthrough TLS closes before the Edge handshake: confirm the durable claim
+  is passthrough and active, `sink connect` is running its apex route, Traefik
+  and Sink agree on required PROXY v2, and Edge is reachable on `tls_target`.
+- Edge logs the Sink client address instead of the visitor address: set
+  `proxy_protocol = "v2"` and make Edge require/trust PROXY v2 only from that
+  client peer.
 - Local HTTPS certificate error: fix the certificate trust/hostname. Use the
   development opt-out only for a target you control.
 - Missing configuration: save the token and server address, or pass
