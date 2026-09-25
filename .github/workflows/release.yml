@@ -95,7 +95,7 @@ jobs:
           mkdir -p dist/package
           install -m 0755 "target/${{ matrix.target }}/release/sink" dist/package/sink
           install -m 0755 "target/${{ matrix.target }}/release/sink-server" dist/package/sink-server
-          install -m 0644 LICENSE-MIT dist/package/LICENSE-MIT
+          install -m 0644 LICENSE dist/package/LICENSE
 
       - name: Import Apple signing certificate
         if: matrix.macos
@@ -252,7 +252,7 @@ jobs:
           set -euo pipefail
           archive="sink-${RELEASE_TAG}-${{ matrix.archive_suffix }}.tar.gz"
           tar -C dist/package -czf "dist/${archive}" \
-            sink sink-server LICENSE-MIT
+            sink sink-server LICENSE
 
       - name: Verify unpacked release package
         shell: bash

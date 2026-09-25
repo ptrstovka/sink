@@ -12,8 +12,7 @@ The binary matrix has exactly four native lanes:
 - `aarch64-unknown-linux-musl` (`linux-arm64`)
 - `x86_64-unknown-linux-musl` (`linux-x86_64`)
 
-Every lane uses Node 24 with its bundled npm and the package-lock v3 file as the
-npm cache key input. It runs this order once before Cargo:
+Each build verifies and bundles the dashboard before compiling the binaries:
 
 ```console
 cd dashboard
@@ -23,12 +22,8 @@ cd ..
 cargo build --release --locked --target TARGET --bin sink --bin sink-server
 ```
 
-`npm run verify` already runs the Vitest and production-source guard through
-`npm test`, then typechecking, the Vite production build, and the
-production-bundle guard through `npm run build`. Do not duplicate or bypass
-those guards. The resulting `dashboard/dist` is generated once and kept
-unchanged for the job's release Cargo build. Cargo only consumes and embeds
-those bytes; it must not invoke npm or fetch frontend assets.
+`npm run verify` runs the frontend tests, typecheck, production build, and
+source and bundle guards. The Cargo build embeds the generated dashboard.
 
 The release remains a `.tar.gz`. Apple publishes notarization tickets online
 for the two standalone executables, so they don't need to be wrapped in an app,
@@ -132,14 +127,9 @@ After configuring the secrets, use the workflow's `Run workflow` action with an
 existing release tag to replace that release's unsigned archives. New published
 releases use the same workflow automatically.
 
-This is a binary-release workflow from a full repository checkout. Publishing
-the Cargo workspace or `sink-client` as a crates.io/source package is out of
-scope: ignored `dashboard/dist` is deliberately prebuilt and is not included in
-a Cargo source archive. Supporting source packages would require a separate,
-explicit asset-packaging design. Running the workflow, publishing assets, and
-the manual one-hour soak are release-operator gates; documentation or CI
-changes do not claim they have run. They also do not claim that a live update
-against a published release or an in-place replacement was exercised.
+Sink is distributed through binary archives and the server container; crates.io
+publication is not part of the release process. Publishing the assets and
+completing the manual acceptance gates remain release-operator responsibilities.
 
 ## Verify a downloaded release
 

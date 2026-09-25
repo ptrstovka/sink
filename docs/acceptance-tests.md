@@ -1,9 +1,8 @@
 # Acceptance tests
 
-## Focused automated gates
+## Automated checks
 
-Normal CI builds one deterministic embedded dashboard before any Cargo command
-that can compile `sink-client`:
+Run the fast automated checks before starting the manual acceptance suite:
 
 ```console
 cd dashboard
@@ -15,32 +14,17 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
 
-CI installs Node 24 with its bundled npm and keys the npm cache from
-`dashboard/package-lock.json` (lockfile v3). `npm run verify` is the single
-frontend gate: `npm test` runs Vitest plus the production-source guard, and
-`npm run build` runs typechecking, Vite build, and the production-bundle guard.
-Cargo reuses the generated `dashboard/dist` and never invokes npm or downloads
-assets. Fast Rust tests cover inspector retention, body states, header masking,
-loopback request guards, list/detail/SSE and mutations, replay/cURL behavior,
-embedded assets, and dashboard lifecycle. Formatting is also checked with the
-command shown above; it does not compile `sink-client`.
-
-The four-lane binary release workflow verifies that native `sink version` and
-`sink-server version` output from each unpacked archive matches the release tag,
-and runs a packaged embedded-dashboard smoke on native Linux x86_64. That smoke
-starts only the copied `sink` from an empty directory with Node absent from
-PATH, verifies embedded HTML, hashed JavaScript, and the transaction API, then
-signals the process and proves loopback port release. Those checks run when the
-release workflow is invoked; this document does not claim a release has been
-published.
+`npm run verify` runs the frontend tests, typecheck, production build, and
+source and bundle guards. The Rust checks cover inspector retention, body
+states, header masking, loopback request guards, list/detail/SSE and mutations,
+replay/cURL behavior, embedded assets, and dashboard lifecycle.
 
 ## Manual acceptance gates
 
 These tests transfer multi-gigabyte data, run for an hour, and deliberately
 interrupt connections and processes. Run them manually in an isolated
-environment. Normal CI intentionally excludes the 1 GiB transfers, one-hour
-soak, repeated disruption, and performance stress; focused automated coverage
-does not replace these gates or claim they have run.
+environment. The fast automated checks do not replace the 1 GiB transfers,
+one-hour soak, repeated disruption, or performance stress.
 
 Use the guarded harness under `scripts/acceptance/`.
 

@@ -61,10 +61,10 @@ For a namespace already claimed with `--passthrough`, use the namespace apex as
 
 ```toml
 [[routes]]
-name = "edge"
-url = "https://edge.example.com"
-target = "http://edge.internal:80"
-tls_target = "tcp://edge.internal:443"
+name = "passthrough"
+url = "https://tls.example.com"
+target = "http://service.internal:80"
+tls_target = "tcp://service.internal:443"
 proxy_protocol = "v2"
 inspect = false
 ```

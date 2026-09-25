@@ -180,7 +180,7 @@ fn prepare_request_headers(
     let scheme = context
         .public_scheme
         .unwrap_or_else(|| forwarded_scheme(headers));
-    let visitor = forwarded_visitor(headers).or(context.peer_ip);
+    let visitor = context.peer_ip.or_else(|| forwarded_visitor(headers));
     strip_hop_by_hop(headers, preserve_upgrade);
     headers.remove(FORWARDED);
     headers.remove(&X_FORWARDED_FOR);
@@ -391,6 +391,30 @@ mod tests {
 
         assert_eq!(headers[X_FORWARDED_PROTO], "http");
         assert_eq!(headers[FORWARDED], "host=demo.example.test;proto=http");
+    }
+
+    #[test]
+    fn listener_peer_overrides_untrusted_forwarded_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("demo.example.test"));
+        headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.8"));
+
+        prepare_request_headers(
+            &mut headers,
+            &ForwardingContext {
+                public_host: "demo.example.test".to_owned(),
+                peer_ip: Some("198.51.100.9".parse().expect("test address")),
+                public_scheme: Some("http"),
+            },
+            false,
+        )
+        .expect("safe metadata");
+
+        assert_eq!(headers[X_FORWARDED_FOR], "198.51.100.9");
+        assert_eq!(
+            headers[FORWARDED],
+            "for=198.51.100.9;host=demo.example.test;proto=http"
+        );
     }
 
     #[test]
