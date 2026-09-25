@@ -2937,10 +2937,11 @@ async fn generated_tunnel_preserves_and_streams_mixed_traffic() -> TestResult<()
     assert!(observed.contains(&format!("host={}", fixture.addr)));
     assert!(observed.contains("authorization=Visitor public-credential"));
     assert!(observed.contains(&format!(
-        "forwarded=for=203.0.113.9;host={};proto=http",
+        "forwarded=for=127.0.0.1;host={};proto=http",
         info.hostname
     )));
-    assert!(observed.contains("x-forwarded-for=203.0.113.9"));
+    assert!(observed.contains("x-forwarded-for=127.0.0.1"));
+    assert!(!observed.contains("203.0.113.9"));
     assert!(observed.contains(&format!("x-forwarded-host={}", info.hostname)));
     assert!(observed.contains("x-forwarded-proto=http"));
     assert!(observed.contains("x-e2e-request=preserved"));
