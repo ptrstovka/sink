@@ -152,10 +152,31 @@ async fn execute(
     cancellation: CancellationToken,
     settings: NamespaceSettings,
 ) -> Result<NamespaceCommandOutput, NamespaceError> {
-    let api = NamespaceApiClient::new(config, settings.request_timeout)?;
+    let claim_wait = match &command {
+        NamespaceCommand::Claim(arguments) if !arguments.no_wait => {
+            Some(ClaimWait::new(Duration::from_secs(arguments.timeout)))
+        }
+        _ => None,
+    };
+    let request_timeout = command_request_timeout(&command, settings.request_timeout);
+    let api = NamespaceApiClient::new(config, request_timeout)?;
     match command {
         NamespaceCommand::Claim(arguments) => {
-            let mut namespace = api.claim(&arguments.hostname, &cancellation).await?;
+            let mut namespace = if let Some(wait) = claim_wait {
+                match timeout_at(wait.deadline, api.claim(&arguments.hostname, &cancellation)).await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(NamespaceError::ClaimTimeout {
+                            hostname: arguments.hostname,
+                            timeout_seconds: wait.timeout_seconds,
+                            last_state: "unknown",
+                        });
+                    }
+                }
+            } else {
+                api.claim(&arguments.hostname, &cancellation).await?
+            };
             if arguments.no_wait {
                 ensure_claim_can_succeed(&namespace)?;
             } else if namespace.state != NamespaceState::Active {
@@ -169,7 +190,7 @@ async fn execute(
                 let hostname = namespace.hostname.clone();
                 namespace = wait_for_active(
                     namespace,
-                    Duration::from_secs(arguments.timeout),
+                    claim_wait.expect("waiting claims have a deadline"),
                     settings.poll_policy,
                     &cancellation,
                     || api.status(&hostname, &cancellation),
@@ -189,6 +210,37 @@ async fn execute(
         NamespaceCommand::Release(arguments) => {
             api.release(&arguments.hostname, &cancellation).await?;
             Ok(NamespaceCommandOutput::Released(arguments.hostname))
+        }
+    }
+}
+
+fn command_request_timeout(command: &NamespaceCommand, default: Duration) -> Duration {
+    match command {
+        // A waited claim may legitimately keep its initial POST open while
+        // issuance completes, but ClaimWait still caps the whole POST + poll
+        // sequence. --no-wait has no activation budget and keeps the normal
+        // bounded request timeout.
+        NamespaceCommand::Claim(arguments) if !arguments.no_wait => {
+            default.max(Duration::from_secs(arguments.timeout))
+        }
+        NamespaceCommand::Claim(_)
+        | NamespaceCommand::List(_)
+        | NamespaceCommand::Status(_)
+        | NamespaceCommand::Release(_) => default,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClaimWait {
+    deadline: Instant,
+    timeout_seconds: u64,
+}
+
+impl ClaimWait {
+    fn new(duration: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + duration,
+            timeout_seconds: duration.as_secs(),
         }
     }
 }
@@ -486,7 +538,7 @@ fn ensure_claim_can_succeed(namespace: &Namespace) -> Result<(), NamespaceError>
 
 async fn wait_for_active<P, F>(
     mut namespace: Namespace,
-    wait_timeout: Duration,
+    wait: ClaimWait,
     policy: PollPolicy,
     cancellation: &CancellationToken,
     mut poll: P,
@@ -495,8 +547,8 @@ where
     P: FnMut() -> F,
     F: Future<Output = Result<Namespace, NamespaceError>>,
 {
-    let deadline = Instant::now() + wait_timeout;
-    let timeout_seconds = wait_timeout.as_secs();
+    let deadline = wait.deadline;
+    let timeout_seconds = wait.timeout_seconds;
     let mut delay = policy.initial_delay;
 
     loop {
@@ -603,6 +655,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeState {
         responses: Arc<Mutex<VecDeque<FakeResponse>>>,
+        response_delays: Arc<Mutex<VecDeque<Duration>>>,
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
     }
 
@@ -642,6 +695,13 @@ mod tests {
                     r#"{"error":{"code":"service_unavailable","message":"missing fake response"}}"#
                         .to_owned(),
             });
+        let delay = state
+            .response_delays
+            .lock()
+            .ok()
+            .and_then(|mut delays| delays.pop_front())
+            .unwrap_or_default();
+        tokio::time::sleep(delay).await;
         let built = Response::builder()
             .status(response.status)
             .header(CONTENT_TYPE, "application/json")
@@ -652,8 +712,16 @@ mod tests {
     async fn fake_server(
         responses: Vec<FakeResponse>,
     ) -> Result<(String, FakeState, JoinHandle<()>), Box<dyn Error>> {
+        fake_server_with_delays(responses, Vec::new()).await
+    }
+
+    async fn fake_server_with_delays(
+        responses: Vec<FakeResponse>,
+        response_delays: Vec<Duration>,
+    ) -> Result<(String, FakeState, JoinHandle<()>), Box<dyn Error>> {
         let state = FakeState {
             responses: Arc::new(Mutex::new(responses.into())),
+            response_delays: Arc::new(Mutex::new(response_delays.into())),
             requests: Arc::default(),
         };
         let router = Router::new()
@@ -699,6 +767,134 @@ mod tests {
                 max_delay: Duration::from_millis(1),
             },
         }
+    }
+
+    #[test]
+    fn claim_request_timeout_distinguishes_wait_and_no_wait() -> Result<(), Box<dyn Error>> {
+        for (arguments, expected) in [
+            (
+                vec!["sink", "namespace", "claim", "cloud.example.test"],
+                300,
+            ),
+            (
+                vec![
+                    "sink",
+                    "namespace",
+                    "claim",
+                    "cloud.example.test",
+                    "--timeout",
+                    "45",
+                ],
+                45,
+            ),
+            (
+                vec![
+                    "sink",
+                    "namespace",
+                    "claim",
+                    "cloud.example.test",
+                    "--timeout",
+                    "5",
+                ],
+                10,
+            ),
+            (
+                vec![
+                    "sink",
+                    "namespace",
+                    "claim",
+                    "cloud.example.test",
+                    "--no-wait",
+                ],
+                10,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments)?;
+            let SinkCommand::Namespace(arguments) = cli.command else {
+                return Err("expected namespace command".into());
+            };
+            assert_eq!(
+                command_request_timeout(&arguments.command, REQUEST_TIMEOUT),
+                Duration::from_secs(expected)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_wait_claim_keeps_the_normal_request_bound() -> Result<(), Box<dyn Error>> {
+        let hostname = "cloud.example.test";
+        let (server, _state, task) = fake_server_with_delays(
+            vec![FakeResponse {
+                status: StatusCode::CREATED,
+                body: namespace_json(hostname, NamespaceState::Active)?,
+            }],
+            vec![Duration::from_millis(100)],
+        )
+        .await?;
+        let cli = Cli::try_parse_from(["sink", "namespace", "claim", hostname, "--no-wait"])?;
+        let SinkCommand::Namespace(arguments) = cli.command else {
+            return Err("expected namespace command".into());
+        };
+        let settings = NamespaceSettings {
+            request_timeout: Duration::from_millis(20),
+            poll_policy: test_settings().poll_policy,
+        };
+
+        let error = execute(
+            arguments.command,
+            resolved(&server, "test-only-secret")?,
+            CancellationToken::new(),
+            settings,
+        )
+        .await
+        .expect_err("no-wait request should retain the normal request timeout");
+        assert!(matches!(error, NamespaceError::RequestTimeout));
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activation_timeout_is_one_budget_for_claim_and_polling() -> Result<(), Box<dyn Error>>
+    {
+        let hostname = "cloud.example.test";
+        let (server, _state, task) = fake_server_with_delays(
+            vec![
+                FakeResponse {
+                    status: StatusCode::ACCEPTED,
+                    body: namespace_json(hostname, NamespaceState::Pending)?,
+                },
+                FakeResponse {
+                    status: StatusCode::OK,
+                    body: namespace_json(hostname, NamespaceState::Active)?,
+                },
+            ],
+            vec![Duration::from_millis(700), Duration::from_millis(700)],
+        )
+        .await?;
+        let cli = Cli::try_parse_from(["sink", "namespace", "claim", hostname, "--timeout", "1"])?;
+        let SinkCommand::Namespace(arguments) = cli.command else {
+            return Err("expected namespace command".into());
+        };
+
+        let error = execute(
+            arguments.command,
+            resolved(&server, "test-only-secret")?,
+            CancellationToken::new(),
+            test_settings(),
+        )
+        .await
+        .expect_err("claim and polling must share the selected activation timeout");
+        assert!(matches!(
+            error,
+            NamespaceError::ClaimTimeout {
+                timeout_seconds: 1,
+                last_state: "pending",
+                ..
+            }
+        ));
+        task.abort();
+        Ok(())
     }
 
     #[tokio::test]
@@ -860,7 +1056,7 @@ mod tests {
         ])));
         let result = wait_for_active(
             namespace("cloud.example.test", NamespaceState::Pending),
-            Duration::from_secs(10),
+            ClaimWait::new(Duration::from_secs(10)),
             PollPolicy {
                 initial_delay: Duration::from_millis(250),
                 max_delay: Duration::from_secs(2),
@@ -885,7 +1081,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         let timeout_error = wait_for_active(
             namespace("cloud.example.test", NamespaceState::Pending),
-            Duration::from_millis(600),
+            ClaimWait::new(Duration::from_millis(600)),
             PollPolicy {
                 initial_delay: Duration::from_millis(250),
                 max_delay: Duration::from_millis(500),
@@ -900,7 +1096,7 @@ mod tests {
         cancellation.cancel();
         let cancelled = wait_for_active(
             namespace("cloud.example.test", NamespaceState::Pending),
-            Duration::from_secs(1),
+            ClaimWait::new(Duration::from_secs(1)),
             PollPolicy {
                 initial_delay: Duration::from_millis(1),
                 max_delay: Duration::from_millis(1),

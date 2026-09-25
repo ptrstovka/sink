@@ -55,6 +55,10 @@ async fn run() -> Result<(), BoxError> {
 }
 
 async fn serve(arguments: sink_server::config::ServeArgs) -> Result<(), BoxError> {
+    // Install the process-wide provider before any managed-TLS dependency can
+    // build a rustls client. The server's feature graph can contain both the
+    // aws-lc and ring providers, so rustls cannot select one implicitly.
+    let _crypto_provider = runtime::default_crypto_provider();
     let config = ServeConfig::resolve(&arguments)?;
     initialize_tracing(&config.log_level)?;
     let database = Database::open(&config.sqlite_path).await?;

@@ -68,8 +68,29 @@ where
             .await
             .map_err(Into::into)
     }
+}
 
+impl<P, S> CertificateManager<P, S>
+where
+    P: CertificateProvider + 'static,
+    S: CertificateStorage + 'static,
+{
     pub async fn provision(
+        &self,
+        request: IssuanceRequest,
+        quota: QuotaSnapshot,
+        now: Timestamp,
+    ) -> Result<ProvisionOutcome, ManagerError> {
+        // Provisioning becomes manager-owned before any durable lifecycle
+        // mutation. Dropping a request that is awaiting this join handle must
+        // not cancel a partially persisted order and leave it InProgress.
+        let manager = self.clone();
+        tokio::spawn(async move { manager.provision_inner(request, quota, now).await })
+            .await
+            .map_err(|_| ManagerError::WorkerStopped)?
+    }
+
+    async fn provision_inner(
         &self,
         request: IssuanceRequest,
         quota: QuotaSnapshot,
@@ -272,6 +293,8 @@ pub enum ManagerError {
     InvalidRequest,
     #[error("certificate storage returned inconsistent state")]
     InconsistentStorage,
+    #[error("certificate issuance worker stopped unexpectedly")]
+    WorkerStopped,
 }
 
 #[cfg(test)]

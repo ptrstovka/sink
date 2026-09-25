@@ -320,7 +320,15 @@ fn certified_key(
 }
 
 pub fn default_crypto_provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    if let Some(provider) = CryptoProvider::get_default() {
+        return Arc::clone(provider);
+    }
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    CryptoProvider::get_default().map_or_else(
+        || Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        Arc::clone,
+    )
 }
 
 pub fn build_tls_server_config(
@@ -408,6 +416,14 @@ mod tests {
 
     fn hostname(value: &str) -> Hostname {
         Hostname::parse(value).expect("valid hostname")
+    }
+
+    #[test]
+    fn default_crypto_provider_is_installed_process_wide() {
+        let selected = default_crypto_provider();
+        let installed = CryptoProvider::get_default().expect("crypto provider installed");
+
+        assert!(Arc::ptr_eq(&selected, installed));
     }
 
     fn material(names: &[&str], not_after: u64) -> CertificateMaterial {

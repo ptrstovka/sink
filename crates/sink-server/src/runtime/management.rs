@@ -646,20 +646,30 @@ fn service_unavailable() -> Response<Body> {
 mod tests {
     use std::{
         error::Error,
-        sync::{Arc, Mutex as StdMutex},
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use futures::future::BoxFuture;
     use http_body_util::BodyExt as _;
     use sink_protocol::{ManagementErrorResponse, NamespaceListResponse, NamespaceResponse};
+    use tokio::{sync::Semaphore, time::timeout};
     use tower::ServiceExt as _;
     use uuid::Uuid;
 
     use crate::{
-        certificates::{CertificateProviderKind, Hostname},
+        certificates::{
+            AccountRecord, CertificateIdentifiers, CertificateMaterial, CertificateProvider,
+            CertificateProviderKind, CertificateState, CertificateStorage, CertificateTarget,
+            Hostname, IssuancePolicy, OrderState, SecretBytes, SqliteCertificateStorage,
+        },
         config::{ConfiguredDomain, ConfiguredDomains},
         namespace_control::{
-            NamespaceCertificateError, NamespaceCertificateProvisioner, NamespaceCertificateRequest,
+            ManagedNamespaceCertificates, NamespaceCertificateError,
+            NamespaceCertificateProvisioner, NamespaceCertificateRequest,
         },
         runtime::{
             admission::{RouteAdmissionError, authorize_hostname_locked},
@@ -737,6 +747,85 @@ mod tests {
                 } else {
                     Ok(())
                 }
+            })
+        }
+    }
+
+    struct BlockingProvider {
+        started: Semaphore,
+        release: Semaphore,
+        issue_count: AtomicUsize,
+    }
+
+    impl BlockingProvider {
+        fn new() -> Self {
+            Self {
+                started: Semaphore::new(0),
+                release: Semaphore::new(0),
+                issue_count: AtomicUsize::new(0),
+            }
+        }
+
+        async fn wait_until_started(&self) {
+            self.started
+                .acquire()
+                .await
+                .expect("provider start semaphore remains open")
+                .forget();
+        }
+
+        fn finish(&self) {
+            self.release.add_permits(1);
+        }
+
+        fn issue_count(&self) -> usize {
+            self.issue_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CertificateProvider for BlockingProvider {
+        fn kind(&self) -> CertificateProviderKind {
+            CertificateProviderKind::Cloudflare
+        }
+
+        fn account_scope(&self) -> &str {
+            "blocking-test-directory"
+        }
+
+        fn provision_account<'a>(
+            &'a self,
+            persisted: Option<&'a AccountRecord>,
+        ) -> BoxFuture<'a, Result<AccountRecord, crate::certificates::ProviderError>> {
+            Box::pin(async move {
+                Ok(persisted.cloned().unwrap_or_else(|| AccountRecord {
+                    provider: CertificateProviderKind::Cloudflare,
+                    account_scope: "blocking-test-directory".to_owned(),
+                    external_account_id: "blocking-test-account".to_owned(),
+                    private_state: SecretBytes::new(b"test-only-account-state".to_vec()),
+                }))
+            })
+        }
+
+        fn issue<'a>(
+            &'a self,
+            _account: &'a AccountRecord,
+            _identifiers: &'a CertificateIdentifiers,
+        ) -> BoxFuture<'a, Result<CertificateMaterial, crate::certificates::ProviderError>>
+        {
+            Box::pin(async move {
+                self.issue_count.fetch_add(1, Ordering::SeqCst);
+                self.started.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("provider release semaphore remains open")
+                    .forget();
+                Ok(CertificateMaterial {
+                    certificate_chain_pem: b"certificate chain".to_vec(),
+                    private_key_pem: SecretBytes::new(b"private key".to_vec()),
+                    not_before: Timestamp::from_unix_seconds(1),
+                    not_after: Timestamp::from_unix_seconds(4_000_000_000),
+                })
             })
         }
     }
@@ -878,6 +967,130 @@ mod tests {
             ))
             .await?;
         assert_eq!(hidden_from_foreign_user.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_claim_request_finishes_issuance_and_later_claim_activates()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let database_path = directory.path().join("management.sqlite3");
+        let database = crate::db::Database::open(&database_path).await?;
+        let alice = database.create_user("alice").await?;
+        let storage = Arc::new(SqliteCertificateStorage::connect(&database_path).await?);
+        let provider = Arc::new(BlockingProvider::new());
+        let certificates: Arc<dyn NamespaceCertificateProvisioner> =
+            Arc::new(ManagedNamespaceCertificates::new(
+                Arc::clone(&provider),
+                Arc::clone(&storage),
+                IssuancePolicy::default(),
+            ));
+        let domain = ConfiguredDomain::new(
+            Hostname::parse("example.test")?,
+            2,
+            CertificateProviderKind::Cloudflare,
+        )?;
+        let state = RuntimeState::with_namespace_control(
+            database,
+            "example.test",
+            ConfiguredDomains::new(vec![domain])?,
+            certificates,
+        )?;
+        let app = router(state.clone());
+        let hostname = "cancelled.example.test";
+        let body = serde_json::to_vec(&NamespaceClaimRequest {
+            hostname: hostname.to_owned(),
+        })?;
+
+        let claim_task = tokio::spawn(app.clone().oneshot(request(
+            Method::POST,
+            sink_protocol::NAMESPACE_COLLECTION_PATH,
+            Some(alice.token.expose_secret()),
+            Body::from(body.clone()),
+        )));
+        timeout(Duration::from_secs(1), provider.wait_until_started()).await?;
+
+        let target = CertificateTarget::namespace(Hostname::parse(hostname)?);
+        assert_eq!(
+            state
+                .database
+                .namespace_claim(hostname)
+                .await?
+                .ok_or("durable claim missing")?
+                .state,
+            NamespaceClaimState::Pending
+        );
+        assert!(matches!(
+            storage.load_order(&target).await?.map(|order| order.state),
+            Some(OrderState::InProgress)
+        ));
+
+        claim_task.abort();
+        assert!(
+            claim_task
+                .await
+                .expect_err("claim request was cancelled")
+                .is_cancelled()
+        );
+        provider.finish();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    storage
+                        .load_order(&target)
+                        .await
+                        .expect("load completed order")
+                        .map(|order| order.state),
+                    Some(OrderState::Succeeded)
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(matches!(
+            storage
+                .load_certificate(&target)
+                .await?
+                .map(|certificate| certificate.state),
+            Some(CertificateState::Ready(_))
+        ));
+        assert_eq!(
+            state
+                .database
+                .namespace_claim(hostname)
+                .await?
+                .ok_or("pending claim missing after issuance")?
+                .state,
+            NamespaceClaimState::Pending
+        );
+
+        let retried = app
+            .oneshot(request(
+                Method::POST,
+                sink_protocol::NAMESPACE_COLLECTION_PATH,
+                Some(alice.token.expose_secret()),
+                Body::from(body),
+            ))
+            .await?;
+        assert_eq!(retried.status(), StatusCode::OK);
+        let retried: NamespaceResponse = json(retried).await?;
+        assert_eq!(
+            retried.namespace.state,
+            sink_protocol::NamespaceState::Active
+        );
+        assert_eq!(
+            state
+                .database
+                .namespace_claim(hostname)
+                .await?
+                .ok_or("activated claim missing")?
+                .state,
+            NamespaceClaimState::Active
+        );
+        assert_eq!(provider.issue_count(), 1);
         Ok(())
     }
 

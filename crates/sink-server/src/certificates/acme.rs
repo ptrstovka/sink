@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, mem, sync::Arc};
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -131,12 +131,13 @@ where
         Box::pin(async move {
             let mut order = self.acme.start_order(account, identifiers).await?;
             let challenges = order.dns_challenges().await?;
-            let mut records = Vec::with_capacity(challenges.len());
+            let mut cleanup = DnsCleanupGuard::new(Arc::clone(&self.dns), challenges.len());
 
             for challenge in &challenges {
                 match self.dns.create_txt(challenge).await {
-                    Ok(record) => records.push(record),
+                    Ok(record) => cleanup.records.push(record),
                     Err(error) => {
+                        let records = cleanup.disarm();
                         cleanup_records(self.dns.as_ref(), &records).await;
                         return Err(error);
                     }
@@ -144,13 +145,14 @@ where
             }
 
             let result = async {
-                if !records.is_empty() {
-                    self.dns.wait_propagated(&records).await?;
+                if !cleanup.records.is_empty() {
+                    self.dns.wait_propagated(&cleanup.records).await?;
                 }
                 order.authorize().await?;
                 order.finalize().await
             }
             .await;
+            let records = cleanup.disarm();
             let cleanup_failed = cleanup_records(self.dns.as_ref(), &records).await;
 
             match (result, cleanup_failed) {
@@ -160,6 +162,49 @@ where
                 (result, _) => result,
             }
         })
+    }
+}
+
+struct DnsCleanupGuard<D>
+where
+    D: DnsChallengeProvider + 'static,
+{
+    provider: Arc<D>,
+    records: Vec<DnsRecord>,
+}
+
+impl<D> DnsCleanupGuard<D>
+where
+    D: DnsChallengeProvider + 'static,
+{
+    fn new(provider: Arc<D>, capacity: usize) -> Self {
+        Self {
+            provider,
+            records: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn disarm(mut self) -> Vec<DnsRecord> {
+        mem::take(&mut self.records)
+    }
+}
+
+impl<D> Drop for DnsCleanupGuard<D>
+where
+    D: DnsChallengeProvider + 'static,
+{
+    fn drop(&mut self) {
+        if self.records.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let provider = Arc::clone(&self.provider);
+        let records = mem::take(&mut self.records);
+        drop(runtime.spawn(async move {
+            cleanup_records(provider.as_ref(), &records).await;
+        }));
     }
 }
 
@@ -175,7 +220,10 @@ async fn cleanup_records(provider: &impl DnsChallengeProvider, records: &[DnsRec
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard};
+    use std::{
+        sync::{Mutex, MutexGuard},
+        time::Duration,
+    };
 
     use super::*;
     use crate::certificates::{Hostname, Timestamp};
@@ -320,6 +368,39 @@ mod tests {
         }
     }
 
+    struct BlockingDns {
+        events: Arc<Mutex<Vec<String>>>,
+        propagation_entered: Arc<tokio::sync::Notify>,
+        release_propagation: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl DnsChallengeProvider for BlockingDns {
+        async fn create_txt(&self, challenge: &DnsChallenge) -> Result<DnsRecord, ProviderError> {
+            let index = lock(&self.events)
+                .iter()
+                .filter(|event| event.starts_with("dns:create"))
+                .count();
+            lock(&self.events).push(format!("dns:create:{index}"));
+            Ok(DnsRecord {
+                record_id: format!("record-{index}"),
+                record_name: challenge.record_name().to_owned(),
+            })
+        }
+
+        async fn wait_propagated(&self, records: &[DnsRecord]) -> Result<(), ProviderError> {
+            lock(&self.events).push(format!("dns:propagated:{}", records.len()));
+            self.propagation_entered.notify_waiters();
+            self.release_propagation.notified().await;
+            Ok(())
+        }
+
+        async fn delete_txt(&self, record: &DnsRecord) -> Result<(), ProviderError> {
+            lock(&self.events).push(format!("dns:delete:{}", record.record_id));
+            Ok(())
+        }
+    }
+
     fn account() -> AccountRecord {
         AccountRecord {
             provider: CertificateProviderKind::Cloudflare,
@@ -386,6 +467,41 @@ mod tests {
         assert!(events.contains(&"dns:delete:record-1".to_owned()));
         assert!(events.contains(&"dns:delete:record-0".to_owned()));
         assert!(!events.contains(&"acme:finalize".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn cancellation_still_cleans_up_every_created_record() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let propagation_entered = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::clone(&propagation_entered).notified_owned();
+        let provider = Arc::new(CloudflareAcmeProvider::new(
+            Arc::new(FakeAcme::new(events.clone(), false)),
+            Arc::new(BlockingDns {
+                events: events.clone(),
+                propagation_entered,
+                release_propagation: Arc::new(tokio::sync::Notify::new()),
+            }),
+        ));
+        let issue = tokio::spawn(async move { provider.issue(&account(), &identifiers()).await });
+
+        entered.await;
+        issue.abort();
+        let _ = issue.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let cleaned = {
+                    let events = lock(&events);
+                    events.contains(&"dns:delete:record-1".to_owned())
+                        && events.contains(&"dns:delete:record-0".to_owned())
+                };
+                if cleaned {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation cleanup completes");
     }
 
     #[tokio::test]

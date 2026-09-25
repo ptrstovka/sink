@@ -43,8 +43,8 @@ pub async fn provision_base_certificates<P, S>(
     now: Timestamp,
 ) -> Result<(), LifecycleError>
 where
-    P: CertificateProvider,
-    S: CertificateStorage,
+    P: CertificateProvider + 'static,
+    S: CertificateStorage + 'static,
 {
     for domain in domains.as_slice() {
         manager
