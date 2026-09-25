@@ -43,13 +43,17 @@ use sink_client::{
     },
     target::{LocalTarget, PublicUrl},
 };
+use sink_protocol::{
+    MAX_PROXY_V2_HEADER_BYTES, NAMESPACE_COLLECTION_PATH, PROXY_V2_PREFIX_BYTES, ProxyV2Header,
+    parse_proxy_v2,
+};
 use sink_server::{
     certificates::{
         CertificateIndexReloader, CertificateMaterial, CertificateProviderKind, CertificateRecord,
         CertificateState, CertificateStorage, CertificateTarget, Hostname, SecretBytes,
         SqliteCertificateStorage, Timestamp,
     },
-    config::{ConfiguredDomain, ConfiguredDomains},
+    config::{ConfiguredDomain, ConfiguredDomains, HttpsProxyConfig},
     db::Database,
     namespace_control::{
         NamespaceCertificateError, NamespaceCertificateProvisioner, NamespaceCertificateRequest,
@@ -223,6 +227,420 @@ impl Drop for FixtureHarness {
             task.abort();
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EdgeTlsObservation {
+    proxy: ProxyV2Header,
+    proxy_wire: Vec<u8>,
+    tls_wire: Vec<u8>,
+}
+
+struct EdgeTlsFixture {
+    addr: SocketAddr,
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+    tls_addr: SocketAddr,
+    observations: Arc<Mutex<Vec<EdgeTlsObservation>>>,
+    observation_ready: Arc<Notify>,
+    shutdown: CancellationToken,
+    task: Option<JoinHandle<io::Result<()>>>,
+    child: Option<Child>,
+}
+
+impl EdgeTlsFixture {
+    async fn start(directory: &FsPath, hostname: &str) -> TestResult<Self> {
+        let (_, certificate_path) = local_certificate(directory, hostname).await?;
+        let private_key_path =
+            directory.join(format!("{}-private-key.pem", hostname.replace('.', "-")));
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observation_ready = Arc::new(Notify::new());
+        let reserved_tls = TcpListener::bind("127.0.0.1:0").await?;
+        let tls_addr = reserved_tls.local_addr()?;
+        drop(reserved_tls);
+        let mut child = spawn_openssl_edge(tls_addr, &certificate_path, &private_key_path)?;
+        wait_for_openssl_edge(tls_addr, &mut child).await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let shutdown = CancellationToken::new();
+        let task = Some(Self::spawn(
+            listener,
+            tls_addr,
+            Arc::clone(&observations),
+            Arc::clone(&observation_ready),
+            shutdown.clone(),
+        ));
+        Ok(Self {
+            addr,
+            certificate_path,
+            private_key_path,
+            tls_addr,
+            observations,
+            observation_ready,
+            shutdown,
+            task,
+            child: Some(child),
+        })
+    }
+
+    fn spawn(
+        listener: TcpListener,
+        tls_addr: SocketAddr,
+        observations: Arc<Mutex<Vec<EdgeTlsObservation>>>,
+        observation_ready: Arc<Notify>,
+        shutdown: CancellationToken,
+    ) -> JoinHandle<io::Result<()>> {
+        tokio::spawn(async move {
+            let connections = TaskTracker::new();
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted?;
+                        let observations = Arc::clone(&observations);
+                        let observation_ready = Arc::clone(&observation_ready);
+                        connections.spawn(async move {
+                            let _ = serve_edge_tls_connection(
+                                stream,
+                                tls_addr,
+                                observations,
+                                observation_ready,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+            connections.close();
+            connections.wait().await;
+            Ok(())
+        })
+    }
+
+    fn certificate_path(&self) -> &FsPath {
+        &self.certificate_path
+    }
+
+    fn observation_count(&self) -> usize {
+        self.observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    async fn observation(&self, index: usize) -> TestResult<EdgeTlsObservation> {
+        bounded("Edge TLS observation", async {
+            loop {
+                let notified = self.observation_ready.notified();
+                if let Some(observation) = self
+                    .observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(index)
+                    .cloned()
+                {
+                    return observation;
+                }
+                notified.await;
+            }
+        })
+        .await
+    }
+
+    async fn stop(&mut self) -> TestResult<()> {
+        self.shutdown.cancel();
+        let task = self
+            .task
+            .take()
+            .ok_or_else(|| io::Error::other("Edge TLS fixture is not running"))?;
+        bounded("Edge TLS fixture shutdown", task).await???;
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| io::Error::other("Edge TLS child is not running"))?;
+        if child.try_wait()?.is_none() {
+            child.kill().await?;
+        }
+        let _ = bounded("Edge TLS child shutdown", child.wait()).await??;
+        Ok(())
+    }
+
+    async fn restart(&mut self) -> TestResult<()> {
+        if self.task.is_some() || self.child.is_some() {
+            return Err(io::Error::other("Edge TLS fixture is already running").into());
+        }
+        let mut child = spawn_openssl_edge(
+            self.tls_addr,
+            &self.certificate_path,
+            &self.private_key_path,
+        )?;
+        wait_for_openssl_edge(self.tls_addr, &mut child).await?;
+        let listener = TcpListener::bind(self.addr).await?;
+        self.shutdown = CancellationToken::new();
+        self.task = Some(Self::spawn(
+            listener,
+            self.tls_addr,
+            Arc::clone(&self.observations),
+            Arc::clone(&self.observation_ready),
+            self.shutdown.clone(),
+        ));
+        self.child = Some(child);
+        Ok(())
+    }
+}
+
+impl Drop for EdgeTlsFixture {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+fn spawn_openssl_edge(
+    addr: SocketAddr,
+    certificate_path: &FsPath,
+    private_key_path: &FsPath,
+) -> TestResult<Child> {
+    let child = Command::new("openssl")
+        .args(["s_server", "-quiet", "-accept", &addr.to_string(), "-cert"])
+        .arg(certificate_path)
+        .arg("-key")
+        .arg(private_key_path)
+        .arg("-www")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    Ok(child)
+}
+
+async fn wait_for_openssl_edge(addr: SocketAddr, child: &mut Child) -> TestResult<()> {
+    bounded("Edge OpenSSL readiness", async {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "Edge OpenSSL fixture exited early with {status}"
+                ))
+                .into());
+            }
+            if TcpStream::connect(addr).await.is_ok() {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?
+}
+
+async fn serve_edge_tls_connection(
+    mut stream: TcpStream,
+    tls_addr: SocketAddr,
+    observations: Arc<Mutex<Vec<EdgeTlsObservation>>>,
+    observation_ready: Arc<Notify>,
+) -> TestResult<()> {
+    let (proxy_wire, proxy) = read_proxy_v2_wire(&mut stream).await?;
+    let tls_wire = Arc::new(Mutex::new(Vec::new()));
+    let mut upstream = bounded("Edge OpenSSL connect", TcpStream::connect(tls_addr)).await??;
+    let (mut stream_read, mut stream_write) = stream.split();
+    let (mut upstream_read, mut upstream_write) = upstream.split();
+    let to_edge = copy_recorded(&mut stream_read, &mut upstream_write, Arc::clone(&tls_wire));
+    let from_edge = copy_and_shutdown(&mut upstream_read, &mut stream_write);
+    let _ = bounded("Edge TLS relay", async {
+        let (to_edge, from_edge) = tokio::join!(to_edge, from_edge);
+        to_edge.and(from_edge)
+    })
+    .await??;
+    observations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(EdgeTlsObservation {
+            proxy,
+            proxy_wire,
+            tls_wire: tls_wire
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        });
+    observation_ready.notify_waiters();
+    Ok(())
+}
+
+async fn read_proxy_v2_wire(stream: &mut TcpStream) -> TestResult<(Vec<u8>, ProxyV2Header)> {
+    let mut wire = vec![0_u8; PROXY_V2_PREFIX_BYTES];
+    stream.read_exact(&mut wire).await?;
+    let payload_bytes = usize::from(u16::from_be_bytes([
+        wire[PROXY_V2_PREFIX_BYTES - 2],
+        wire[PROXY_V2_PREFIX_BYTES - 1],
+    ]));
+    let total_bytes = PROXY_V2_PREFIX_BYTES.saturating_add(payload_bytes);
+    if total_bytes > MAX_PROXY_V2_HEADER_BYTES {
+        return Err(io::Error::other("Edge received oversized PROXY v2 header").into());
+    }
+    wire.resize(total_bytes, 0);
+    stream
+        .read_exact(&mut wire[PROXY_V2_PREFIX_BYTES..])
+        .await?;
+    let proxy = parse_proxy_v2(&wire)?.header;
+    Ok((wire, proxy))
+}
+
+struct PrefixProxy {
+    addr: SocketAddr,
+    recordings: Arc<Mutex<Vec<Vec<u8>>>>,
+    recording_ready: Arc<Notify>,
+    shutdown: CancellationToken,
+    task: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl PrefixProxy {
+    async fn start(upstream: SocketAddr, prefix: Vec<u8>) -> TestResult<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let recordings = Arc::new(Mutex::new(Vec::new()));
+        let recording_ready = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
+        let task_recordings = Arc::clone(&recordings);
+        let task_recording_ready = Arc::clone(&recording_ready);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            let connections = TaskTracker::new();
+            loop {
+                tokio::select! {
+                    () = task_shutdown.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let (downstream, _) = accepted?;
+                        let prefix = prefix.clone();
+                        let recordings = Arc::clone(&task_recordings);
+                        let recording_ready = Arc::clone(&task_recording_ready);
+                        let connection_shutdown = task_shutdown.clone();
+                        connections.spawn(async move {
+                            let Ok(mut upstream_stream) = TcpStream::connect(upstream).await else {
+                                return;
+                            };
+                            if upstream_stream.write_all(&prefix).await.is_err() {
+                                return;
+                            }
+                            let mut downstream = downstream;
+                            let (mut downstream_read, mut downstream_write) = downstream.split();
+                            let (mut upstream_read, mut upstream_write) = upstream_stream.split();
+                            let captured = Arc::new(Mutex::new(Vec::new()));
+                            let to_upstream = copy_recorded(
+                                &mut downstream_read,
+                                &mut upstream_write,
+                                Arc::clone(&captured),
+                            );
+                            let to_downstream =
+                                copy_and_shutdown(&mut upstream_read, &mut downstream_write);
+                            tokio::select! {
+                                _ = async { let _ = tokio::join!(to_upstream, to_downstream); } => {}
+                                () = connection_shutdown.cancelled() => {}
+                            }
+                            recordings
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(
+                                    captured
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .clone(),
+                                );
+                            recording_ready.notify_waiters();
+                        });
+                    }
+                }
+            }
+            connections.close();
+            connections.wait().await;
+            Ok(())
+        });
+        Ok(Self {
+            addr,
+            recordings,
+            recording_ready,
+            shutdown,
+            task: Some(task),
+        })
+    }
+
+    async fn recording(&self, index: usize) -> TestResult<Vec<u8>> {
+        bounded("prefixed proxy recording", async {
+            loop {
+                let notified = self.recording_ready.notified();
+                if let Some(recording) = self
+                    .recordings
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(index)
+                    .cloned()
+                {
+                    return recording;
+                }
+                notified.await;
+            }
+        })
+        .await
+    }
+
+    async fn stop(mut self) -> TestResult<()> {
+        self.shutdown.cancel();
+        let task = self
+            .task
+            .take()
+            .ok_or_else(|| io::Error::other("prefixed proxy task already consumed"))?;
+        bounded("prefixed proxy shutdown", task).await???;
+        Ok(())
+    }
+}
+
+impl Drop for PrefixProxy {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+    }
+}
+
+async fn copy_recorded<R, W>(
+    mut reader: R,
+    mut writer: W,
+    captured: Arc<Mutex<Vec<u8>>>,
+) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            writer.shutdown().await?;
+            return Ok(copied);
+        }
+        captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(&buffer[..read]);
+        writer.write_all(&buffer[..read]).await?;
+        copied = copied.saturating_add(read as u64);
+    }
+}
+
+async fn copy_and_shutdown<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let copied = tokio::io::copy(&mut reader, &mut writer).await?;
+    writer.shutdown().await?;
+    Ok(copied)
 }
 
 fn fixture_router(state: FixtureState) -> Router {
@@ -976,6 +1394,16 @@ impl ManagedTlsServerHarness {
         storage: Arc<SqliteCertificateStorage>,
         certificates: Arc<LocalCertificateProvisioner>,
     ) -> TestResult<Self> {
+        Self::start_on(database, storage, certificates, None, None).await
+    }
+
+    async fn start_on(
+        database: Database,
+        storage: Arc<SqliteCertificateStorage>,
+        certificates: Arc<LocalCertificateProvisioner>,
+        addresses: Option<(SocketAddr, SocketAddr)>,
+        https_proxy: Option<HttpsProxyConfig>,
+    ) -> TestResult<Self> {
         let base_hostname = Hostname::parse(PUBLIC_BASE_DOMAIN)?;
         let crypto_provider = default_crypto_provider();
         let authorization = Arc::new(RuntimeSniAuthorization::new(base_hostname.clone()));
@@ -1002,11 +1430,20 @@ impl ManagedTlsServerHarness {
         state.refresh_sni_namespace_boundaries().await?;
 
         let tls_config = build_tls_server_config(resolver, crypto_provider)?;
-        let http_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let (http_bind, https_bind) = match addresses {
+            Some(addresses) => addresses,
+            None => ("127.0.0.1:0".parse()?, "127.0.0.1:0".parse()?),
+        };
+        let http_listener = TcpListener::bind(http_bind).await?;
         let http_addr = http_listener.local_addr()?;
-        let https_socket = TcpListener::bind("127.0.0.1:0").await?;
+        let https_socket = TcpListener::bind(https_bind).await?;
         let https_addr = https_socket.local_addr()?;
-        let https_listener = TlsListener::new(https_socket, tls_config);
+        let https_listener = match https_proxy {
+            Some(proxy) => {
+                TlsListener::with_passthrough(https_socket, tls_config, state.clone(), proxy)
+            }
+            None => TlsListener::new(https_socket, tls_config),
+        };
         let runtime_state = state.clone();
         let (shutdown, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -1060,11 +1497,16 @@ struct ManagedTlsStack {
     database: Database,
     storage: Arc<SqliteCertificateStorage>,
     certificates: Arc<LocalCertificateProvisioner>,
+    https_proxy: Option<HttpsProxyConfig>,
     server: Option<ManagedTlsServerHarness>,
 }
 
 impl ManagedTlsStack {
     async fn start() -> TestResult<Self> {
+        Self::start_with_https_proxy(None).await
+    }
+
+    async fn start_with_https_proxy(https_proxy: Option<HttpsProxyConfig>) -> TestResult<Self> {
         let temp = tempfile::tempdir()?;
         let database_path = temp.path().join("sink.sqlite3");
         let database = Database::open(&database_path).await?;
@@ -1088,14 +1530,32 @@ impl ManagedTlsStack {
             PUBLIC_BASE_DOMAIN,
             base_certificate_path,
         ));
-        let server =
-            ManagedTlsServerHarness::start(database.clone(), storage.clone(), certificates.clone())
-                .await?;
+        let server = match https_proxy.clone() {
+            Some(proxy) => {
+                ManagedTlsServerHarness::start_on(
+                    database.clone(),
+                    storage.clone(),
+                    certificates.clone(),
+                    None,
+                    Some(proxy),
+                )
+                .await?
+            }
+            None => {
+                ManagedTlsServerHarness::start(
+                    database.clone(),
+                    storage.clone(),
+                    certificates.clone(),
+                )
+                .await?
+            }
+        };
         Ok(Self {
             _temp: temp,
             database,
             storage,
             certificates,
+            https_proxy,
             server: Some(server),
         })
     }
@@ -1111,12 +1571,15 @@ impl ManagedTlsStack {
             .server
             .take()
             .ok_or_else(|| io::Error::other("managed server is not running"))?;
+        let addresses = (old.http_addr, old.https_addr);
         old.stop().await?;
         self.server = Some(
-            ManagedTlsServerHarness::start(
+            ManagedTlsServerHarness::start_on(
                 self.database.clone(),
                 self.storage.clone(),
                 self.certificates.clone(),
+                Some(addresses),
+                self.https_proxy.clone(),
             )
             .await?,
         );
@@ -1281,6 +1744,35 @@ impl MultiConnectProcess {
             self.child.kill().await?;
         }
         let _ = bounded("multi-connect process exit", self.child.wait()).await??;
+        Ok(())
+    }
+
+    async fn stop_gracefully(mut self) -> TestResult<()> {
+        let pid = self
+            .child
+            .id()
+            .ok_or_else(|| io::Error::other("multi-connect process has no PID"))?;
+        let status = bounded(
+            "multi-connect termination signal",
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status(),
+        )
+        .await??;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "could not terminate multi-connect process: {status}"
+            ))
+            .into());
+        }
+        let status = bounded("multi-connect graceful exit", self.child.wait()).await??;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "multi-connect process did not exit cleanly: {status}"
+            ))
+            .into());
+        }
         Ok(())
     }
 }
@@ -1537,25 +2029,138 @@ async fn assert_tls_handshake_rejected(
     sni: &str,
     certificate_authority: &FsPath,
 ) -> TestResult<()> {
-    let mut stream = public_tls_stream(addr, sni, certificate_authority)?;
+    let address = addr.to_string();
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-quiet",
+            "-verify_return_error",
+            "-verify_hostname",
+            sni,
+            "-servername",
+            sni,
+            "-connect",
+            &address,
+            "-CAfile",
+        ])
+        .arg(certificate_authority)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("openssl stdin was not piped"))?;
     let request = format!("GET / HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n");
-    let result = timeout(Duration::from_secs(3), async {
-        stream.write_all(request.as_bytes()).await?;
-        let mut response = [0_u8; 1];
-        stream.read(&mut response).await
+    if let Err(error) = stdin.write_all(request.as_bytes()).await
+        && !matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+        )
+    {
+        return Err(error.into());
+    }
+    let _ = stdin.shutdown().await;
+    drop(stdin);
+    let status = timeout(Duration::from_secs(6), child.wait())
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("TLS rejection timed out for {sni}"),
+            )
+        })??;
+    if status.success() {
+        return Err(
+            io::Error::other(format!("TLS handshake unexpectedly succeeded for {sni}")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn required_v2_proxy(trusted_cidr: &str) -> TestResult<HttpsProxyConfig> {
+    Ok(HttpsProxyConfig::RequiredV2 {
+        trusted_peer_cidrs: vec![trusted_cidr.parse()?],
     })
-    .await;
-    match result {
+}
+
+fn proxy_v2_with_test_tlv(source: SocketAddr, destination: SocketAddr) -> TestResult<Vec<u8>> {
+    let mut wire = ProxyV2Header::proxied(source, destination)?.encode()?;
+    let payload_bytes = u16::from_be_bytes([
+        wire[PROXY_V2_PREFIX_BYTES - 2],
+        wire[PROXY_V2_PREFIX_BYTES - 1],
+    ]);
+    let extended = payload_bytes
+        .checked_add(4)
+        .ok_or_else(|| io::Error::other("test PROXY v2 payload overflow"))?;
+    wire[PROXY_V2_PREFIX_BYTES - 2..PROXY_V2_PREFIX_BYTES].copy_from_slice(&extended.to_be_bytes());
+    wire.extend_from_slice(&[0xea, 0, 1, 0xab]);
+    Ok(wire)
+}
+
+fn oversized_proxy_v2_prefix() -> Vec<u8> {
+    let mut wire = sink_protocol::PROXY_V2_SIGNATURE.to_vec();
+    wire.push(0x21);
+    wire.push(0x11);
+    let payload_bytes =
+        u16::try_from(MAX_PROXY_V2_HEADER_BYTES - PROXY_V2_PREFIX_BYTES + 1).unwrap_or(u16::MAX);
+    wire.extend_from_slice(&payload_bytes.to_be_bytes());
+    wire
+}
+
+async fn assert_prefixed_tls_handshake_rejected(
+    server_addr: SocketAddr,
+    prefix: Vec<u8>,
+    sni: &str,
+    certificate_authority: &FsPath,
+) -> TestResult<()> {
+    let proxy = PrefixProxy::start(server_addr, prefix).await?;
+    assert_tls_handshake_rejected(proxy.addr, sni, certificate_authority).await?;
+    proxy.stop().await
+}
+
+async fn assert_raw_connection_rejected(addr: SocketAddr, payload: &[u8]) -> TestResult<()> {
+    let mut stream = bounded("rejected TCP connect", TcpStream::connect(addr)).await??;
+    stream.write_all(payload).await?;
+    stream.shutdown().await?;
+    let mut response = [0_u8; 1];
+    match timeout(Duration::from_secs(3), stream.read(&mut response)).await {
         Ok(Ok(0) | Err(_)) => Ok(()),
-        Ok(Ok(_)) => {
-            Err(io::Error::other(format!("TLS handshake unexpectedly succeeded for {sni}")).into())
-        }
+        Ok(Ok(_)) => Err(io::Error::other("rejected TCP connection returned data").into()),
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("TLS rejection timed out for {sni}"),
+            "rejected TCP connection remained open",
         )
         .into()),
     }
+}
+
+async fn edge_tls_round_trip(
+    server_addr: SocketAddr,
+    prefix: Vec<u8>,
+    sni: &str,
+    certificate_authority: &FsPath,
+) -> TestResult<Vec<u8>> {
+    let proxy = PrefixProxy::start(server_addr, prefix).await?;
+    let (status, _, body) = public_tls_call(
+        proxy.addr,
+        sni,
+        sni,
+        certificate_authority,
+        Method::GET,
+        "/edge",
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty());
+    let recording = proxy.recording(0).await?;
+    proxy.stop().await?;
+    Ok(recording)
 }
 
 async fn claim_namespace(
@@ -1563,23 +2168,108 @@ async fn claim_namespace(
     token: &str,
     hostname: &str,
 ) -> TestResult<(StatusCode, Bytes)> {
+    namespace_request(
+        addr,
+        token,
+        Method::POST,
+        NAMESPACE_COLLECTION_PATH,
+        Body::from(format!(r#"{{"hostname":"{hostname}"}}"#)),
+    )
+    .await
+}
+
+async fn claim_passthrough_namespace(
+    addr: SocketAddr,
+    token: &str,
+    hostname: &str,
+) -> TestResult<(StatusCode, Bytes)> {
+    namespace_request(
+        addr,
+        token,
+        Method::POST,
+        NAMESPACE_COLLECTION_PATH,
+        Body::from(format!(
+            r#"{{"hostname":"{hostname}","tls_mode":"passthrough"}}"#
+        )),
+    )
+    .await
+}
+
+async fn namespace_request(
+    addr: SocketAddr,
+    token: &str,
+    method: Method,
+    path: &str,
+    body: Body,
+) -> TestResult<(StatusCode, Bytes)> {
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {token}"))?,
     );
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let body = format!(r#"{{"hostname":"{hostname}"}}"#);
-    let (status, _, body) = public_call(
+    let (status, _, body) = public_call(addr, "127.0.0.1", method, path, headers, body).await?;
+    Ok((status, body))
+}
+
+async fn list_namespaces(addr: SocketAddr, token: &str) -> TestResult<Bytes> {
+    let (status, body) = namespace_request(
         addr,
-        "127.0.0.1",
-        Method::POST,
-        sink_protocol::NAMESPACE_COLLECTION_PATH,
-        headers,
-        Body::from(body),
+        token,
+        Method::GET,
+        NAMESPACE_COLLECTION_PATH,
+        Body::empty(),
     )
     .await?;
-    Ok((status, body))
+    assert_eq!(status, StatusCode::OK);
+    Ok(body)
+}
+
+async fn namespace_status(
+    addr: SocketAddr,
+    token: &str,
+    hostname: &str,
+) -> TestResult<(StatusCode, Bytes)> {
+    namespace_request(
+        addr,
+        token,
+        Method::GET,
+        &format!("{NAMESPACE_COLLECTION_PATH}/{hostname}"),
+        Body::empty(),
+    )
+    .await
+}
+
+async fn release_namespace(
+    addr: SocketAddr,
+    token: &str,
+    hostname: &str,
+) -> TestResult<(StatusCode, Bytes)> {
+    namespace_request(
+        addr,
+        token,
+        Method::DELETE,
+        &format!("{NAMESPACE_COLLECTION_PATH}/{hostname}"),
+        Body::empty(),
+    )
+    .await
+}
+
+fn management_error_code(body: &[u8]) -> TestResult<String> {
+    let body = std::str::from_utf8(body)?;
+    let (_, tail) = body
+        .split_once(r#""code":""#)
+        .ok_or_else(|| io::Error::other("management error response has no code"))?;
+    let (code, _) = tail
+        .split_once('"')
+        .ok_or_else(|| io::Error::other("management error code is not terminated"))?;
+    Ok(code.to_owned())
+}
+
+fn passthrough_namespace(body: &[u8], hostname: &str, depth: u32) -> TestResult<()> {
+    active_namespace(body, hostname, depth)?;
+    assert!(std::str::from_utf8(body)?.contains(r#""tls_mode":"passthrough""#));
+    Ok(())
 }
 
 fn active_namespace(body: &[u8], hostname: &str, depth: u32) -> TestResult<()> {
@@ -3228,6 +3918,469 @@ async fn single_route_http_compatibility_serves_root_pool_http_and_https() -> Te
     client.stop().await?;
     stack.stop().await?;
     fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passthrough_namespace_management_is_immediate_durable_and_conflict_safe() -> TestResult<()>
+{
+    let payload = Bytes::from_static(b"passthrough-management-route");
+    let fixture = FixtureHarness::start(FixtureState::new(&payload)).await?;
+    let mut stack =
+        ManagedTlsStack::start_with_https_proxy(Some(required_v2_proxy("127.0.0.0/8")?)).await?;
+    let owner = stack.database.create_user("passthrough-owner-e2e").await?;
+    let intruder = stack
+        .database
+        .create_user("passthrough-intruder-e2e")
+        .await?;
+    let owner_token = owner.token.expose_secret().to_owned();
+    let intruder_token = intruder.token.expose_secret().to_owned();
+    let namespace = "edge.e2e.test";
+
+    let (status, created) =
+        claim_passthrough_namespace(stack.server()?.http_addr, &owner_token, namespace).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    passthrough_namespace(&created, namespace, 1)?;
+
+    let (status, idempotent) =
+        claim_passthrough_namespace(stack.server()?.http_addr, &owner_token, namespace).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(idempotent, created);
+
+    let listed = list_namespaces(stack.server()?.http_addr, &owner_token).await?;
+    passthrough_namespace(&listed, namespace, 1)?;
+    assert_eq!(
+        String::from_utf8_lossy(&listed)
+            .matches(r#""hostname":"#)
+            .count(),
+        1
+    );
+    let (status, body) =
+        namespace_status(stack.server()?.http_addr, &owner_token, namespace).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, created);
+
+    let (status, body) = namespace_request(
+        stack.server()?.http_addr,
+        &intruder_token,
+        Method::POST,
+        NAMESPACE_COLLECTION_PATH,
+        Body::from(format!(
+            r#"{{"hostname":"{namespace}","tls_mode":"passthrough"}}"#
+        )),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(management_error_code(&body)?, "namespace_unavailable");
+
+    let (status, body) = namespace_request(
+        stack.server()?.http_addr,
+        &owner_token,
+        Method::POST,
+        NAMESPACE_COLLECTION_PATH,
+        Body::from(format!(r#"{{"hostname":"{namespace}"}}"#)),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(management_error_code(&body)?, "namespace_mode_conflict");
+
+    let child = "api.edge.e2e.test";
+    let child_body = format!(r#"{{"hostname":"{child}","tls_mode":"passthrough"}}"#);
+    let (status, body) = namespace_request(
+        stack.server()?.http_addr,
+        &intruder_token,
+        Method::POST,
+        NAMESPACE_COLLECTION_PATH,
+        Body::from(child_body.clone()),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        management_error_code(&body)?,
+        "parent_namespace_unavailable"
+    );
+    let (status, body) = namespace_request(
+        stack.server()?.http_addr,
+        &owner_token,
+        Method::POST,
+        NAMESPACE_COLLECTION_PATH,
+        Body::from(child_body),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(management_error_code(&body)?, "wildcard_conflict");
+
+    let exact_hostname = "preexisting.e2e.test";
+    let exact = ClientHarness::start(client_runtime(
+        &owner_token,
+        stack.server()?.http_addr,
+        fixture.addr,
+        Some(exact_hostname),
+    )?);
+    assert_eq!(exact.connected().await?.hostname, exact_hostname);
+    let exact_body = format!(r#"{{"hostname":"{exact_hostname}","tls_mode":"passthrough"}}"#);
+    let (status, body) = namespace_request(
+        stack.server()?.http_addr,
+        &owner_token,
+        Method::POST,
+        NAMESPACE_COLLECTION_PATH,
+        Body::from(exact_body.clone()),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(management_error_code(&body)?, "wildcard_conflict");
+    exact.stop().await?;
+    wait_for_public_status(
+        "preexisting exact release",
+        stack.server()?.http_addr,
+        exact_hostname,
+        StatusCode::NOT_FOUND,
+    )
+    .await?;
+    let (status, body) = namespace_request(
+        stack.server()?.http_addr,
+        &owner_token,
+        Method::POST,
+        NAMESPACE_COLLECTION_PATH,
+        Body::from(exact_body),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    passthrough_namespace(&body, exact_hostname, 1)?;
+
+    for invalid_body in [
+        r#"{"hostname":"invalid.e2e.test","tls_mode":"edge"}"#,
+        r#"{"hostname":"too.deep.invalid.e2e.test","tls_mode":"passthrough"}"#,
+    ] {
+        let (status, body) = namespace_request(
+            stack.server()?.http_addr,
+            &owner_token,
+            Method::POST,
+            NAMESPACE_COLLECTION_PATH,
+            Body::from(invalid_body),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(matches!(
+            management_error_code(&body)?.as_str(),
+            "invalid_tls_mode" | "invalid_hostname"
+        ));
+    }
+
+    stack.restart_server().await?;
+    let listed = list_namespaces(stack.server()?.http_addr, &owner_token).await?;
+    assert_eq!(
+        String::from_utf8_lossy(&listed)
+            .matches(r#""hostname":"#)
+            .count(),
+        2
+    );
+    passthrough_namespace(&listed, namespace, 1)?;
+    passthrough_namespace(&listed, exact_hostname, 1)?;
+    let (status, body) =
+        namespace_status(stack.server()?.http_addr, &owner_token, namespace).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, created);
+
+    for hostname in [namespace, exact_hostname] {
+        let (status, body) =
+            release_namespace(stack.server()?.http_addr, &owner_token, hostname).await?;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(body.is_empty());
+        let (status, _) =
+            namespace_status(stack.server()?.http_addr, &owner_token, hostname).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        list_namespaces(stack.server()?.http_addr, &owner_token).await?,
+        r#"{"namespaces":[]}"#
+    );
+
+    stack.stop().await?;
+    fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn passthrough_route_preserves_http_tls_proxy_metadata_and_restart_isolation()
+-> TestResult<()> {
+    let payload = deterministic_payload(512 * 1024);
+    let fixture_state = FixtureState::new(&payload);
+    let fixture = FixtureHarness::start(fixture_state).await?;
+    let process_files = tempfile::tempdir()?;
+    let namespace = "edge.e2e.test";
+    let child = "api.edge.e2e.test";
+    let deep = "deep.api.edge.e2e.test";
+    let mut edge = EdgeTlsFixture::start(process_files.path(), namespace).await?;
+    let mut stack =
+        ManagedTlsStack::start_with_https_proxy(Some(required_v2_proxy("127.0.0.0/8")?)).await?;
+    let issued = stack.database.create_user("passthrough-route-e2e").await?;
+    let token = issued.token.expose_secret().to_owned();
+    let (status, claim) =
+        claim_passthrough_namespace(stack.server()?.http_addr, &token, namespace).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    passthrough_namespace(&claim, namespace, 1)?;
+
+    let config_path = process_files.path().join("passthrough-routes.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[[routes]]
+name = "edge"
+url = "https://{namespace}"
+target = "http://{}"
+tls_target = "tcp://{}"
+proxy_protocol = "v2"
+inspect = false
+"#,
+            fixture.addr, edge.addr
+        ),
+    )?;
+    let mut process = MultiConnectProcess::start(
+        &config_path,
+        &process_files.path().join("config-home"),
+        &token,
+        stack.server()?.http_addr,
+    )?;
+
+    wait_for_public_body(
+        "passthrough apex HTTP",
+        stack.server()?.http_addr,
+        namespace,
+        "/download",
+        &payload,
+    )
+    .await?;
+    wait_for_public_body(
+        "passthrough direct-child HTTP",
+        stack.server()?.http_addr,
+        child,
+        "/download",
+        &payload,
+    )
+    .await?;
+    let (status, _, body) = public_call(
+        stack.server()?.http_addr,
+        deep,
+        Method::GET,
+        "/download",
+        HeaderMap::new(),
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "tunnel not found\n");
+
+    let mut exact_override =
+        client_runtime(&token, stack.server()?.http_addr, fixture.addr, Some(child))?;
+    let error = bounded(
+        "passthrough exact-route override rejection",
+        exact_override.run_one_connection(),
+    )
+    .await?
+    .expect_err("an exact route must not shadow passthrough ownership");
+    assert!(matches!(
+        error,
+        RuntimeError::Rejected {
+            code: sink_protocol::RejectCode::InvalidSubdomain
+        }
+    ));
+    assert_eq!(error.disposition(), FailureDisposition::Permanent);
+
+    websocket_round_trip(
+        stack.server()?.http_addr,
+        child,
+        Bytes::from_static(b"passthrough-http-websocket"),
+    )
+    .await?;
+    let sse_request = Request::builder()
+        .method(Method::GET)
+        .uri("/sse")
+        .body(Body::empty())?;
+    let sse_response = public_send(stack.server()?.http_addr, namespace, sse_request).await?;
+    assert_eq!(sse_response.status(), StatusCode::OK);
+    let mut sse = SseProbe::new(sse_response.into_body());
+    assert!(sse.sequence_at_least(2).await? >= 2);
+    drop(sse);
+
+    let ipv4_source: SocketAddr = "198.51.100.27:43111".parse()?;
+    let ipv4_destination: SocketAddr = "203.0.113.8:443".parse()?;
+    let incoming_v4 = proxy_v2_with_test_tlv(ipv4_source, ipv4_destination)?;
+    let observation_index = edge.observation_count();
+    let client_wire = edge_tls_round_trip(
+        stack.server()?.https_addr,
+        incoming_v4.clone(),
+        child,
+        edge.certificate_path(),
+    )
+    .await?;
+    let observed = edge.observation(observation_index).await?;
+    let expected_v4 = ProxyV2Header::proxied(ipv4_source, ipv4_destination)?;
+    assert_eq!(observed.proxy, expected_v4);
+    assert_eq!(observed.proxy_wire, expected_v4.encode()?);
+    assert_ne!(observed.proxy_wire, incoming_v4);
+    assert!(!observed.tls_wire.is_empty());
+    assert_eq!(client_wire, observed.tls_wire);
+
+    let ipv6_source: SocketAddr = "[2001:db8:1::27]:53111".parse()?;
+    let ipv6_destination: SocketAddr = "[2001:db8:2::8]:443".parse()?;
+    let incoming_v6 = proxy_v2_with_test_tlv(ipv6_source, ipv6_destination)?;
+    let observation_index = edge.observation_count();
+    let client_wire = edge_tls_round_trip(
+        stack.server()?.https_addr,
+        incoming_v6.clone(),
+        namespace,
+        edge.certificate_path(),
+    )
+    .await?;
+    let observed = edge.observation(observation_index).await?;
+    let expected_v6 = ProxyV2Header::proxied(ipv6_source, ipv6_destination)?;
+    assert_eq!(observed.proxy, expected_v6);
+    assert_eq!(observed.proxy_wire, expected_v6.encode()?);
+    assert_ne!(observed.proxy_wire, incoming_v6);
+    assert!(!observed.tls_wire.is_empty());
+    assert_eq!(client_wire, observed.tls_wire);
+
+    let successful_observations = edge.observation_count();
+    for unsupported in ["unsupported.e2e.test", deep] {
+        assert_prefixed_tls_handshake_rejected(
+            stack.server()?.https_addr,
+            ProxyV2Header::proxied(ipv4_source, ipv4_destination)?.encode()?,
+            unsupported,
+            edge.certificate_path(),
+        )
+        .await?;
+    }
+    assert_eq!(edge.observation_count(), successful_observations);
+
+    edge.stop().await?;
+    assert_prefixed_tls_handshake_rejected(
+        stack.server()?.https_addr,
+        ProxyV2Header::proxied(ipv4_source, ipv4_destination)?.encode()?,
+        child,
+        edge.certificate_path(),
+    )
+    .await?;
+    wait_for_public_body(
+        "HTTP remains healthy during raw target outage",
+        stack.server()?.http_addr,
+        child,
+        "/download",
+        &payload,
+    )
+    .await?;
+    process.assert_running()?;
+    edge.restart().await?;
+    let observation_index = edge.observation_count();
+    edge_tls_round_trip(
+        stack.server()?.https_addr,
+        ProxyV2Header::proxied(ipv4_source, ipv4_destination)?.encode()?,
+        child,
+        edge.certificate_path(),
+    )
+    .await?;
+    edge.observation(observation_index).await?;
+
+    process.stop_gracefully().await?;
+    wait_for_public_status(
+        "durable disconnected passthrough HTTP",
+        stack.server()?.http_addr,
+        child,
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await?;
+    assert_prefixed_tls_handshake_rejected(
+        stack.server()?.https_addr,
+        ProxyV2Header::proxied(ipv4_source, ipv4_destination)?.encode()?,
+        child,
+        edge.certificate_path(),
+    )
+    .await?;
+
+    process = MultiConnectProcess::start(
+        &config_path,
+        &process_files.path().join("config-home-reconnect"),
+        &token,
+        stack.server()?.http_addr,
+    )?;
+    wait_for_public_body(
+        "passthrough client reconnect",
+        stack.server()?.http_addr,
+        child,
+        "/download",
+        &payload,
+    )
+    .await?;
+    let observation_index = edge.observation_count();
+    edge_tls_round_trip(
+        stack.server()?.https_addr,
+        ProxyV2Header::proxied(ipv6_source, ipv6_destination)?.encode()?,
+        namespace,
+        edge.certificate_path(),
+    )
+    .await?;
+    edge.observation(observation_index).await?;
+
+    stack.restart_server().await?;
+    wait_for_public_body(
+        "passthrough route after server restart",
+        stack.server()?.http_addr,
+        namespace,
+        "/download",
+        &payload,
+    )
+    .await?;
+    let persisted = list_namespaces(stack.server()?.http_addr, &token).await?;
+    passthrough_namespace(&persisted, namespace, 1)?;
+    assert_eq!(
+        String::from_utf8_lossy(&persisted)
+            .matches(r#""hostname":"#)
+            .count(),
+        1
+    );
+    let observation_index = edge.observation_count();
+    edge_tls_round_trip(
+        stack.server()?.https_addr,
+        ProxyV2Header::proxied(ipv4_source, ipv4_destination)?.encode()?,
+        child,
+        edge.certificate_path(),
+    )
+    .await?;
+    edge.observation(observation_index).await?;
+    process.assert_running()?;
+
+    process.stop().await?;
+    stack.stop().await?;
+    edge.stop().await?;
+    fixture.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn required_proxy_v2_ingress_rejects_missing_malformed_oversized_local_and_untrusted()
+-> TestResult<()> {
+    let stack =
+        ManagedTlsStack::start_with_https_proxy(Some(required_v2_proxy("127.0.0.0/8")?)).await?;
+    let https_addr = stack.server()?.https_addr;
+
+    let mut missing = vec![0_u8; PROXY_V2_PREFIX_BYTES];
+    missing[..5].copy_from_slice(&[0x16, 0x03, 0x03, 0, 11]);
+    assert_raw_connection_rejected(https_addr, &missing).await?;
+    assert_raw_connection_rejected(https_addr, &[0_u8; PROXY_V2_PREFIX_BYTES]).await?;
+    assert_raw_connection_rejected(https_addr, &oversized_proxy_v2_prefix()).await?;
+    assert_raw_connection_rejected(https_addr, &ProxyV2Header::local().encode()?).await?;
+    stack.stop().await?;
+
+    let untrusted =
+        ManagedTlsStack::start_with_https_proxy(Some(required_v2_proxy("192.0.2.0/24")?)).await?;
+    assert_raw_connection_rejected(
+        untrusted.server()?.https_addr,
+        &ProxyV2Header::proxied("198.51.100.40:50000".parse()?, "203.0.113.9:443".parse()?)?
+            .encode()?,
+    )
+    .await?;
+    untrusted.stop().await?;
     Ok(())
 }
 
