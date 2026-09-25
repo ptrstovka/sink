@@ -118,13 +118,17 @@ pub struct ServeArgs {
 pub struct HttpsProxyArgs {
     /// HTTPS ingress PROXY protocol policy: `disabled` (the compatibility
     /// default) or `required-v2`.
-    #[arg(long, value_name = "MODE", env = "SINK_SERVER_HTTPS_PROXY_PROTOCOL")]
+    #[arg(
+        long = "https-proxy-protocol",
+        value_name = "MODE",
+        env = "SINK_SERVER_HTTPS_PROXY_PROTOCOL"
+    )]
     pub protocol: Option<String>,
 
     /// Comma-separated IPv4/IPv6 CIDRs allowed to supply required PROXY v2
     /// metadata. Valid only with `--https-proxy-protocol required-v2`.
     #[arg(
-        long,
+        long = "https-proxy-trusted-peer-cidrs",
         value_name = "CIDR,...",
         env = "SINK_SERVER_HTTPS_PROXY_TRUSTED_PEER_CIDRS"
     )]
@@ -808,7 +812,10 @@ fn normalize_log_level(value: &str) -> Result<String, ConfigError> {
 mod tests {
     use std::{collections::HashMap, ffi::OsString};
 
+    use clap::{CommandFactory as _, Parser as _, error::ErrorKind};
+
     use super::*;
+    use crate::admin::{Cli, ServerCommand};
 
     fn environment(values: &[(&str, &str)]) -> impl Environment {
         let values: HashMap<String, OsString> = values
@@ -816,6 +823,88 @@ mod tests {
             .map(|(key, value)| ((*key).to_owned(), OsString::from(value)))
             .collect();
         move |name: &str| values.get(name).cloned()
+    }
+
+    #[test]
+    fn https_proxy_cli_uses_only_the_public_long_option_names() {
+        let parsed = Cli::try_parse_from([
+            "sink-server",
+            "serve",
+            "--public-base-domain",
+            "example.test",
+            "--https-proxy-protocol",
+            "required-v2",
+            "--https-proxy-trusted-peer-cidrs",
+            "192.0.2.99/24,2001:db8:42::1/48",
+        ])
+        .expect("documented HTTPS PROXY options should parse");
+        let ServerCommand::Serve(args) = parsed.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.https_proxy.protocol.as_deref(), Some("required-v2"));
+        assert_eq!(
+            args.https_proxy.trusted_peer_cidrs.as_deref(),
+            Some("192.0.2.99/24,2001:db8:42::1/48")
+        );
+        let resolved = ServeConfig::resolve_with(
+            &args,
+            &environment(&[
+                (CERTIFICATE_BACKEND_ENABLED_ENV, "true"),
+                (HTTPS_LISTEN_ADDRESS_ENV, "127.0.0.1:8443"),
+                (ACME_TERMS_AGREED_ENV, "true"),
+                (ACME_CONTACT_ENV, "mailto:admin@example.test"),
+                (CLOUDFLARE_ZONE_ID_ENV, "0123456789abcdef0123456789abcdef"),
+                (CLOUDFLARE_API_TOKEN_ENV, "token"),
+                (HTTPS_PROXY_PROTOCOL_ENV, "disabled"),
+                (HTTPS_PROXY_TRUSTED_PEER_CIDRS_ENV, "198.51.100.0/24"),
+            ]),
+        )
+        .expect("explicit HTTPS PROXY options should override the environment");
+        assert_eq!(resolved.https_proxy.mode_name(), "required-v2");
+        assert_eq!(
+            resolved
+                .https_proxy
+                .trusted_peer_cidrs()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["192.0.2.0/24", "2001:db8:42::/48"]
+        );
+
+        for accidental_name in ["--protocol", "--trusted-peer-cidrs"] {
+            let error = Cli::try_parse_from([
+                "sink-server",
+                "serve",
+                "--public-base-domain",
+                "example.test",
+                accidental_name,
+                "value",
+            ])
+            .expect_err("accidental generic option name must be rejected");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::UnknownArgument,
+                "{accidental_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_help_exposes_the_https_proxy_contract() {
+        let mut command = Cli::command();
+        let serve = command
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand");
+        let help = serve.render_long_help().to_string();
+
+        assert!(help.contains("--https-proxy-protocol <MODE>"));
+        assert!(help.contains("SINK_SERVER_HTTPS_PROXY_PROTOCOL"));
+        assert!(help.contains("--https-proxy-trusted-peer-cidrs <CIDR,...>"));
+        assert!(help.contains("SINK_SERVER_HTTPS_PROXY_TRUSTED_PEER_CIDRS"));
+        assert!(!help.lines().any(|line| {
+            let option = line.trim_start();
+            option.starts_with("--protocol ") || option.starts_with("--trusted-peer-cidrs ")
+        }));
     }
 
     #[test]
@@ -1172,6 +1261,18 @@ mod tests {
                 ]),
             ),
             Err(ConfigError::HttpsProxyTrustedPeerCidrsWithoutRequiredV2)
+        ));
+
+        assert!(matches!(
+            ServeConfig::resolve_with(
+                &ServeArgs::default(),
+                &environment(&[
+                    (PUBLIC_BASE_DOMAIN_ENV, "example.test"),
+                    (HTTPS_PROXY_PROTOCOL_ENV, "required-v2"),
+                    (HTTPS_PROXY_TRUSTED_PEER_CIDRS_ENV, "127.0.0.1/32"),
+                ]),
+            ),
+            Err(ConfigError::HttpsProxyWithoutCertificateBackend)
         ));
     }
 }
