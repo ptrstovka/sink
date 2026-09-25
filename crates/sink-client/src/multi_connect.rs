@@ -21,7 +21,7 @@ use crate::{
     cli::{ConnectArgs, HttpArgs},
     config::{
         ConfigError, ConfigStore, ConnectConfig, ConnectConfigError, ConnectRouteConfig,
-        ResolvedConfig,
+        RawTcpTarget, ResolvedConfig,
     },
     dashboard::{DashboardBindError, DashboardPort, DashboardService, production_assets},
     runtime::{
@@ -48,6 +48,7 @@ pub async fn run(arguments: ConnectArgs) -> Result<(), MultiConnectError> {
 struct PreparedRoute {
     name: String,
     target: LocalTarget,
+    tls_target: Option<RawTcpTarget>,
     runtime: TunnelRuntime,
     handle: RuntimeHandle,
     inspect: bool,
@@ -72,19 +73,27 @@ async fn prepare_routes(
     for route in connect.into_routes() {
         let name = route.name.clone();
         let target = route.target.clone();
+        let tls_target = route.tls_target.clone();
+        let proxy_protocol = route.proxy_protocol;
+        let namespace_apex = route.public_url.requested_hostname().to_owned();
         let inspect = route.inspect;
         let dashboard_port = route.dashboard_port;
         let arguments = route_http_arguments(route);
-        let runtime = TunnelRuntime::from_http(&arguments, resolved.clone()).map_err(|source| {
-            MultiConnectError::RouteSetup {
-                route: name.clone(),
-                source,
-            }
-        })?;
+        let mut runtime =
+            TunnelRuntime::from_http(&arguments, resolved.clone()).map_err(|source| {
+                MultiConnectError::RouteSetup {
+                    route: name.clone(),
+                    source,
+                }
+            })?;
+        if let Some(target) = tls_target.clone() {
+            runtime = runtime.with_raw_tcp(namespace_apex, target, proxy_protocol);
+        }
         let handle = runtime.handle();
         prepared.push(PreparedRoute {
             name,
             target,
+            tls_target,
             runtime,
             handle,
             inspect,
@@ -153,6 +162,9 @@ async fn supervise_routes(prepared: Vec<PreparedRoute>) -> Result<(), MultiConne
 
     for route in prepared {
         println!("[{}] local target: {}", route.name, route.target);
+        if let Some(target) = &route.tls_target {
+            println!("[{}] raw TLS target: {}", route.name, target);
+        }
         if let Some(dashboard) = route.dashboard.as_ref() {
             println!("[{}] inspector dashboard: {}", route.name, dashboard.url());
         }
@@ -587,6 +599,36 @@ inspect = false
             "None is the gate that prevents any bind_dashboard call"
         );
         assert!(prepared[0].dashboard.is_none());
+        assert!(prepared[0].handle.inspection_store().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn passthrough_route_prepares_one_control_runtime_for_both_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("routes.toml");
+        fs::write(
+            &path,
+            r#"
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+target = "http://edge.internal:80"
+tls_target = "tcp://edge.internal:443"
+proxy_protocol = "v2"
+inspect = false
+"#,
+        )?;
+
+        let prepared = prepare_routes(ConnectConfig::load(&path)?, resolved_config()?).await?;
+        assert_eq!(prepared.len(), 1, "one namespace must own one runtime");
+        assert_eq!(prepared[0].target.to_string(), "http://edge.internal/");
+        assert_eq!(
+            prepared[0].tls_target.as_ref().map(ToString::to_string),
+            Some("tcp://edge.internal:443".to_owned())
+        );
+        assert!(prepared[0].runtime.has_raw_tcp_bridge());
         assert!(prepared[0].handle.inspection_store().is_none());
         Ok(())
     }

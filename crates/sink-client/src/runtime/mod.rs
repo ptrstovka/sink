@@ -3,6 +3,7 @@
 mod backoff;
 mod control;
 mod proxy;
+mod raw_tcp;
 mod websocket_io;
 
 use crate::cors::CorsPolicy;
@@ -26,7 +27,7 @@ use yamux::{Config as YamuxConfig, Connection, DEFAULT_CREDIT, Mode};
 
 use crate::{
     cli::{CliValidationError, HttpArgs},
-    config::ResolvedConfig,
+    config::{OutgoingProxyProtocol, RawTcpTarget, ResolvedConfig},
     curl::CurlService,
     dashboard::{DashboardBindError, DashboardPort, DashboardService, EmbeddedAssetSource},
     inspection::{InspectionLimitError, InspectionLimits, InspectionStore},
@@ -185,6 +186,7 @@ impl RuntimeHandle {
 pub struct TunnelRuntime {
     config: ResolvedConfig,
     local_proxy: LocalProxy,
+    raw_bridge: Option<raw_tcp::RawTcpBridge>,
     session_id: Uuid,
     initial_requested_hostname: Option<String>,
     accepted: Option<ConnectionInfo>,
@@ -203,6 +205,7 @@ impl fmt::Debug for TunnelRuntime {
             .debug_struct("TunnelRuntime")
             .field("config", &self.config)
             .field("local_proxy", &self.local_proxy)
+            .field("raw_bridge", &self.raw_bridge)
             .field("session_id", &self.session_id)
             .field(
                 "initial_requested_hostname",
@@ -296,6 +299,7 @@ impl TunnelRuntime {
         Ok(Self {
             config,
             local_proxy,
+            raw_bridge: None,
             session_id,
             initial_requested_hostname,
             accepted: None,
@@ -307,6 +311,21 @@ impl TunnelRuntime {
             curl,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         })
+    }
+
+    /// Add raw TLS forwarding to the same broker session that serves HTTP.
+    pub(crate) fn with_raw_tcp(
+        mut self,
+        namespace_apex: String,
+        target: RawTcpTarget,
+        proxy_protocol: Option<OutgoingProxyProtocol>,
+    ) -> Self {
+        self.raw_bridge = Some(raw_tcp::RawTcpBridge::new(
+            namespace_apex,
+            target,
+            proxy_protocol,
+        ));
+        self
     }
 
     #[must_use]
@@ -325,6 +344,12 @@ impl TunnelRuntime {
     #[must_use]
     pub fn session_id(&self) -> Uuid {
         self.session_id
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn has_raw_tcp_bridge(&self) -> bool {
+        self.raw_bridge.is_some()
     }
 
     #[must_use]
@@ -432,6 +457,7 @@ impl TunnelRuntime {
         let exchange_proxy = self
             .local_proxy
             .for_connection(tasks.clone(), force_shutdown.clone());
+        let raw_bridge = self.raw_bridge.clone();
 
         loop {
             tokio::select! {
@@ -452,10 +478,12 @@ impl TunnelRuntime {
                                 "tunneled request stage latency"
                             );
                             let proxy = exchange_proxy.clone();
+                            let raw_bridge = raw_bridge.clone();
                             let force = force_shutdown.clone();
-                            tasks.spawn(proxy::serve_stream(
+                            tasks.spawn(raw_tcp::dispatch_stream(
                                 stream.compat(),
                                 proxy,
+                                raw_bridge,
                                 force,
                                 self.session_id,
                                 stream_id,
@@ -603,7 +631,7 @@ mod tests {
     use http_body_util::{BodyExt, Empty};
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
-    use sink_protocol::{SessionAccepted, Subdomain};
+    use sink_protocol::{RawTcpStreamOpen, SessionAccepted, StreamOpen, Subdomain};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -926,6 +954,75 @@ mod tests {
         for status in statuses {
             assert_eq!(status?, StatusCode::SERVICE_UNAVAILABLE);
         }
+
+        handle.begin_graceful_shutdown();
+        assert_eq!(runtime_task.await??, ConnectionEnd::Shutdown);
+        server_driver.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_target_failure_keeps_control_session_and_http_side_alive()
+    -> Result<(), proxy::BoxError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let unused_port = listener.local_addr()?.port();
+        drop(listener);
+
+        let mut runtime = TunnelRuntime::new(
+            resolved_config()?,
+            format!("http://127.0.0.1:{unused_port}").parse()?,
+            Some("https://edge.example.com".parse()?),
+            false,
+        )?
+        .with_raw_tcp(
+            "edge.example.com".to_owned(),
+            format!("tcp://127.0.0.1:{unused_port}").parse()?,
+            Some(OutgoingProxyProtocol::V2),
+        );
+        runtime.drain_timeout = Duration::from_secs(1);
+        let handle = runtime.handle();
+        let (client_transport, server_transport) = tokio::io::duplex(1024 * 1024);
+        let client_connection = Connection::new(
+            client_transport.compat(),
+            YamuxConfig::default(),
+            Mode::Client,
+        );
+        let mut server_connection = Connection::new(
+            server_transport.compat(),
+            YamuxConfig::default(),
+            Mode::Server,
+        );
+        let runtime_task =
+            tokio::spawn(async move { runtime.drive_connection(client_connection).await });
+
+        let raw_stream = poll_fn(|context| server_connection.poll_new_outbound(context)).await?;
+        let mut raw_stream = raw_stream.compat();
+        let preamble = StreamOpen::RawTcp(RawTcpStreamOpen::new(
+            "edge.example.com",
+            "192.0.2.1:40000".parse()?,
+            "198.51.100.1:443".parse()?,
+        )?)
+        .encode()?;
+        raw_stream.write_all(&preamble).await?;
+        raw_stream.write_all(b"\x16\x03\x01client-hello").await?;
+        raw_stream.shutdown().await?;
+        drop(raw_stream);
+
+        let http_stream = poll_fn(|context| server_connection.poll_new_outbound(context)).await?;
+        let server_driver = tokio::spawn(async move {
+            while let Some(inbound) =
+                poll_fn(|context| server_connection.poll_next_inbound(context)).await
+            {
+                if inbound.is_err() {
+                    break;
+                }
+            }
+        });
+        assert_eq!(
+            request_status(http_stream, 1).await?,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "legacy HTTP must still be dispatched after the raw route fails"
+        );
 
         handle.begin_graceful_shutdown();
         assert_eq!(runtime_task.await??, ConnectionEnd::Shutdown);

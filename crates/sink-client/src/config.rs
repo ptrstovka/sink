@@ -11,7 +11,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use url::Url;
+use url::{Host, Url};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
@@ -228,6 +228,18 @@ const MAX_ROUTE_NAME_BYTES: usize = 64;
 /// dashboard_port = 4040 # optional; automatic when omitted
 /// ```
 ///
+/// A passthrough namespace remains one route and one control session. Its
+/// existing `target` handles HTTP while `tls_target` receives raw TLS:
+///
+/// ```toml
+/// [[routes]]
+/// name = "edge"
+/// url = "https://edge.example.com"
+/// target = "http://edge:80"
+/// tls_target = "tcp://edge:443"
+/// proxy_protocol = "v2" # optional; disabled when omitted
+/// ```
+///
 /// `local_tls_insecure`, `cors_allow_origin`, `cors_allow_credentials`,
 /// `inspect`, `inspect_request_limit`, and `inspect_body_limit` mirror the
 /// existing `sink http` options. Authentication and the control-server address
@@ -321,6 +333,8 @@ pub struct ConnectRouteConfig {
     pub(crate) dashboard_port: Option<NonZeroU16>,
     pub(crate) inspect_request_limit: NonZeroUsize,
     pub(crate) inspect_body_limit: NonZeroUsize,
+    pub(crate) tls_target: Option<RawTcpTarget>,
+    pub(crate) proxy_protocol: Option<OutgoingProxyProtocol>,
 }
 
 impl ConnectRouteConfig {
@@ -392,6 +406,41 @@ impl ConnectRouteConfig {
             "inspect_body_limit",
         )?;
 
+        let tls_target = raw
+            .tls_target
+            .map(|target| {
+                target.parse().map_err(|error| {
+                    ConnectConfigError::invalid_route(
+                        raw.name.clone(),
+                        route_number,
+                        "tls_target",
+                        error,
+                    )
+                })
+            })
+            .transpose()?;
+        let proxy_protocol = raw
+            .proxy_protocol
+            .map(|protocol| {
+                protocol.parse().map_err(|error| {
+                    ConnectConfigError::invalid_route(
+                        raw.name.clone(),
+                        route_number,
+                        "proxy_protocol",
+                        error,
+                    )
+                })
+            })
+            .transpose()?;
+        if proxy_protocol.is_some() && tls_target.is_none() {
+            return Err(ConnectConfigError::invalid_route(
+                raw.name,
+                route_number,
+                "proxy_protocol",
+                "requires tls_target",
+            ));
+        }
+
         Ok(Self {
             name: raw.name,
             public_url,
@@ -403,6 +452,8 @@ impl ConnectRouteConfig {
             dashboard_port,
             inspect_request_limit,
             inspect_body_limit,
+            tls_target,
+            proxy_protocol,
         })
     }
 
@@ -425,7 +476,122 @@ impl ConnectRouteConfig {
     pub fn dashboard_port(&self) -> Option<NonZeroU16> {
         self.dashboard_port
     }
+
+    #[must_use]
+    pub fn tls_target(&self) -> Option<&RawTcpTarget> {
+        self.tls_target.as_ref()
+    }
+
+    #[must_use]
+    pub const fn proxy_protocol(&self) -> Option<OutgoingProxyProtocol> {
+        self.proxy_protocol
+    }
 }
+
+/// A raw TCP upstream used only after a raw-stream preamble has been accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawTcpTarget {
+    url: Url,
+    host: String,
+    port: u16,
+}
+
+impl RawTcpTarget {
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl fmt::Display for RawTcpTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.url.as_str())
+    }
+}
+
+impl FromStr for RawTcpTarget {
+    type Err = RawTcpTargetError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        if input.is_empty() {
+            return Err(RawTcpTargetError::Empty);
+        }
+        if input.trim() != input || input.chars().any(char::is_whitespace) {
+            return Err(RawTcpTargetError::Whitespace);
+        }
+        let url = Url::parse(input).map_err(|_| RawTcpTargetError::InvalidUrl)?;
+        if url.scheme() != "tcp" {
+            return Err(RawTcpTargetError::UnsupportedScheme);
+        }
+        let host = match url.host().ok_or(RawTcpTargetError::MissingHost)? {
+            Host::Domain(host) => host.to_owned(),
+            Host::Ipv4(host) => host.to_string(),
+            Host::Ipv6(host) => host.to_string(),
+        };
+        let port = url.port().ok_or(RawTcpTargetError::MissingPort)?;
+        if port == 0 {
+            return Err(RawTcpTargetError::ZeroPort);
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(RawTcpTargetError::UserInfo);
+        }
+        if (!url.path().is_empty() && url.path() != "/")
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(RawTcpTargetError::OriginOnly);
+        }
+        Ok(Self { url, host, port })
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RawTcpTargetError {
+    #[error("raw TLS target cannot be empty")]
+    Empty,
+    #[error("raw TLS target cannot contain whitespace")]
+    Whitespace,
+    #[error("raw TLS target must be a tcp:// URL with an explicit port")]
+    InvalidUrl,
+    #[error("raw TLS target must use tcp://")]
+    UnsupportedScheme,
+    #[error("raw TLS target must include a host")]
+    MissingHost,
+    #[error("raw TLS target must include an explicit port")]
+    MissingPort,
+    #[error("raw TLS target port must be greater than zero")]
+    ZeroPort,
+    #[error("raw TLS target cannot contain a username or password")]
+    UserInfo,
+    #[error("raw TLS target must be an origin without a path, query, or fragment")]
+    OriginOnly,
+}
+
+/// Outgoing PROXY protocol is opt-in and currently supports v2 only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutgoingProxyProtocol {
+    V2,
+}
+
+impl FromStr for OutgoingProxyProtocol {
+    type Err = OutgoingProxyProtocolError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "v2" => Ok(Self::V2),
+            _ => Err(OutgoingProxyProtocolError),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("must be exactly `v2`")]
+pub struct OutgoingProxyProtocolError;
 
 fn validate_route_name(name: &str, route_number: usize) -> Result<(), ConnectConfigError> {
     if name.is_empty()
@@ -505,6 +671,8 @@ struct DiskConnectRoute {
     inspect_request_limit: u64,
     #[serde(default = "default_inspect_body_limit")]
     inspect_body_limit: u64,
+    tls_target: Option<String>,
+    proxy_protocol: Option<String>,
 }
 
 const fn default_inspect() -> bool {
@@ -1006,6 +1174,190 @@ inspect = false
         assert_eq!(events.dashboard_port(), None);
         assert_eq!(events.inspect_request_limit.get(), 100);
         assert_eq!(events.inspect_body_limit.get(), 1_048_576);
+        Ok(())
+    }
+
+    #[test]
+    fn multi_connect_file_parses_one_session_passthrough_route()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = write_connect_config(
+            &directory,
+            r#"
+[[routes]]
+name = "edge"
+url = "https://cloud.example.com"
+target = "http://edge.internal:80"
+tls_target = "tcp://edge.internal:443"
+proxy_protocol = "v2"
+inspect = false
+"#,
+        )?;
+
+        let config = ConnectConfig::load(&path)?;
+        let route = &config.routes()[0];
+        assert_eq!(route.public_url().requested_hostname(), "cloud.example.com");
+        assert_eq!(route.target().to_string(), "http://edge.internal/");
+        let tls_target = route.tls_target().ok_or("missing TLS target")?;
+        assert_eq!(tls_target.host(), "edge.internal");
+        assert_eq!(tls_target.port(), 443);
+        assert_eq!(tls_target.to_string(), "tcp://edge.internal:443");
+        assert_eq!(route.proxy_protocol(), Some(OutgoingProxyProtocol::V2));
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_routes_keep_raw_tls_and_proxy_protocol_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = write_connect_config(
+            &directory,
+            r#"
+[[routes]]
+name = "api"
+url = "https://api.example.com"
+target = "3000"
+"#,
+        )?;
+
+        let config = ConnectConfig::load(&path)?;
+        let route = &config.routes()[0];
+        assert!(route.tls_target().is_none());
+        assert_eq!(route.proxy_protocol(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_tls_target_normalizes_ipv6_for_socket_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target: RawTcpTarget = "tcp://[2001:db8::1]:443".parse()?;
+        assert_eq!(target.host(), "2001:db8::1");
+        assert_eq!(target.port(), 443);
+        assert_eq!(target.to_string(), "tcp://[2001:db8::1]:443");
+        Ok(())
+    }
+
+    #[test]
+    fn passthrough_fields_validate_pairing_scheme_and_explicit_v2()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        for (contents, field) in [
+            (
+                r#"
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+target = "edge.internal:80"
+proxy_protocol = "v2"
+"#,
+                "proxy_protocol",
+            ),
+            (
+                r#"
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+target = "edge.internal:80"
+tls_target = "https://edge.internal:443"
+"#,
+                "tls_target",
+            ),
+            (
+                r#"
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+target = "edge.internal:80"
+tls_target = ""
+"#,
+                "tls_target",
+            ),
+            (
+                r#"
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+target = "edge.internal:80"
+tls_target = "tcp://edge.internal"
+"#,
+                "tls_target",
+            ),
+            (
+                r#"
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+target = "edge.internal:80"
+tls_target = "tcp://edge.internal:443"
+proxy_protocol = "v1"
+"#,
+                "proxy_protocol",
+            ),
+        ] {
+            let path = write_connect_config(&directory, contents)?;
+            let error = ConnectConfig::load(&path).expect_err("route must be invalid");
+            assert!(
+                matches!(error, ConnectConfigError::InvalidRoute { field: actual, .. } if actual == field),
+                "unexpected error for {field}: {error}"
+            );
+        }
+
+        let missing_http_target = write_connect_config(
+            &directory,
+            r#"
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+tls_target = "tcp://edge.internal:443"
+"#,
+        )?;
+        assert!(matches!(
+            ConnectConfig::load(&missing_http_target),
+            Err(ConnectConfigError::InvalidFile { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn passthrough_route_rejects_duplicate_fields_and_duplicate_namespace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let duplicate_field = write_connect_config(
+            &directory,
+            r#"
+[[routes]]
+name = "edge"
+url = "https://edge.example.com"
+target = "edge.internal:80"
+tls_target = "tcp://edge.internal:443"
+tls_target = "tcp://edge.internal:8443"
+"#,
+        )?;
+        assert!(matches!(
+            ConnectConfig::load(&duplicate_field),
+            Err(ConnectConfigError::InvalidFile { .. })
+        ));
+
+        let duplicate_namespace = write_connect_config(
+            &directory,
+            r#"
+[[routes]]
+name = "edge-a"
+url = "https://edge.example.com"
+target = "edge-a.internal:80"
+tls_target = "tcp://edge-a.internal:443"
+
+[[routes]]
+name = "edge-b"
+url = "https://EDGE.example.com"
+target = "edge-b.internal:80"
+tls_target = "tcp://edge-b.internal:443"
+"#,
+        )?;
+        assert!(matches!(
+            ConnectConfig::load(&duplicate_namespace),
+            Err(ConnectConfigError::DuplicatePublicHostname { .. })
+        ));
         Ok(())
     }
 
