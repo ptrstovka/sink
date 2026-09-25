@@ -78,6 +78,10 @@ pub struct NamespaceClaimArgs {
     #[arg(value_name = "HOSTNAME")]
     pub hostname: String,
 
+    /// Request raw TLS passthrough instead of managed TLS.
+    #[arg(long)]
+    pub passthrough: bool,
+
     /// Return after the server accepts the claim instead of waiting for it to become active.
     #[arg(long)]
     pub no_wait: bool,
@@ -464,6 +468,7 @@ mod tests {
             "namespace",
             "claim",
             "cloud.example.test",
+            "--passthrough",
             "--no-wait",
             "--authtoken",
             "one-run-secret",
@@ -478,6 +483,7 @@ mod tests {
             return Err("expected namespace claim command".into());
         };
         assert_eq!(arguments.hostname, "cloud.example.test");
+        assert!(arguments.passthrough);
         assert!(arguments.no_wait);
         assert_eq!(arguments.timeout, 300);
         assert_eq!(
@@ -496,6 +502,17 @@ mod tests {
             Some("http://127.0.0.1:8080/".to_owned())
         );
         assert!(arguments.control.allow_plaintext_control);
+
+        let managed = Cli::try_parse_from(["sink", "namespace", "claim", "managed.example.test"])?;
+        let SinkCommand::Namespace(NamespaceArgs {
+            command: NamespaceCommand::Claim(managed),
+        }) = managed.command
+        else {
+            return Err("expected managed namespace claim command".into());
+        };
+        assert!(!managed.passthrough);
+        assert!(!managed.no_wait);
+        assert_eq!(managed.timeout, 300);
 
         for arguments in [
             vec!["sink", "namespace", "list"],

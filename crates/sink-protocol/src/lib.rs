@@ -19,7 +19,7 @@ pub use handshake::{
 pub use management::{
     ManagementError, ManagementErrorCode, ManagementErrorResponse, NAMESPACE_COLLECTION_PATH,
     NAMESPACE_ITEM_PATH, Namespace, NamespaceClaimRequest, NamespaceListResponse,
-    NamespaceResponse, NamespaceState,
+    NamespaceResponse, NamespaceState, NamespaceTlsMode,
 };
 pub use message_io::MessageIo;
 pub use proxy_v2::{

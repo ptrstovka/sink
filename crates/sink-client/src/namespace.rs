@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use sink_protocol::{
     ManagementErrorCode, ManagementErrorResponse, NAMESPACE_COLLECTION_PATH, Namespace,
     NamespaceClaimRequest, NamespaceListResponse, NamespaceResponse, NamespaceState,
+    NamespaceTlsMode,
 };
 use thiserror::Error;
 use tokio::{
@@ -61,9 +62,10 @@ impl NamespaceCommandOutput {
                 for namespace in namespaces {
                     writeln!(
                         writer,
-                        "namespace {}: {}",
+                        "namespace {}: {}{}",
                         namespace.hostname,
-                        namespace_state_name(namespace.state)
+                        namespace_state_name(namespace.state),
+                        namespace_mode_suffix(namespace.tls_mode)
                     )?;
                 }
                 Ok(())
@@ -163,7 +165,11 @@ async fn execute(
     match command {
         NamespaceCommand::Claim(arguments) => {
             let mut namespace = if let Some(wait) = claim_wait {
-                match timeout_at(wait.deadline, api.claim(&arguments.hostname, &cancellation)).await
+                match timeout_at(
+                    wait.deadline,
+                    api.claim(&arguments.hostname, arguments.passthrough, &cancellation),
+                )
+                .await
                 {
                     Ok(result) => result?,
                     Err(_) => {
@@ -175,7 +181,8 @@ async fn execute(
                     }
                 }
             } else {
-                api.claim(&arguments.hostname, &cancellation).await?
+                api.claim(&arguments.hostname, arguments.passthrough, &cancellation)
+                    .await?
             };
             if arguments.no_wait {
                 ensure_claim_can_succeed(&namespace)?;
@@ -297,11 +304,14 @@ impl NamespaceApiClient {
     async fn claim(
         &self,
         hostname: &str,
+        passthrough: bool,
         cancellation: &CancellationToken,
     ) -> Result<Namespace, NamespaceError> {
-        let body = serde_json::to_vec(&NamespaceClaimRequest {
-            hostname: hostname.to_owned(),
-        })
+        let body = if passthrough {
+            serde_json::to_vec(&NamespaceClaimRequest::passthrough(hostname))
+        } else {
+            serde_json::to_vec(&NamespaceClaimRequest::managed(hostname))
+        }
         .map_err(NamespaceError::RequestEncode)?;
         let (status, body) = self
             .send(
@@ -600,6 +610,13 @@ const fn namespace_state_name(state: NamespaceState) -> &'static str {
     }
 }
 
+const fn namespace_mode_suffix(mode: NamespaceTlsMode) -> &'static str {
+    match mode {
+        NamespaceTlsMode::Managed => "",
+        NamespaceTlsMode::Passthrough => " (passthrough)",
+    }
+}
+
 const fn management_error_code_name(code: ManagementErrorCode) -> &'static str {
     match code {
         ManagementErrorCode::AuthenticationRequired => "authentication_required",
@@ -735,19 +752,38 @@ mod tests {
         Ok((format!("http://{address}"), state, task))
     }
 
-    fn namespace(hostname: &str, state: NamespaceState) -> Namespace {
+    fn namespace_with_mode(
+        hostname: &str,
+        state: NamespaceState,
+        tls_mode: NamespaceTlsMode,
+    ) -> Namespace {
         Namespace {
             hostname: hostname.to_owned(),
             depth: 1,
+            tls_mode,
             state,
             created_at: 10,
             updated_at: 20,
         }
     }
 
+    fn namespace(hostname: &str, state: NamespaceState) -> Namespace {
+        namespace_with_mode(hostname, state, NamespaceTlsMode::Managed)
+    }
+
     fn namespace_json(hostname: &str, state: NamespaceState) -> Result<String, serde_json::Error> {
         serde_json::to_string(&NamespaceResponse {
             namespace: namespace(hostname, state),
+        })
+    }
+
+    fn namespace_json_with_mode(
+        hostname: &str,
+        state: NamespaceState,
+        tls_mode: NamespaceTlsMode,
+    ) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&NamespaceResponse {
+            namespace: namespace_with_mode(hostname, state, tls_mode),
         })
     }
 
@@ -782,6 +818,7 @@ mod tests {
                     "namespace",
                     "claim",
                     "cloud.example.test",
+                    "--passthrough",
                     "--timeout",
                     "45",
                 ],
@@ -947,10 +984,12 @@ mod tests {
             Some("Bearer test-only-secret")
         );
         assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[0].body)?,
+            serde_json::json!({"hostname": hostname})
+        );
+        assert_eq!(
             serde_json::from_slice::<NamespaceClaimRequest>(&requests[0].body)?,
-            NamespaceClaimRequest {
-                hostname: hostname.to_owned()
-            }
+            NamespaceClaimRequest::managed(hostname)
         );
         for request in &requests[1..] {
             assert_eq!(request.method, Method::GET);
@@ -962,19 +1001,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passthrough_claim_posts_mode_and_accepts_immediate_active_response()
+    -> Result<(), Box<dyn Error>> {
+        let hostname = "edge.example.test";
+        let expected = namespace_with_mode(
+            hostname,
+            NamespaceState::Active,
+            NamespaceTlsMode::Passthrough,
+        );
+        let (server, state, task) = fake_server(vec![FakeResponse {
+            status: StatusCode::CREATED,
+            body: namespace_json_with_mode(
+                hostname,
+                NamespaceState::Active,
+                NamespaceTlsMode::Passthrough,
+            )?,
+        }])
+        .await?;
+        let cli = Cli::try_parse_from([
+            "sink",
+            "namespace",
+            "claim",
+            hostname,
+            "--passthrough",
+            "--timeout",
+            "1",
+        ])?;
+        let SinkCommand::Namespace(arguments) = cli.command else {
+            return Err("expected namespace command".into());
+        };
+
+        let result = execute(
+            arguments.command,
+            resolved(&server, "test-only-secret")?,
+            CancellationToken::new(),
+            test_settings(),
+        )
+        .await?;
+        assert_eq!(result, NamespaceCommandOutput::Namespaces(vec![expected]));
+
+        let requests = state
+            .requests
+            .lock()
+            .map_err(|_| "fake request lock poisoned")?
+            .clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::POST);
+        assert_eq!(requests[0].path, NAMESPACE_COLLECTION_PATH);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[0].body)?,
+            serde_json::json!({
+                "hostname": hostname,
+                "tls_mode": "passthrough"
+            })
+        );
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn list_status_and_release_follow_the_management_contract() -> Result<(), Box<dyn Error>>
     {
         let hostname = "cloud.example.test";
+        let passthrough_hostname = "edge.example.test";
+        let passthrough = namespace_with_mode(
+            passthrough_hostname,
+            NamespaceState::Active,
+            NamespaceTlsMode::Passthrough,
+        );
         let (server, state, task) = fake_server(vec![
             FakeResponse {
                 status: StatusCode::OK,
                 body: serde_json::to_string(&NamespaceListResponse {
-                    namespaces: vec![namespace(hostname, NamespaceState::Active)],
+                    namespaces: vec![
+                        namespace(hostname, NamespaceState::Active),
+                        passthrough.clone(),
+                    ],
                 })?,
             },
             FakeResponse {
                 status: StatusCode::OK,
-                body: namespace_json(hostname, NamespaceState::Active)?,
+                body: namespace_json_with_mode(
+                    passthrough_hostname,
+                    NamespaceState::Active,
+                    NamespaceTlsMode::Passthrough,
+                )?,
             },
             FakeResponse {
                 status: StatusCode::NO_CONTENT,
@@ -990,13 +1101,16 @@ mod tests {
 
         assert_eq!(
             api.list(&cancellation).await?,
-            vec![namespace(hostname, NamespaceState::Active)]
+            vec![
+                namespace(hostname, NamespaceState::Active),
+                passthrough.clone()
+            ]
         );
         assert_eq!(
-            api.status(hostname, &cancellation).await?,
-            namespace(hostname, NamespaceState::Active)
+            api.status(passthrough_hostname, &cancellation).await?,
+            passthrough
         );
-        api.release(hostname, &cancellation).await?;
+        api.release(passthrough_hostname, &cancellation).await?;
 
         let requests = state
             .requests
@@ -1014,6 +1128,36 @@ mod tests {
                 .iter()
                 .all(|request| request.authorization_count == 1)
         );
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_namespace_mode_response_is_rejected() -> Result<(), Box<dyn Error>> {
+        let hostname = "edge.example.test";
+        let (server, _state, task) = fake_server(vec![FakeResponse {
+            status: StatusCode::OK,
+            body: format!(
+                r#"{{"namespace":{{"hostname":"{hostname}","depth":1,"tls_mode":"invalid","state":"active","created_at":10,"updated_at":20}}}}"#
+            ),
+        }])
+        .await?;
+        let api = NamespaceApiClient::new(
+            resolved(&server, "test-only-secret")?,
+            Duration::from_secs(1),
+        )?;
+
+        let error = api
+            .status(hostname, &CancellationToken::new())
+            .await
+            .expect_err("unknown namespace modes must fail decoding");
+        assert!(matches!(
+            error,
+            NamespaceError::ResponseDecode {
+                status: StatusCode::OK,
+                ..
+            }
+        ));
         task.abort();
         Ok(())
     }
@@ -1114,13 +1258,17 @@ mod tests {
     fn output_is_stable_and_line_oriented() -> Result<(), Box<dyn Error>> {
         let output = NamespaceCommandOutput::Namespaces(vec![
             namespace("cloud.example.test", NamespaceState::Active),
-            namespace("edge.cloud.example.test", NamespaceState::Retrying),
+            namespace_with_mode(
+                "edge.cloud.example.test",
+                NamespaceState::Retrying,
+                NamespaceTlsMode::Passthrough,
+            ),
         ]);
         let mut rendered = Vec::new();
         output.write_to(&mut rendered)?;
         assert_eq!(
             String::from_utf8(rendered)?,
-            "namespace cloud.example.test: active\nnamespace edge.cloud.example.test: retrying\n"
+            "namespace cloud.example.test: active\nnamespace edge.cloud.example.test: retrying (passthrough)\n"
         );
 
         let mut empty = Vec::new();
