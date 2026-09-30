@@ -1822,6 +1822,7 @@ fn client_runtime_with_cors(
             authtoken: None,
             server_addr: None,
             local_tls_insecure: false,
+            preserve_host: false,
             allow_plaintext_control: false,
             inspect: true,
             dashboard_port: None,
