@@ -109,6 +109,7 @@ pub(crate) struct LocalProxy {
     inspection: Option<InspectionStore>,
     connect_timeout: Duration,
     cors: CorsPolicy,
+    preserve_host: bool,
 }
 
 impl fmt::Debug for LocalProxy {
@@ -119,6 +120,7 @@ impl fmt::Debug for LocalProxy {
             .field("uses_tls", &self.tls.is_some())
             .field("inspection_enabled", &self.inspection.is_some())
             .field("connect_timeout", &self.connect_timeout)
+            .field("preserve_host", &self.preserve_host)
             .finish_non_exhaustive()
     }
 }
@@ -152,12 +154,23 @@ impl LocalProxy {
             inspection,
             connect_timeout: LOCAL_CONNECT_TIMEOUT,
             cors: CorsPolicy::default(),
+            preserve_host: false,
         })
     }
 
     pub(crate) fn with_cors(mut self, cors: CorsPolicy) -> Self {
         self.cors = cors;
         self
+    }
+
+    pub(crate) fn with_preserve_host(mut self, preserve_host: bool) -> Self {
+        self.preserve_host = preserve_host;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn preserves_host(&self) -> bool {
+        self.preserve_host
     }
 
     pub(crate) fn for_connection(
@@ -182,7 +195,9 @@ impl LocalProxy {
         B::Error: Into<BoxError>,
         Spawn: FnOnce(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
     {
-        if rewrite_local_request(&mut request, &self.target).is_err() {
+        if rewrite_local_request_with_host_policy(&mut request, &self.target, self.preserve_host)
+            .is_err()
+        {
             return Err(ReplayTransportError::Rewrite);
         }
 
@@ -576,13 +591,23 @@ pub fn rewrite_local_request<B>(
     request: &mut Request<B>,
     target: &LocalTarget,
 ) -> Result<(), ProxySetupError> {
+    rewrite_local_request_with_host_policy(request, target, false)
+}
+
+fn rewrite_local_request_with_host_policy<B>(
+    request: &mut Request<B>,
+    target: &LocalTarget,
+    preserve_host: bool,
+) -> Result<(), ProxySetupError> {
     *request.uri_mut() = resolve_local_uri(target, request.uri())?;
-    let authority = target
-        .origin()
-        .authority()
-        .ok_or(ProxySetupError::InvalidLocalTarget)?;
-    let host = HeaderValue::from_str(authority.as_str())?;
-    request.headers_mut().insert(HOST, host);
+    if !preserve_host {
+        let authority = target
+            .origin()
+            .authority()
+            .ok_or(ProxySetupError::InvalidLocalTarget)?;
+        let host = HeaderValue::from_str(authority.as_str())?;
+        request.headers_mut().insert(HOST, host);
+    }
     Ok(())
 }
 
@@ -1475,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_base_path_and_rewrites_host_without_touching_other_headers()
+    fn default_rewrite_resolves_base_path_and_uses_target_host_without_touching_forwarded_host()
     -> Result<(), Box<dyn StdError>> {
         let target = LocalTarget::from_str("http://local.example:8080/api/v1/")?;
         let mut request = Request::builder()
@@ -1490,6 +1515,69 @@ mod tests {
         );
         assert_eq!(request.headers()[HOST], "local.example:8080");
         assert_eq!(request.headers()["x-forwarded-host"], "public.example.com");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enabled_preservation_sends_public_host_and_unchanged_forwarded_host_to_upstream()
+    -> Result<(), BoxError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let service = service_fn(|request: Request<Incoming>| async move {
+                let host = request
+                    .headers()
+                    .get(HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                let forwarded_host = request
+                    .headers()
+                    .get(X_FORWARDED_HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                let path_and_query = request
+                    .uri()
+                    .path_and_query()
+                    .map(PathAndQuery::as_str)
+                    .unwrap_or_default();
+                let observed = format!("{path_and_query}|{host}|{forwarded_host}");
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(observed))))
+            });
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), service)
+                .await
+                .map_err(io::Error::other)
+        });
+
+        let (summary_tx, _) = broadcast::channel(4);
+        let tasks = TaskTracker::new();
+        let proxy = LocalProxy::new(
+            format!("http://127.0.0.1:{port}/base").parse()?,
+            false,
+            summary_tx,
+        )?
+        .with_preserve_host(true)
+        .for_connection(tasks.clone(), CancellationToken::new());
+        let response = proxy
+            .forward(
+                Request::builder()
+                    .uri("/users/%2Fraw?active=true")
+                    .header(HOST, "public.example.test")
+                    .header(X_FORWARDED_HOST, "public.example.test")
+                    .body(Empty::<Bytes>::new())?,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await?.to_bytes(),
+            "/base/users/%2Fraw?active=true|public.example.test|public.example.test"
+        );
+
+        tasks.close();
+        let _ = timeout(Duration::from_secs(1), tasks.wait()).await;
+        server.await??;
         Ok(())
     }
 

@@ -145,6 +145,7 @@ fn route_http_arguments(route: ConnectRouteConfig) -> HttpArgs {
         authtoken: None,
         server_addr: None,
         local_tls_insecure: route.local_tls_insecure,
+        preserve_host: route.preserve_host,
         cors_allow_origin: route.cors_allow_origin,
         cors_allow_credentials: route.cors_allow_credentials,
         allow_plaintext_control: false,
@@ -615,6 +616,7 @@ inspect = false
 name = "edge"
 url = "https://edge.example.com"
 target = "http://edge.internal:80"
+preserve_host = true
 tls_target = "tcp://edge.internal:443"
 proxy_protocol = "v2"
 inspect = false
@@ -629,6 +631,7 @@ inspect = false
             Some("tcp://edge.internal:443".to_owned())
         );
         assert!(prepared[0].runtime.has_raw_tcp_bridge());
+        assert!(prepared[0].runtime.preserves_host());
         assert!(prepared[0].handle.inspection_store().is_none());
         Ok(())
     }

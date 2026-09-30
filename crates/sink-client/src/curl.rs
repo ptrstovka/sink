@@ -113,6 +113,7 @@ pub struct CurlService {
     store: InspectionStore,
     target: LocalTarget,
     local_tls_insecure: bool,
+    preserve_host: bool,
 }
 
 impl CurlService {
@@ -121,11 +122,13 @@ impl CurlService {
         store: InspectionStore,
         target: LocalTarget,
         local_tls_insecure: bool,
+        preserve_host: bool,
     ) -> Self {
         Self {
             store,
             target,
             local_tls_insecure,
+            preserve_host,
         }
     }
 
@@ -140,10 +143,11 @@ impl CurlService {
             .store
             .get(source_id)
             .ok_or(CurlServiceError::SourceNotFound)?;
-        generate_curl_command(
+        generate_curl_command_with_host_policy(
             &source,
             &self.target,
             self.local_tls_insecure,
+            self.preserve_host,
             sensitive_header_consent,
         )
         .map_err(CurlServiceError::Generation)
@@ -157,6 +161,7 @@ impl fmt::Debug for CurlService {
             .field("store", &self.store)
             .field("target", &self.target)
             .field("local_tls_insecure", &self.local_tls_insecure)
+            .field("preserve_host", &self.preserve_host)
             .finish()
     }
 }
@@ -191,6 +196,22 @@ pub fn generate_curl_command(
     local_tls_insecure: bool,
     sensitive_header_consent: SensitiveHeaderConsent,
 ) -> Result<CurlGenerationOutcome, CurlGenerationError> {
+    generate_curl_command_with_host_policy(
+        transaction,
+        target,
+        local_tls_insecure,
+        false,
+        sensitive_header_consent,
+    )
+}
+
+fn generate_curl_command_with_host_policy(
+    transaction: &Transaction,
+    target: &LocalTarget,
+    local_tls_insecure: bool,
+    preserve_host: bool,
+    sensitive_header_consent: SensitiveHeaderConsent,
+) -> Result<CurlGenerationOutcome, CurlGenerationError> {
     if let ReplayEligibility::Ineligible(reason) = transaction.replay_eligibility() {
         return Err(CurlGenerationError::Ineligible(reason));
     }
@@ -200,7 +221,7 @@ pub fn generate_curl_command(
         .request()
         .headers()
         .iter()
-        .filter(|header| !exclude_header(header.name(), &connection_nominated))
+        .filter(|header| !exclude_header(header.name(), &connection_nominated, preserve_host))
         .collect::<Vec<_>>();
     let sensitive_header_names = sensitive_header_names(&included_headers);
 
@@ -279,13 +300,16 @@ fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
     value
 }
 
-fn exclude_header(name: &HeaderName, connection_nominated: &[HeaderName]) -> bool {
+fn exclude_header(
+    name: &HeaderName,
+    connection_nominated: &[HeaderName],
+    preserve_host: bool,
+) -> bool {
     let name_text = name.as_str();
     connection_nominated.contains(name)
         || matches!(
             name_text,
-            "host"
-                | "connection"
+            "connection"
                 | "keep-alive"
                 | "proxy-authenticate"
                 | "proxy-authorization"
@@ -297,6 +321,7 @@ fn exclude_header(name: &HeaderName, connection_nominated: &[HeaderName]) -> boo
                 | "forwarded"
                 | "content-length"
         )
+        || (name_text == "host" && !preserve_host)
         || name_text == "x-forwarded"
         || name_text.starts_with("x-forwarded-")
         || is_sink_control_header(name)
@@ -375,7 +400,7 @@ fn octal_printf_operand(bytes: &[u8]) -> String {
 mod tests {
     use std::{error::Error as StdError, str::FromStr, time::SystemTime};
 
-    use http::{HeaderName, HeaderValue, Method, Uri, Version};
+    use http::{HeaderName, HeaderValue, Method, Uri, Version, header::HOST};
 
     use super::*;
     use crate::inspection::{
@@ -477,6 +502,43 @@ mod tests {
             )
         );
         assert!(!command.command().contains("public.example.test"));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_host_preservation_includes_public_host_for_direct_curl()
+    -> Result<(), Box<dyn StdError>> {
+        let transaction = eligible_transaction(
+            Method::GET,
+            Uri::from_static("https://public.example.test/items?active=true"),
+            [HeaderSnapshot::new(
+                HOST,
+                HeaderValue::from_static("public.example.test"),
+            )],
+            b"",
+        )?;
+        let target = LocalTarget::from_str("http://127.0.0.1:8080/base")?;
+        let outcome = generate_curl_command_with_host_policy(
+            &transaction,
+            &target,
+            false,
+            true,
+            SensitiveHeaderConsent::NotGranted,
+        )?;
+        let CurlGenerationOutcome::Generated(command) = outcome else {
+            return Err("unexpected sensitive-header confirmation".into());
+        };
+
+        assert!(
+            command
+                .command()
+                .contains("--header 'host:public.example.test'")
+        );
+        assert!(
+            command
+                .command()
+                .ends_with("--url 'http://127.0.0.1:8080/base/items?active=true'")
+        );
         Ok(())
     }
 

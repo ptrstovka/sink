@@ -211,6 +211,10 @@ pub struct HttpArgs {
     #[arg(long)]
     pub local_tls_insecure: bool,
 
+    /// Preserve the public Host header when forwarding to the local target.
+    #[arg(long)]
+    pub preserve_host: bool,
+
     /// Allow a cross-origin caller (repeat for multiple http(s) origins, or use '*').
     #[arg(long, value_name = "ORIGIN")]
     pub cors_allow_origin: Vec<CorsOrigin>,
@@ -393,6 +397,7 @@ mod tests {
             "--server-addr",
             "http://127.0.0.1:8080",
             "--local-tls-insecure",
+            "--preserve-host",
             "--allow-plaintext-control",
             "--inspect=false",
             "--dashboard-port",
@@ -419,6 +424,7 @@ mod tests {
             Some("one-run-secret")
         );
         assert!(args.local_tls_insecure);
+        assert!(args.preserve_host);
         assert!(args.allow_plaintext_control);
         assert!(!args.inspect);
         assert_eq!(args.dashboard_port.map(NonZeroU16::get), Some(4042));

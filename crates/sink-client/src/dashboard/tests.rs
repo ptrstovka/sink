@@ -140,6 +140,7 @@ async fn ephemeral_service_with_curl(
         store.clone(),
         target.parse::<LocalTarget>()?,
         local_tls_insecure,
+        false,
     );
     Ok(DashboardService::bind_ephemeral_with_curl(store, test_assets()?, curl).await?)
 }

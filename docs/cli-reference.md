@@ -26,6 +26,7 @@ sink version
 | `--cors-allow-origin ORIGIN` | Opt in to CORS for this tunnel; repeat for exact HTTP(S) origins, or use quoted `'*'` for any origin. Disabled by default. |
 | `--cors-allow-credentials` | Allow credentialed CORS requests; requires concrete allowed origins and rejects `'*'`. |
 | `--local-tls-insecure` | Disable certificate verification only for an explicit HTTPS local target. |
+| `--preserve-host` | Forward the public `Host` header to the local target. By default, `Host` is rewritten to the target authority while `X-Forwarded-Host` retains the public host. |
 | `--allow-plaintext-control` | Permit an explicitly configured `http://` control origin for local development. |
 | `--inspect=<BOOL>` | Enable local capture and dashboard; defaults to `true`. Use the equals form, including `--inspect=false`. |
 | `--dashboard-port PORT` | Bind exactly `127.0.0.1:PORT`; must be non-zero. When omitted, scan from port 4040 upward. |
@@ -64,6 +65,7 @@ For a namespace already claimed with `--passthrough`, use the namespace apex as
 name = "passthrough"
 url = "https://tls.example.com"
 target = "http://service.internal:80"
+preserve_host = true
 tls_target = "tcp://service.internal:443"
 proxy_protocol = "v2"
 inspect = false
@@ -71,6 +73,7 @@ inspect = false
 
 | Key | Default and behavior |
 | --- | --- |
+| `preserve_host` | Defaults to `false`, which rewrites `Host` to the HTTP target authority. Set to `true` for a name-based local reverse proxy; `X-Forwarded-Host` remains the public host in either mode. |
 | `tls_target` | Optional `tcp://host:port` for raw TLS. Omission disables raw forwarding. |
 | `proxy_protocol` | Optional; only `"v2"` is accepted and it requires `tls_target`. Omission sends no outgoing PROXY header. |
 | `local_tls_insecure` | Defaults to `false`; valid only when `target` is `https://`. It does not affect raw TLS. |

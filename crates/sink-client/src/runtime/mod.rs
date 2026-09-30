@@ -236,6 +236,7 @@ impl TunnelRuntime {
             args.target.clone(),
             args.url.clone(),
             args.local_tls_insecure,
+            args.preserve_host,
             inspection,
             CorsPolicy::new(args.cors_allow_origin.clone(), args.cors_allow_credentials)
                 .map_err(crate::cli::CliValidationError::from)?,
@@ -253,6 +254,7 @@ impl TunnelRuntime {
             target,
             requested_public_url,
             local_tls_insecure,
+            false,
             None,
             CorsPolicy::default(),
         )
@@ -263,6 +265,7 @@ impl TunnelRuntime {
         target: LocalTarget,
         requested_public_url: Option<PublicUrl>,
         local_tls_insecure: bool,
+        preserve_host: bool,
         inspection: Option<InspectionStore>,
         cors: CorsPolicy,
     ) -> Result<Self, RuntimeError> {
@@ -289,13 +292,14 @@ impl TunnelRuntime {
             )?,
             None => LocalProxy::new(target.clone(), local_tls_insecure, summaries.clone())?,
         }
-        .with_cors(cors);
+        .with_cors(cors)
+        .with_preserve_host(preserve_host);
         let replay = inspection
             .as_ref()
             .map(|store| ReplayService::new(store.clone(), Arc::new(local_proxy.clone())));
-        let curl = inspection
-            .as_ref()
-            .map(|store| CurlService::new(store.clone(), target, local_tls_insecure));
+        let curl = inspection.as_ref().map(|store| {
+            CurlService::new(store.clone(), target, local_tls_insecure, preserve_host)
+        });
         Ok(Self {
             config,
             local_proxy,
@@ -344,6 +348,12 @@ impl TunnelRuntime {
     #[must_use]
     pub fn session_id(&self) -> Uuid {
         self.session_id
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn preserves_host(&self) -> bool {
+        self.local_proxy.preserves_host()
     }
 
     #[cfg(test)]
@@ -683,6 +693,22 @@ mod tests {
         assert!(handle.inspection_store().is_none());
         assert!(handle.replay_service().is_none());
         assert!(handle.curl_service().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn http_cli_preserves_host_only_when_explicitly_enabled() -> Result<(), proxy::BoxError> {
+        let default = Cli::try_parse_from(["sink", "http", "3000"])?;
+        let SinkCommand::Http(default) = default.command else {
+            return Err("expected http command".into());
+        };
+        assert!(!TunnelRuntime::from_http(&default, resolved_config()?)?.preserves_host());
+
+        let enabled = Cli::try_parse_from(["sink", "http", "3000", "--preserve-host"])?;
+        let SinkCommand::Http(enabled) = enabled.command else {
+            return Err("expected http command".into());
+        };
+        assert!(TunnelRuntime::from_http(&enabled, resolved_config()?)?.preserves_host());
         Ok(())
     }
 

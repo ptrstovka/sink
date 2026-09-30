@@ -99,18 +99,23 @@ example, save this as `passthrough-routes.toml`:
 name = "passthrough"
 url = "https://tls.example.com"
 target = "http://service.internal:80"
+preserve_host = true
 tls_target = "tcp://service.internal:443"
 proxy_protocol = "v2"
 inspect = false
 ```
 
 The route `url` is the claimed namespace apex. Its normal `target` receives
-HTTP for the apex and direct children through the HTTP tunnel. `tls_target`
-must be a `tcp://host:port` address and receives the original TLS bytes for the
-same scope. The local TLS service presents and manages the certificate on port
-443; Sink never terminates the passthrough handshake. There is no implicit
-HTTP-to-HTTPS redirect. The example explicitly disables the HTTP inspector;
-raw TLS is never inspected regardless of this setting.
+HTTP for the apex and direct children through the HTTP tunnel. The example sets
+`preserve_host = true` so a name-based local reverse proxy receives the public
+`Host`; by default Sink instead rewrites `Host` to the target authority. In both
+modes, `X-Forwarded-Host` remains the public host and path/query handling is
+unchanged. `tls_target` must be a `tcp://host:port` address and receives the
+original TLS bytes for the same scope. The local TLS service presents and
+manages the certificate on port 443; Sink never terminates the passthrough
+handshake. There is no implicit HTTP-to-HTTPS redirect. The example explicitly
+disables the HTTP inspector; raw TLS is never inspected regardless of this
+setting.
 
 `proxy_protocol = "v2"` is optional. When present, the client creates a fresh
 PROXY v2 header from the source/destination metadata authenticated by
@@ -129,7 +134,8 @@ Authentication and the control server remain in the private saved client
 configuration or the command's global overrides; they are not route-file
 fields. Keep the route file private if internal hostnames are sensitive. A
 generic `[[routes]]` entry with only `name`, `url`, and `target` remains an exact
-HTTP/managed-TLS route: raw TLS and outgoing PROXY v2 are off by default.
+HTTP/managed-TLS route: public-Host preservation, raw TLS, and outgoing PROXY
+v2 are off by default.
 
 Use a process manager for production. Restart gracefully so the old route is
 released before the replacement starts. An unexpected exit retains the lease

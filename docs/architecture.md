@@ -58,9 +58,11 @@ certificate lifecycle continues after readiness and drains with both listeners
 during graceful shutdown.
 
 Forwarding preserves the method, path, query, body, status, and end-to-end
-headers. The local Host targets the local service; standard forwarding headers
-carry the public host, scheme, and observed visitor address. Control credentials
-never enter the forwarded HTTP exchange.
+headers. By default the local Host targets the local service, while an explicit
+per-route option preserves the public Host for a name-based local reverse
+proxy. Standard forwarding headers carry the public host, scheme, and observed
+visitor address in either mode. Control credentials never enter the forwarded
+HTTP exchange.
 
 When Sink listens directly, the accepted socket is the network trust boundary.
 An optional TCP proxy can provide source and destination addresses through

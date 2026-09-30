@@ -236,14 +236,16 @@ const MAX_ROUTE_NAME_BYTES: usize = 64;
 /// name = "edge"
 /// url = "https://edge.example.com"
 /// target = "http://edge:80"
+/// preserve_host = true # optional; defaults to target-authority Host
 /// tls_target = "tcp://edge:443"
 /// proxy_protocol = "v2" # optional; disabled when omitted
 /// ```
 ///
-/// `local_tls_insecure`, `cors_allow_origin`, `cors_allow_credentials`,
-/// `inspect`, `inspect_request_limit`, and `inspect_body_limit` mirror the
-/// existing `sink http` options. Authentication and the control-server address
-/// are intentionally absent and continue to use the existing global settings.
+/// `local_tls_insecure`, `preserve_host`, `cors_allow_origin`,
+/// `cors_allow_credentials`, `inspect`, `inspect_request_limit`, and
+/// `inspect_body_limit` mirror the existing `sink http` options. Authentication
+/// and the control-server address are intentionally absent and continue to use
+/// the existing global settings.
 #[derive(Clone, Debug)]
 pub struct ConnectConfig {
     routes: Vec<ConnectRouteConfig>,
@@ -327,6 +329,7 @@ pub struct ConnectRouteConfig {
     pub(crate) public_url: PublicUrl,
     pub(crate) target: LocalTarget,
     pub(crate) local_tls_insecure: bool,
+    pub(crate) preserve_host: bool,
     pub(crate) cors_allow_origin: Vec<CorsOrigin>,
     pub(crate) cors_allow_credentials: bool,
     pub(crate) inspect: bool,
@@ -446,6 +449,7 @@ impl ConnectRouteConfig {
             public_url,
             target,
             local_tls_insecure: raw.local_tls_insecure,
+            preserve_host: raw.preserve_host,
             cors_allow_origin,
             cors_allow_credentials: raw.cors_allow_credentials,
             inspect: raw.inspect,
@@ -470,6 +474,11 @@ impl ConnectRouteConfig {
     #[must_use]
     pub fn target(&self) -> &LocalTarget {
         &self.target
+    }
+
+    #[must_use]
+    pub const fn preserve_host(&self) -> bool {
+        self.preserve_host
     }
 
     #[must_use]
@@ -660,6 +669,8 @@ struct DiskConnectRoute {
     target: String,
     #[serde(default)]
     local_tls_insecure: bool,
+    #[serde(default)]
+    preserve_host: bool,
     #[serde(default)]
     cors_allow_origin: Vec<String>,
     #[serde(default)]
@@ -1188,6 +1199,7 @@ inspect = false
 name = "edge"
 url = "https://cloud.example.com"
 target = "http://edge.internal:80"
+preserve_host = true
 tls_target = "tcp://edge.internal:443"
 proxy_protocol = "v2"
 inspect = false
@@ -1198,6 +1210,7 @@ inspect = false
         let route = &config.routes()[0];
         assert_eq!(route.public_url().requested_hostname(), "cloud.example.com");
         assert_eq!(route.target().to_string(), "http://edge.internal/");
+        assert!(route.preserve_host());
         let tls_target = route.tls_target().ok_or("missing TLS target")?;
         assert_eq!(tls_target.host(), "edge.internal");
         assert_eq!(tls_target.port(), 443);
@@ -1222,6 +1235,7 @@ target = "3000"
 
         let config = ConnectConfig::load(&path)?;
         let route = &config.routes()[0];
+        assert!(!route.preserve_host());
         assert!(route.tls_target().is_none());
         assert_eq!(route.proxy_protocol(), None);
         Ok(())
