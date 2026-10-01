@@ -599,8 +599,18 @@ fn rewrite_local_request_with_host_policy<B>(
     target: &LocalTarget,
     preserve_host: bool,
 ) -> Result<(), ProxySetupError> {
-    *request.uri_mut() = resolve_local_uri(target, request.uri())?;
-    if !preserve_host {
+    let local_uri = resolve_local_uri(target, request.uri())?;
+    if preserve_host {
+        // Hyper's low-level HTTP/1 sender serializes this URI as-is. The
+        // target has already selected the direct connection (and TLS SNI), so
+        // omit its authority from the request-target when retaining Host.
+        let path_and_query = local_uri
+            .path_and_query()
+            .cloned()
+            .ok_or(ProxySetupError::InvalidLocalTarget)?;
+        *request.uri_mut() = Uri::builder().path_and_query(path_and_query).build()?;
+    } else {
+        *request.uri_mut() = local_uri;
         let authority = target
             .origin()
             .authority()
@@ -1513,36 +1523,42 @@ mod tests {
             request.uri().to_string(),
             "http://local.example:8080/api/v1/users/%2Fraw?active=true"
         );
+        assert_eq!(request.uri().scheme_str(), Some("http"));
+        assert_eq!(
+            request.uri().authority().map(Authority::as_str),
+            Some("local.example:8080")
+        );
         assert_eq!(request.headers()[HOST], "local.example:8080");
         assert_eq!(request.headers()["x-forwarded-host"], "public.example.com");
         Ok(())
     }
 
     #[tokio::test]
-    async fn enabled_preservation_sends_public_host_and_unchanged_forwarded_host_to_upstream()
+    async fn enabled_preservation_sends_origin_form_and_public_host_to_upstream()
     -> Result<(), BoxError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await?;
-            let service = service_fn(|request: Request<Incoming>| async move {
-                let host = request
-                    .headers()
-                    .get(HOST)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default();
-                let forwarded_host = request
-                    .headers()
-                    .get(X_FORWARDED_HOST)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default();
-                let path_and_query = request
-                    .uri()
-                    .path_and_query()
-                    .map(PathAndQuery::as_str)
-                    .unwrap_or_default();
-                let observed = format!("{path_and_query}|{host}|{forwarded_host}");
-                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(observed))))
+            let observed_tx = Arc::new(std::sync::Mutex::new(Some(observed_tx)));
+            let service = service_fn(move |request: Request<Incoming>| {
+                let observed_tx = observed_tx.clone();
+                async move {
+                    let observed = (
+                        request.uri().clone(),
+                        request.headers().get(HOST).cloned(),
+                        request.headers().get(X_FORWARDED_HOST).cloned(),
+                    );
+                    if let Some(sender) = observed_tx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = sender.send(observed);
+                    }
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                }
             });
             hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(socket), service)
@@ -1570,9 +1586,19 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "ok");
+
+        let (uri, host, forwarded_host) = timeout(Duration::from_secs(1), observed_rx).await??;
+        assert_eq!(uri.scheme(), None);
+        assert_eq!(uri.authority(), None);
         assert_eq!(
-            response.into_body().collect().await?.to_bytes(),
-            "/base/users/%2Fraw?active=true|public.example.test|public.example.test"
+            uri.path_and_query().map(PathAndQuery::as_str),
+            Some("/base/users/%2Fraw?active=true")
+        );
+        assert_eq!(host, Some(HeaderValue::from_static("public.example.test")));
+        assert_eq!(
+            forwarded_host,
+            Some(HeaderValue::from_static("public.example.test"))
         );
 
         tasks.close();
