@@ -51,6 +51,13 @@ sink http 3000 --url https://demo.example.com
 Targets may also be `host:port`, `http://...`, or `https://...`. The control
 connection and local HTTPS targets validate certificates by default.
 
+To run several named tunnels in one process, use
+`sink connect --config routes.toml`. See the
+[complete `connect` and TOML reference](docs/cli-reference.md#multi-route-configuration)
+for every command option, route setting, default, and validation rule, and the
+[saved client configuration](docs/client-reference.md#saved-client-configuration)
+for the token, server address, and configuration-file location.
+
 For cross-origin assets, use `--cors-allow-origin https://other.example.com`
 or `--cors-allow-origin '*'`. Credentialed requests additionally require
 `--cors-allow-credentials` and concrete origins. See the

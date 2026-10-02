@@ -54,6 +54,47 @@ The config file is readable only by your account. Keep it out of repositories
 and images. One-run overrides are available with `--authtoken` and
 `--server-addr`, but command-line secrets may be visible in process listings.
 
+### Saved client configuration
+
+The saved `config.toml` contains only the following settings:
+
+| Key | TOML type | Behavior |
+| --- | --- | --- |
+| `authtoken` | String | Non-empty server-issued bearer token. Used by `http`, `connect`, and `namespace` unless their `--authtoken` overrides it. |
+| `server_addr` | String | Control-server HTTP(S) origin, such as `"https://connect.example.com"`, with an optional non-zero port. Rejects whitespace, URL credentials, paths other than `/`, queries, and fragments. Used unless `--server-addr` overrides it. |
+
+For example, the file written by `sink config` has this form:
+
+```toml
+authtoken = "YOUR_TOKEN"
+server_addr = "https://connect.example.com/"
+```
+
+The platform locations are:
+
+| System | Saved configuration path |
+| --- | --- |
+| macOS | `~/Library/Application Support/sink/config.toml` |
+| Linux | `$XDG_CONFIG_HOME/sink/config.toml` when `XDG_CONFIG_HOME` is an absolute path; otherwise `~/.config/sink/config.toml`. |
+
+Use `sink config add-authtoken TOKEN` and
+`sink config add-server-addr SERVER` to update these values. Each command
+preserves the other supported setting and writes the file atomically. On
+macOS/Linux, Sink sets the file permissions to `0600` and its directory to
+`0700` when saving.
+
+Either key may be absent from the saved file, but both must be supplied by
+saved values or flags before a tunnel or namespace command can run. Flags take
+precedence independently for each key and do not change the saved values. A
+missing file is treated as empty configuration; a malformed file or an unknown
+key is an error even when both command-line overrides are present.
+
+An HTTP control origin can be saved, but using it requires
+`--allow-plaintext-control` on every run. This permission cannot be saved as a
+configuration key. Route settings belong in a separate TOML file selected by
+`sink connect --config FILE`; that option does not change the saved file's
+location. See the [complete route-file reference](cli-reference.md#multi-route-configuration).
+
 ## Open a tunnel
 
 ```console
@@ -73,6 +114,36 @@ state, and completed-request summaries. Keep it running. After a transient
 network or server interruption it reconnects and reclaims the same address.
 The interrupted in-flight operation fails and is never replayed; new traffic
 works after reconnection.
+
+## Open multiple tunnels
+
+Save the routes to a file such as `routes.toml`:
+
+```toml
+[[routes]]
+name = "app"
+url = "https://app.example.com"
+target = "3000"
+
+[[routes]]
+name = "api"
+url = "https://api.example.com"
+target = "localhost:8080"
+inspect = false
+```
+
+```console
+sink connect --config routes.toml
+```
+
+All routes share the saved token and control-server address. Each has its own
+connection and retry loop; inspection is enabled by default per route. Unlike
+`sink http`, every route requires a chosen public URL. The process reads the
+file once, so restart it after edits. Ctrl-C gracefully stops all routes.
+
+The [complete `connect` reference](cli-reference.md#multi-route-configuration)
+lists every command option and all 13 route keys, their types, defaults,
+validation rules, and examples for CORS, local HTTPS, inspectors, and raw TLS.
 
 ## Raw TLS passthrough
 
